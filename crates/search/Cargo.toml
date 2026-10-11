@@ -1,0 +1,13 @@
+[package]
+name = "lithe-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lithe-core.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
+grep-matcher.workspace = true
+ignore.workspace = true
+log.workspace = true
