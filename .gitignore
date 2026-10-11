@@ -6,5 +6,8 @@
 /assets/lithe.icns
 /assets/icon-1024.png
 
-# Generated knowledge graph
-/graphify-out
+# graphify: per-machine pointers, rewritten on every run. The graph
+# outputs themselves are committed; these two would only break on
+# another machine.
+/graphify-out/.graphify_python
+/graphify-out/.graphify_root
