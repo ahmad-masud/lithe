@@ -1,0 +1,10 @@
+[package]
+name = "lithe-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gix.workspace = true
+imara-diff.workspace = true
+log.workspace = true
