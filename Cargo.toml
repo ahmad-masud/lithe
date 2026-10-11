@@ -84,6 +84,12 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+# No debuginfo for dependencies. You never step into wgpu or gix, and
+# optimised-plus-full-debuginfo is the fattest artifact there is: this
+# was most of an 11 GB target/debug/deps. Panics still name dependency
+# functions, they just lose file:line inside them. Our own crates keep
+# full debuginfo.
+debug = false
 
 [profile.release]
 opt-level = 3
