@@ -1,0 +1,93 @@
+[workspace]
+members = ["crates/core", "crates/gpu", "crates/syntax", "crates/search", "crates/lsp", "crates/vcs", "crates/app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+lithe-core = { path = "crates/core" }
+lithe-gpu  = { path = "crates/gpu" }
+lithe-syntax = { path = "crates/syntax" }
+lithe-search = { path = "crates/search" }
+lithe-lsp = { path = "crates/lsp" }
+lithe-vcs = { path = "crates/vcs" }
+
+ropey       = "1.6"
+winit       = "0.30"
+# Native desktop only: no gles, no webgpu. Drops the GL backend and a
+# chunk of naga from the build.
+wgpu        = { version = "30.0", default-features = false, features = [
+    "std", "parking_lot", "metal", "vulkan", "dx12", "wgsl",
+] }
+# fontconfig is dead weight off Linux. monospace_fallback makes font
+# fallback prefer monospace faces, which is what a code editor wants.
+cosmic-text = { version = "0.19", default-features = false, features = [
+    "std", "swash", "monospace_fallback",
+] }
+bytemuck    = { version = "1", features = ["derive"] }
+pollster    = "0.4"
+arboard     = "3.6"
+muda        = "0.21"
+rfd         = "0.17"
+nucleo      = "0.5"
+ignore      = "0.4"
+grep-searcher = "0.1"
+grep-regex    = "0.1"
+grep-matcher  = "0.1"
+lsp-types     = "0.97"
+serde_json    = "1"
+serde         = { version = "1", features = ["derive"] }
+toml          = "1"
+# Only the formats people actually drop into a project; the default set
+# pulls in a lot of decoders we would never reach for.
+image         = { version = "0.25", default-features = false, features = [
+    "png", "jpeg", "gif", "bmp", "webp",
+] }
+# SVG is rasterised to RGBA and goes through the same image path as a PNG.
+resvg         = { version = "0.48", default-features = false }
+tiny-skia     = "0.12"
+# Pinned below 0.89: that release depends on gix-note ^0.3, which was never
+# published, so it cannot resolve at all. `sha1` is not optional either —
+# gix-hash refuses to compile without a hash backend named explicitly.
+gix           = { version = "0.88", default-features = false, features = [
+    "sha1", "max-performance-safe", "revision", "status", "blob-diff",
+] }
+imara-diff    = "0.2"
+
+tree-sitter            = "0.27"
+tree-sitter-language   = "0.1"
+tree-sitter-rust       = "0.24"
+tree-sitter-json       = "0.24"
+tree-sitter-toml-ng    = "0.7"
+tree-sitter-python     = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go         = "0.25"
+tree-sitter-c          = "0.24"
+anyhow      = "1"
+log         = "0.4"
+env_logger  = "0.11"
+
+# ---------------------------------------------------------------------------
+# Perf profiles. Two things matter here:
+#  - our code at opt-level 1 in dev, because an editor is unusable when
+#    scrolling a rope compiled at opt-level 0
+#  - every dependency at opt-level 3 even in dev; they change ~never, so we
+#    pay the cost once and get a fast editor out of a debug build
+# ---------------------------------------------------------------------------
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
