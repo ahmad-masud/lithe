@@ -1,0 +1,3931 @@
+//! Layout and drawing.
+//!
+//! Invariant 2 lives here: every loop below is bounded by the window, never
+//! by the document, the project or the match set. The file tree draws the
+//! rows that fit; the picker draws the results that fit; the editor shapes
+//! the lines that fit.
+//!
+//! Tabs make visual columns and character offsets different things, so the
+//! two mappings between them live here and every caller goes through them.
+
+use std::fmt::Write as _;
+use std::path::Path;
+
+use lithe_core::{RopeSlice, TextBuffer};
+use lithe_gpu::{CellMetrics, Renderer, Rgba};
+use lithe_syntax::{Kind, Span};
+
+use crate::context::ContextMenu;
+use crate::editor::Editor;
+use crate::find::{Completion, Field, Find, ProjectSearch, Prompt};
+use crate::gitpanel::{GitPanel, Mode as GitMode, Row as GitRowKind};
+use crate::icons::{self, Icon};
+use crate::markdown::{Block as MdBlock, Line as MdLine, Scale as MdScale, Style as MdStyle};
+use crate::picker::Picker;
+use crate::settings::{PreviewKind, Settings};
+use crate::theme::Theme;
+use crate::tree::Tree;
+use crate::workspace::Workspace;
+
+/// Default sidebar width, in cells.
+pub const TREE_COLS: f32 = 28.0;
+/// How far the sidebar can be dragged, in cells.
+pub const SIDEBAR_MIN: f32 = 14.0;
+pub const SIDEBAR_MAX: f32 = 70.0;
+/// Grab area for the divider, in physical pixels either side.
+const DIVIDER_GRAB: f32 = 4.0;
+/// Most results the picker will draw, regardless of window height.
+const PICKER_ROWS: usize = 14;
+/// Cells reserved at the right of a tab for its close box.
+const CLOSE_COLS: f32 = 3.0;
+/// A switch on the settings page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Setting {
+    Autosave,
+    Preview(PreviewKind),
+    SideBySideDiff,
+}
+
+/// One line of the settings page. Blanks and headings are rows too, so
+/// position is an index times the line height — the same arrangement the
+/// landing page and the source control panel use.
+enum SettingRow {
+    Blank,
+    Title,
+    Heading(&'static str),
+    Switch(Setting),
+}
+
+fn setting_rows() -> Vec<SettingRow> {
+    let mut rows = vec![
+        SettingRow::Title,
+        SettingRow::Blank,
+        SettingRow::Heading("Editor"),
+        SettingRow::Switch(Setting::Autosave),
+        SettingRow::Blank,
+        SettingRow::Heading("Preview"),
+    ];
+    rows.extend(
+        PreviewKind::ALL
+            .into_iter()
+            .map(|kind| SettingRow::Switch(Setting::Preview(kind))),
+    );
+    rows.push(SettingRow::Blank);
+    rows.push(SettingRow::Heading("Diff"));
+    rows.push(SettingRow::Switch(Setting::SideBySideDiff));
+    rows
+}
+
+impl Setting {
+    pub fn label(self) -> &'static str {
+        match self {
+            Setting::Autosave => "Save automatically after a pause",
+            Setting::Preview(kind) => kind.label(),
+            Setting::SideBySideDiff => "Show diffs side by side",
+        }
+    }
+
+    pub fn value(self, settings: &Settings) -> bool {
+        match self {
+            Setting::Autosave => settings.autosave,
+            Setting::Preview(kind) => settings.preview(kind),
+            Setting::SideBySideDiff => settings.side_by_side_diff,
+        }
+    }
+
+    pub fn toggle(self, settings: &mut Settings) {
+        let now = !self.value(settings);
+        match self {
+            Setting::Autosave => settings.autosave = now,
+            Setting::Preview(kind) => settings.set_preview(kind, now),
+            Setting::SideBySideDiff => settings.side_by_side_diff = now,
+        }
+    }
+}
+
+/// Where the settings block sits, and how wide its rows are.
+fn settings_origin(l: &Layout, rows: usize) -> (f32, f32, f32) {
+    let width = (46.0 * l.cell.advance).min(l.width - l.text_x - 4.0 * l.cell.advance);
+    let x = (l.text_x + (l.width - l.text_x - width) / 2.0)
+        .max(l.text_x)
+        .round();
+    let height = rows as f32 * l.cell.line_height;
+    let y = (l.text_y + (l.text_h - height) / 2.0)
+        .max(l.text_y + l.cell.line_height)
+        .round();
+    (x, y, width)
+}
+
+/// A clickable segment of the status bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusButton {
+    Explorer,
+    Git,
+    Search,
+    Preview,
+}
+
+/// One button: what it does, what it says, and whether it is on.
+pub struct ButtonSlot {
+    pub button: StatusButton,
+    pub icon: Icon,
+    pub active: bool,
+}
+
+/// Which surfaces are open. Shared by drawing and hit-testing so the two
+/// cannot disagree about what is on screen — and small enough that the
+/// click path, which has no theme, can build one.
+#[derive(Clone, Copy)]
+pub struct Panels<'a> {
+    pub workspace: &'a Workspace,
+    pub tree: Option<&'a Tree>,
+    pub git: Option<&'a GitPanel>,
+    pub recents: &'a [&'a Path],
+    pub search_open: bool,
+    pub preview_open: bool,
+    pub settings_open: bool,
+    pub context: Option<&'a ContextMenu>,
+    /// An open diff of the working copy, whose new side is the live
+    /// buffer and so takes clicks as text rather than as decoration.
+    pub diff_editable: bool,
+    /// How far that diff is scrolled, so a click can name the row it
+    /// landed on rather than the row it would have landed on unscrolled.
+    pub diff_scroll: f32,
+    pub diff_side_by_side: bool,
+}
+
+/// The buttons, in order. Built from what is open, so "on" always matches
+/// what is actually showing.
+pub fn status_buttons(panels: &Panels<'_>) -> Vec<ButtonSlot> {
+    let mut slots = vec![
+        ButtonSlot {
+            button: StatusButton::Explorer,
+            icon: Icon::Files,
+            active: panels.tree.is_some(),
+        },
+        ButtonSlot {
+            button: StatusButton::Git,
+            icon: Icon::Git,
+            active: panels.git.is_some(),
+        },
+        ButtonSlot {
+            button: StatusButton::Search,
+            icon: Icon::Search,
+            active: panels.search_open,
+        },
+    ];
+    // Offered for every kind that has a preview, not just Markdown.
+    // Without this an HTML or SVG file had no visible way back to its
+    // source, which is half of having two modes.
+    // And only on a file tab: a diff and the settings page are what the
+    // tab shows, so there is nothing for the eye to switch.
+    let previewable = matches!(
+        panels.workspace.active_tab(),
+        Some(crate::workspace::Tab::File(_))
+    ) && panels
+        .workspace
+        .active()
+        .and_then(|e| e.path.as_deref())
+        .and_then(PreviewKind::of)
+        .is_some();
+    if previewable || panels.preview_open {
+        slots.push(ButtonSlot {
+            button: StatusButton::Preview,
+            icon: Icon::Eye,
+            active: panels.preview_open,
+        });
+    }
+    slots
+}
+
+/// Where each button sits along the status bar.
+pub fn status_button_extents(l: &Layout, slots: &[ButtonSlot]) -> Vec<(f32, f32)> {
+    // Square-ish targets: an icon with a comfortable margin either side.
+    let w = (icon_size(l) + 2.0 * l.cell.advance).round();
+    (0..slots.len())
+        .map(|i| (i as f32 * w, (i + 1) as f32 * w))
+        .collect()
+}
+
+/// Icon size for the status bar, a little under the line height.
+fn icon_size(l: &Layout) -> f32 {
+    (l.cell.line_height * 0.52).round()
+}
+
+/// Cells reserved at the end of a source control row for its stage box.
+const STAGE_COLS: f32 = 3.0;
+
+/// Scrollbar width in physical pixels.
+pub const SCROLLBAR_W: f32 = 10.0;
+
+/// Width of the landing page's content column, in cells.
+const LANDING_COLS: f32 = 46.0;
+
+/// A diagnostic, reduced to what drawing needs.
+pub struct Mark {
+    pub start: usize,
+    pub end: usize,
+    pub severity: Severity,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Severity {
+    Hint,
+    Information,
+    Warning,
+    Error,
+}
+
+/// What a landing-page row does when clicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandingAction {
+    NewFile,
+    OpenFile,
+    OpenFolder,
+    NewWindow,
+    OpenRecent(usize),
+}
+
+/// One line of the landing page. Gaps are rows too, so the whole page is a
+/// simple index-times-line-height walk and drawing cannot drift from
+/// hit-testing.
+enum Row<'a> {
+    Blank,
+    Title,
+    Subtitle,
+    Heading(&'a str),
+    Action { label: &'a str, hint: &'a str },
+    Recent(usize),
+    Footer(&'a str),
+}
+
+struct LandingRow<'a> {
+    row: Row<'a>,
+    action: Option<LandingAction>,
+}
+
+/// True when there is no project and nothing open — just the app.
+pub fn showing_landing(workspace: &Workspace) -> bool {
+    workspace.root.is_none() && workspace.is_empty()
+}
+
+/// The landing page, as a flat list of lines.
+fn landing_rows<'a>(recents: &[&'a Path]) -> Vec<LandingRow<'a>> {
+    let mut rows = vec![
+        LandingRow {
+            row: Row::Title,
+            action: None,
+        },
+        LandingRow {
+            row: Row::Subtitle,
+            action: None,
+        },
+        LandingRow {
+            row: Row::Blank,
+            action: None,
+        },
+        LandingRow {
+            row: Row::Heading("Start"),
+            action: None,
+        },
+        LandingRow {
+            row: Row::Action {
+                label: "New buffer",
+                hint: "cmd N",
+            },
+            action: Some(LandingAction::NewFile),
+        },
+        LandingRow {
+            row: Row::Action {
+                label: "Open file…",
+                hint: "cmd O",
+            },
+            action: Some(LandingAction::OpenFile),
+        },
+        LandingRow {
+            row: Row::Action {
+                label: "Open folder…",
+                hint: "cmd shift O",
+            },
+            action: Some(LandingAction::OpenFolder),
+        },
+        LandingRow {
+            row: Row::Action {
+                label: "New window",
+                hint: "cmd shift N",
+            },
+            action: Some(LandingAction::NewWindow),
+        },
+    ];
+
+    if !recents.is_empty() {
+        rows.push(LandingRow {
+            row: Row::Blank,
+            action: None,
+        });
+        rows.push(LandingRow {
+            row: Row::Heading("Recent"),
+            action: None,
+        });
+        for index in 0..recents.len() {
+            rows.push(LandingRow {
+                row: Row::Recent(index),
+                action: Some(LandingAction::OpenRecent(index)),
+            });
+        }
+    }
+
+    rows.push(LandingRow {
+        row: Row::Blank,
+        action: None,
+    });
+    rows.push(LandingRow {
+        row: Row::Footer("cmd shift P  for every command"),
+        action: None,
+    });
+    rows
+}
+
+/// Where the landing block sits: a centred column, nudged above centre so
+/// it does not look like it is sliding off the bottom.
+fn landing_origin(l: &Layout, rows: usize) -> (f32, f32) {
+    let width = LANDING_COLS * l.cell.advance;
+    let x = ((l.width - width) / 2.0).max(l.cell.advance).round();
+    let height = rows as f32 * l.cell.line_height;
+    let y = ((l.height - height) / 2.0).max(l.cell.line_height).round();
+    (x, y)
+}
+
+/// Everything drawing needs, gathered by the caller so this module never
+/// reaches into application state.
+pub struct Scene<'a> {
+    pub workspace: &'a Workspace,
+    pub find: Option<&'a Find>,
+    pub prompt: Option<&'a Prompt>,
+    /// False while the caret is in the off half of its blink.
+    pub caret_visible: bool,
+    pub search: Option<&'a ProjectSearch>,
+    /// In-buffer matches within the visible range.
+    pub find_matches: &'a [lithe_search::Span],
+    /// Diagnostics for the active file, as char ranges.
+    pub diagnostics: &'a [Mark],
+    pub completion: Option<&'a Completion>,
+    /// Differences from the committed version of the active file.
+    pub hunks: &'a [lithe_vcs::Hunk],
+    /// Current branch, for the status bar.
+    pub branch: Option<&'a str>,
+    /// Who last changed the cursor's line, when that is switched on.
+    pub blame: Option<&'a str>,
+    /// Language-server state, for the status bar.
+    pub lsp: Option<&'a str>,
+    /// Whether autosave is on, for the status bar.
+    pub autosave: bool,
+    /// Projects offered on the landing page, newest first.
+    pub recents: &'a [&'a Path],
+    /// Highlight spans for the visible byte range, in paint order.
+    pub highlights: &'a [Span],
+    pub tree: Option<&'a Tree>,
+    pub git: Option<&'a GitPanel>,
+    /// Sidebar width in cells, as the person has dragged it.
+    pub sidebar_cols: f32,
+    /// Rendered Markdown, shown instead of the file when open.
+    pub preview: Option<&'a [MdLine]>,
+    pub preview_scroll: f32,
+    /// A unified diff, shown instead of the file.
+    pub diff: Option<&'a [lithe_vcs::DiffLine]>,
+    pub diff_title: Option<&'a str>,
+    pub diff_scroll: f32,
+    /// Whether this diff is of the working copy, which can be typed into.
+    pub diff_editable: bool,
+    /// What the pointer is resting on, if the server has said.
+    pub hover: Option<&'a Hover>,
+    /// Show the two versions in parallel columns.
+    pub diff_side_by_side: bool,
+    /// A decoded image, shown instead of the file.
+    pub image: Option<&'a crate::imageview::ImageView>,
+    /// The settings page, shown instead of everything else.
+    pub settings: Option<&'a Settings>,
+    /// An open right-click menu, drawn over everything.
+    pub context: Option<&'a ContextMenu>,
+    pub picker: Option<&'a Picker>,
+    pub theme: &'a Theme,
+    pub status: Option<&'a str>,
+    pub tab_width: usize,
+}
+
+/// Per-frame scratch, reused so drawing allocates nothing in steady state.
+#[derive(Default)]
+pub struct Scratch {
+    text: String,
+    /// Highlight kind per character of the line being drawn.
+    styles: Vec<Option<Kind>>,
+}
+
+/// Where things sit this frame. Shared by drawing and hit-testing so the two
+/// can never disagree about the gutter width.
+pub struct Layout {
+    pub cell: CellMetrics,
+    pub width: f32,
+    pub height: f32,
+    pub tree_w: f32,
+    /// Height of the tab strip; zero when nothing is open.
+    pub tab_h: f32,
+    /// Height of the find bar; zero when it is closed.
+    pub find_h: f32,
+    /// Top of the text area.
+    pub text_y: f32,
+    /// Height of the text area, between the tabs and the status bar.
+    pub text_h: f32,
+    pub gutter_w: f32,
+    pub text_x: f32,
+    pub rows: usize,
+}
+
+/// Which pieces of chrome are showing, for layout.
+#[derive(Clone, Copy, Default)]
+pub struct Chrome {
+    /// Either panel; they share the sidebar.
+    pub sidebar: bool,
+    /// Sidebar width in cells, as dragged.
+    pub sidebar_cols: f32,
+    pub find: bool,
+}
+
+pub fn layout(renderer: &Renderer, workspace: &Workspace, chrome: Chrome) -> Layout {
+    let cell = renderer.cell();
+    let (width, height) = renderer.size_px();
+
+    let tree_w = if chrome.sidebar {
+        chrome.sidebar_cols.clamp(SIDEBAR_MIN, SIDEBAR_MAX) * cell.advance
+    } else {
+        0.0
+    };
+    let tab_h = if workspace.is_empty() {
+        0.0
+    } else {
+        cell.line_height
+    };
+    // The find bar — or the prompt, which shares its row — sits between
+    // the tabs and the text.
+    let find_h = if chrome.find { cell.line_height } else { 0.0 };
+    let text_y = tab_h + find_h;
+    let text_h = (height - text_y - cell.line_height).max(0.0);
+
+    let lines = workspace.active().map(|e| e.doc.len_lines()).unwrap_or(1);
+    let gutter_w = (decimal_width(lines) + 2) as f32 * cell.advance;
+
+    Layout {
+        cell,
+        width,
+        height,
+        tree_w,
+        tab_h,
+        find_h,
+        text_y,
+        text_h,
+        gutter_w,
+        text_x: tree_w + gutter_w,
+        rows: (text_h / cell.line_height).ceil() as usize,
+    }
+}
+
+// ---- column mapping -----------------------------------------------------
+
+/// Visual column of a character offset within a line.
+fn visual_col(line: RopeSlice<'_>, char_col: usize, tab: usize) -> usize {
+    let mut col = 0;
+    for (i, ch) in line.chars().enumerate() {
+        if i >= char_col || ch == '\n' || ch == '\r' {
+            break;
+        }
+        col += if ch == '\t' { tab - (col % tab) } else { 1 };
+    }
+    col
+}
+
+/// Character offset within a line for a visual column.
+///
+/// `nearest_edge` picks between the two things a click can mean. Placing a
+/// caret wants the nearer boundary, so clicking the right half of a letter
+/// puts the cursor after it. Selecting a word wants the character actually
+/// under the pointer, because the boundary after the last letter of a word
+/// belongs to the space that follows — and double-clicking the end of a
+/// word should take the word, not the space.
+fn char_col_at_visual(line: RopeSlice<'_>, target: usize, tab: usize, nearest_edge: bool) -> usize {
+    let mut col = 0;
+    for (i, ch) in line.chars().enumerate() {
+        if ch == '\n' || ch == '\r' {
+            return i;
+        }
+        let width = if ch == '\t' { tab - (col % tab) } else { 1 };
+        if target < col + width {
+            return if nearest_edge && target >= col + width.div_ceil(2) {
+                i + 1
+            } else {
+                i
+            };
+        }
+        col += width;
+    }
+    line.chars()
+        .take_while(|c| *c != '\n' && *c != '\r')
+        .count()
+}
+
+// ---- hit testing --------------------------------------------------------
+
+/// Maps a point in physical pixels to a position in the document.
+pub fn point_to_char(
+    l: &Layout,
+    doc: &TextBuffer,
+    scroll: f32,
+    x: f32,
+    y: f32,
+    tab: usize,
+) -> usize {
+    point_to_char_with(l, doc, scroll, x, y, tab, true)
+}
+
+/// The character under the pointer, rather than the nearest caret
+/// boundary. What a double click should ask about.
+pub fn point_to_char_under(
+    l: &Layout,
+    doc: &TextBuffer,
+    scroll: f32,
+    x: f32,
+    y: f32,
+    tab: usize,
+) -> usize {
+    point_to_char_with(l, doc, scroll, x, y, tab, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn point_to_char_with(
+    l: &Layout,
+    doc: &TextBuffer,
+    scroll: f32,
+    x: f32,
+    y: f32,
+    tab: usize,
+    nearest_edge: bool,
+) -> usize {
+    // Fractional scroll means the first visible row is usually clipped, so
+    // the hit row is found in continuous coordinates and floored once.
+    let row = ((y - l.text_y) / l.cell.line_height + scroll.max(0.0)).floor();
+    let line = (row.max(0.0) as usize).min(doc.len_lines().saturating_sub(1));
+    let target_col = ((x - l.text_x) / l.cell.advance).round().max(0.0) as usize;
+    let char_col = match doc.line(line) {
+        Some(slice) => char_col_at_visual(slice, target_col, tab, nearest_edge),
+        None => 0,
+    };
+    (doc.line_to_char(line) + char_col).min(doc.len_chars())
+}
+
+/// Which region of the window a point falls in.
+// No `Eq`: one variant carries a y coordinate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hit {
+    /// An entry in the open right-click menu.
+    Context(usize),
+    /// A switch on the settings page.
+    Setting(Setting),
+    /// A toggle in the status bar.
+    Status(StatusButton),
+    /// The scrollbar track, at a y position.
+    Scrollbar(f32),
+    /// The draggable edge of the sidebar.
+    SidebarDivider,
+    /// A row in an editable diff's new side: which row of the diff, and
+    /// how many cells into the text the click landed.
+    DiffText {
+        row: usize,
+        column: usize,
+    },
+    /// A row in the source control panel.
+    GitRow(usize),
+    /// The stage/unstage box at the end of a source control row.
+    GitStage(usize),
+    /// A commit in the history.
+    GitCommit(usize),
+    /// The Changes / History switch.
+    GitMode(GitMode),
+    /// The button offered when there is no repository here yet.
+    GitInit,
+    /// A row on the landing page.
+    Landing(LandingAction),
+    Tree(usize),
+    Tab(usize),
+    /// The close box on a tab.
+    TabClose(usize),
+    Text,
+    Elsewhere,
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Where an open context menu sits, clamped inside the window.
+pub fn context_bounds(l: &Layout, menu: &ContextMenu) -> (f32, f32, f32, f32) {
+    let width = menu.columns() as f32 * l.cell.advance;
+    let height = menu.entries.len() as f32 * l.cell.line_height + 4.0;
+    // Flip rather than overflow: a menu opened near an edge should still
+    // be entirely on screen.
+    let x = menu.at.0.min((l.width - width).max(0.0));
+    let y = if menu.at.1 + height > l.height {
+        (menu.at.1 - height).max(0.0)
+    } else {
+        menu.at.1
+    };
+    (x, y, width, height)
+}
+
+pub fn hit_test(l: &Layout, panels: &Panels<'_>, x: f32, y: f32) -> Hit {
+    // An open menu takes every click: one inside it chooses, one outside
+    // dismisses, and nothing underneath should act in either case.
+    if let Some(menu) = panels.context {
+        let (mx, my, width, height) = context_bounds(l, menu);
+        if x >= mx && x < mx + width && y >= my && y < my + height {
+            let row = ((y - my - 2.0) / l.cell.line_height).floor().max(0.0) as usize;
+            return Hit::Context(row);
+        }
+        return Hit::Elsewhere;
+    }
+    let workspace = panels.workspace;
+    let tree = panels.tree;
+    let git = panels.git;
+    let recents = panels.recents;
+    // The find bar swallows clicks on its own row rather than letting them
+    // land in the text underneath.
+    if l.find_h > 0.0 && y >= l.tab_h && y < l.tab_h + l.find_h {
+        return Hit::Elsewhere;
+    }
+
+    // The status bar is checked first, and before the landing page, so its
+    // toggles stay clickable when there is no file open — which is exactly
+    // when you are most likely to reach for one.
+    if y >= l.text_y + l.text_h {
+        // The status bar's left end is a row of toggles.
+        let slots = status_buttons(panels);
+        for (slot, (x0, x1)) in slots.iter().zip(status_button_extents(l, &slots)) {
+            if x >= x0 && x < x1 {
+                return Hit::Status(slot.button);
+            }
+        }
+        return Hit::Elsewhere;
+    }
+    // The divider is grabbed slightly either side of the edge, since a
+    // one-pixel target is not a target.
+    if l.tree_w > 0.0 && (x - l.tree_w).abs() <= DIVIDER_GRAB {
+        return Hit::SidebarDivider;
+    }
+    // The scrollbar sits over the right edge of the text area.
+    if x >= l.width - SCROLLBAR_W && y >= l.text_y {
+        return Hit::Scrollbar(y);
+    }
+    if l.tab_h > 0.0 && y < l.tab_h && x >= l.tree_w {
+        let labels = workspace.labels();
+        for (index, (x0, x1)) in tab_extents(l, &labels).into_iter().enumerate() {
+            if x >= x0 && x < x1 {
+                // The close box occupies the trailing cells of the tab.
+                return if x >= x1 - CLOSE_COLS * l.cell.advance {
+                    Hit::TabClose(index)
+                } else {
+                    Hit::Tab(index)
+                };
+            }
+        }
+        return Hit::Elsewhere;
+    }
+    // The new side of a working-copy diff is the buffer, so a click there
+    // places the caret in it. The old side is a committed version, which
+    // is not a thing that can be typed into.
+    if panels.diff_editable {
+        let frame = diff_frame(l, panels.diff_side_by_side);
+        let in_body = y >= frame.body_y && x >= frame.new_text_x && x < l.width - SCROLLBAR_W;
+        if in_body && x >= l.tree_w {
+            let row = (y - frame.body_y) / l.cell.line_height + panels.diff_scroll.max(0.0);
+            let column = ((x - frame.new_text_x) / l.cell.advance).max(0.0);
+            return Hit::DiffText {
+                row: row.max(0.0) as usize,
+                column: column.round() as usize,
+            };
+        }
+    }
+    if let Some(panel) = git.filter(|_| x < l.tree_w) {
+        let row = (y / l.cell.line_height).floor().max(0.0) as usize + panel.scroll;
+        // Row 0 is the Changes / History switch.
+        if row == panel.scroll {
+            let split = 10.0 * l.cell.advance;
+            return Hit::GitMode(if x < split {
+                GitMode::Changes
+            } else {
+                GitMode::History
+            });
+        }
+        if panel.change_at(row).is_some() {
+            // The trailing cells toggle staging; the rest opens the file.
+            return if x >= l.tree_w - STAGE_COLS * l.cell.advance {
+                Hit::GitStage(row)
+            } else {
+                Hit::GitRow(row)
+            };
+        }
+        if panel.commit_at(row).is_some() {
+            return Hit::GitCommit(row);
+        }
+        if panel.init_at(row) {
+            return Hit::GitInit;
+        }
+        return Hit::Elsewhere;
+    }
+    if let Some(tree) = tree {
+        if x < l.tree_w {
+            let row = (y / l.cell.line_height).floor().max(0.0) as usize + tree.scroll;
+            return if row < tree.rows.len() {
+                Hit::Tree(row)
+            } else {
+                Hit::Elsewhere
+            };
+        }
+    }
+
+    // The two full-area pages are tested here rather than up front,
+    // because that is where they are: they fill the text area and nothing
+    // else. Checked before the chrome, they swallowed every click in the
+    // sidebar and — once the settings page became a tab — the click on
+    // the tab that would have left it.
+    if panels.settings_open {
+        let rows = setting_rows();
+        let (ox, oy, width) = settings_origin(l, rows.len());
+        if x >= ox && x < ox + width {
+            let index = ((y - oy) / l.cell.line_height).floor();
+            if index >= 0.0 {
+                if let Some(SettingRow::Switch(setting)) = rows.get(index as usize) {
+                    return Hit::Setting(*setting);
+                }
+            }
+        }
+        return Hit::Elsewhere;
+    }
+    if showing_landing(workspace) {
+        let rows = landing_rows(recents);
+        let (ox, oy) = landing_origin(l, rows.len());
+        let width = LANDING_COLS * l.cell.advance;
+        if x >= ox && x < ox + width {
+            let index = ((y - oy) / l.cell.line_height).floor();
+            if index >= 0.0 {
+                if let Some(row) = rows.get(index as usize) {
+                    if let Some(action) = row.action {
+                        return Hit::Landing(action);
+                    }
+                }
+            }
+        }
+        return Hit::Elsewhere;
+    }
+    Hit::Text
+}
+
+fn tab_extents(l: &Layout, labels: &[String]) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(labels.len());
+    let mut x = l.tree_w;
+    for label in labels {
+        let w = (label.chars().count() as f32 + 2.0 + CLOSE_COLS) * l.cell.advance;
+        out.push((x, x + w));
+        x += w;
+    }
+    out
+}
+
+// ---- drawing ------------------------------------------------------------
+
+impl<'a> Scene<'a> {
+    pub fn panels(&self) -> Panels<'a> {
+        Panels {
+            workspace: self.workspace,
+            tree: self.tree,
+            git: self.git,
+            recents: self.recents,
+            search_open: self.search.is_some(),
+            // Either kind of preview counts: an SVG showing as a picture
+            // is as much "previewing" as rendered Markdown is.
+            preview_open: self.preview.is_some() || self.image.is_some(),
+            settings_open: self.settings.is_some(),
+            context: self.context,
+            diff_editable: self.diff.is_some() && self.diff_editable,
+            diff_scroll: self.diff_scroll,
+            diff_side_by_side: self.diff_side_by_side,
+        }
+    }
+}
+
+pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
+    let l = layout(
+        renderer,
+        scene.workspace,
+        Chrome {
+            sidebar: scene.tree.is_some() || scene.git.is_some(),
+            sidebar_cols: scene.sidebar_cols,
+            // The prompt shares the find bar's row, so either one reserves
+            // it. Checking only `find` here drew the prompt over the first
+            // line of the file.
+            find: scene.find.is_some() || scene.prompt.is_some(),
+        },
+    );
+    let theme = scene.theme;
+    let labels = scene.workspace.labels();
+    let tabs = tab_extents(&l, &labels);
+
+    let mut f = renderer.frame(theme.bg);
+
+    // ---- file tree ----
+    if let Some(tree) = scene.tree {
+        f.rect(0.0, 0.0, l.tree_w, l.height, theme.panel_bg);
+        let active_path = scene.workspace.active().and_then(|e| e.path.as_deref());
+
+        let visible = (l.height / l.cell.line_height).ceil() as usize;
+        for row in 0..visible {
+            let Some(entry) = tree.rows.get(tree.scroll + row) else {
+                break;
+            };
+            let y = row as f32 * l.cell.line_height;
+            let baseline = y + l.cell.ascent;
+            let editing = tree.edit_at == Some(tree.scroll + row);
+
+            // The row being typed into is highlighted like the active
+            // file, because that is what it is about to be.
+            if editing || Some(entry.path.as_path()) == active_path {
+                f.rect(0.0, y, l.tree_w, l.cell.line_height, theme.panel_active);
+            }
+
+            // Leaves a column for the disclosure caret, which hangs left.
+            let indent = 2.0 + entry.depth as f32 * 2.0;
+            let x = indent * l.cell.advance;
+
+            // A caret for directories, so open and closed are tellable
+            // apart without colour alone.
+            if entry.is_dir {
+                f.text(
+                    x - l.cell.advance,
+                    baseline,
+                    if entry.expanded { "v" } else { ">" },
+                    theme.gutter_fg,
+                );
+            }
+
+            scratch.text.clear();
+            let room = (l.tree_w / l.cell.advance - indent - 1.0).max(1.0) as usize;
+            if editing {
+                // The name as typed, with a block caret after it. No
+                // separate text-input widget: one row, one caret, Enter
+                // and Escape, which is the whole of what naming a file
+                // needs.
+                let typed = tree.typed().unwrap_or_default();
+                let shown = typed.chars().count().min(room.saturating_sub(1));
+                let tail: String = typed.chars().skip(typed.chars().count() - shown).collect();
+                f.text(x, baseline, &tail, theme.fg);
+                f.rect(
+                    x + shown as f32 * l.cell.advance,
+                    y + 2.0,
+                    l.cell.advance,
+                    l.cell.line_height - 4.0,
+                    theme.cursor,
+                );
+                continue;
+            }
+            truncate_tail(&mut scratch.text, &entry.name, room);
+            let colour = if entry.is_dir {
+                theme.tree_dir
+            } else if Some(entry.path.as_path()) == active_path {
+                theme.fg
+            } else {
+                theme.tree_file
+            };
+            f.text(x, baseline, &scratch.text, colour);
+        }
+    }
+
+    // ---- source control panel, sharing the sidebar ----
+    if let Some(git) = scene.git {
+        f.rect(0.0, 0.0, l.tree_w, l.height, theme.panel_bg);
+        let rows = git.rows();
+        let visible = (l.height / l.cell.line_height).ceil() as usize;
+
+        for offset in 0..visible {
+            let index = git.scroll + offset;
+            let Some(row) = rows.get(index) else { break };
+            let y = offset as f32 * l.cell.line_height;
+            let baseline = y + l.cell.ascent;
+
+            match row {
+                GitRowKind::Blank => {}
+                GitRowKind::Tabs => {
+                    // Two words acting as tabs, the active one lit.
+                    let mut x = l.cell.advance;
+                    for (mode, label) in
+                        [(GitMode::Changes, "changes"), (GitMode::History, "history")]
+                    {
+                        let on = git.mode == mode;
+                        if on {
+                            f.rect(
+                                x - 0.5 * l.cell.advance,
+                                y,
+                                (label.chars().count() as f32 + 1.0) * l.cell.advance,
+                                l.cell.line_height,
+                                theme.panel_active,
+                            );
+                        }
+                        f.text(
+                            x,
+                            baseline,
+                            label,
+                            if on { theme.fg } else { theme.tree_file },
+                        );
+                        x += (label.chars().count() as f32 + 2.0) * l.cell.advance;
+                    }
+                }
+                GitRowKind::Commit(index) => {
+                    let Some(commit) = git.commits.get(*index) else {
+                        continue;
+                    };
+                    f.text(
+                        l.cell.advance,
+                        baseline,
+                        &commit.short,
+                        theme.syntax.function,
+                    );
+                    scratch.text.clear();
+                    let room = (l.tree_w / l.cell.advance - 10.0).max(6.0) as usize;
+                    truncate_tail(&mut scratch.text, &commit.summary, room);
+                    f.text(
+                        l.cell.advance * 9.0,
+                        baseline,
+                        &scratch.text,
+                        theme.tree_file,
+                    );
+                }
+                GitRowKind::Header(text) => {
+                    f.text(l.cell.advance, baseline, text, theme.status_fg);
+                }
+                GitRowKind::Empty(text) => {
+                    f.text(l.cell.advance, baseline, text, theme.gutter_fg);
+                }
+                // Drawn as a button, because it is the one row here that
+                // does something to the world rather than describing it.
+                GitRowKind::Init => {
+                    const LABEL: &str = "Initialize Repository";
+                    let width = (LABEL.chars().count() as f32 + 2.0) * l.cell.advance;
+                    let x = ((l.tree_w - width) / 2.0).max(l.cell.advance);
+                    f.rect(
+                        x,
+                        y,
+                        width.min(l.tree_w - 2.0 * x),
+                        l.cell.line_height,
+                        theme.panel_active,
+                    );
+                    f.text(x + l.cell.advance, baseline, LABEL, theme.fg);
+                }
+                GitRowKind::Change(change) => {
+                    let Some(change) = git.changes.get(*change) else {
+                        continue;
+                    };
+                    // git's own letter, in the colour the gutter uses for
+                    // that kind of change.
+                    let colour = match change.status {
+                        'A' | '?' => theme.vcs_added,
+                        'D' => theme.vcs_removed,
+                        _ => theme.vcs_modified,
+                    };
+                    scratch.text.clear();
+                    scratch.text.push(change.status);
+                    f.text(l.cell.advance, baseline, &scratch.text, colour);
+
+                    scratch.text.clear();
+                    let room = (l.tree_w / l.cell.advance - 3.0 - STAGE_COLS).max(4.0) as usize;
+                    truncate_tail(&mut scratch.text, &change.display, room);
+                    f.text(
+                        l.cell.advance * 3.0,
+                        baseline,
+                        &scratch.text,
+                        theme.tree_file,
+                    );
+
+                    // Stage with +, unstage with −.
+                    f.text(
+                        l.tree_w - STAGE_COLS * l.cell.advance,
+                        baseline,
+                        if change.staged { "-" } else { "+" },
+                        theme.gutter_fg,
+                    );
+                }
+            }
+        }
+    }
+
+    // A hairline at the sidebar's edge, so the drag target is visible.
+    if l.tree_w > 0.0 {
+        f.rect(l.tree_w - 1.0, 0.0, 1.0, l.height, theme.panel_active);
+    }
+
+    // ---- editor, or the landing page when there is nothing to edit ----
+    if let Some(settings) = scene.settings {
+        draw_settings(&mut f, &l, settings, theme, scratch);
+    } else if let Some(view) = scene.image {
+        draw_image(&mut f, &l, view, theme, scratch);
+    } else if let Some(lines) = scene.diff {
+        draw_diff(&mut f, &l, lines, scene, theme, scratch);
+    } else if let Some(lines) = scene.preview {
+        draw_preview(&mut f, &l, lines, scene.preview_scroll, theme);
+    } else if showing_landing(scene.workspace) {
+        draw_landing(&mut f, &l, scene, scratch);
+    } else {
+        match scene.workspace.active() {
+            Some(editor) => draw_editor(&mut f, &l, editor, scene, scratch),
+            None => {
+                // A project is open but no file is: the tree is the
+                // affordance, so this only needs to point at it.
+                let hint = "cmd+P  open a file        cmd+shift+P  commands";
+                let x = l
+                    .text_x
+                    .max((l.width - hint.chars().count() as f32 * l.cell.advance) / 2.0);
+                f.text(x, l.text_y + l.text_h / 2.0, hint, theme.gutter_fg);
+            }
+        }
+    }
+
+    // ---- tab strip ----
+    //
+    // After the editor, not before: with fractional scrolling the top
+    // row is usually clipped, and a strip drawn first had document
+    // text sliding over it.
+    if l.tab_h > 0.0 {
+        f.rect(l.tree_w, 0.0, l.width - l.tree_w, l.tab_h, theme.panel_bg);
+        for (index, (x0, x1)) in tabs.iter().enumerate() {
+            if *x0 > l.width {
+                break;
+            }
+            let active = index == scene.workspace.active;
+            if active {
+                f.rect(*x0, 0.0, x1 - x0, l.tab_h, theme.bg);
+                // A bright rule under the active tab.
+                f.rect(*x0, l.tab_h - 2.0, x1 - x0, 2.0, theme.cursor);
+            }
+            // A provisional tab is drawn dimmer even when it is active,
+            // so "this will be replaced by the next click" is visible
+            // without having to remember how it was opened.
+            let preview = scene
+                .workspace
+                .tabs
+                .get(index)
+                .and_then(crate::workspace::Tab::editor)
+                .is_some_and(|b| b.preview);
+            let colour = match (active, preview) {
+                (true, false) => theme.fg,
+                (true, true) => theme.status_fg,
+                (false, _) => theme.tree_file,
+            };
+            f.text(
+                x0 + 1.0 * l.cell.advance,
+                l.cell.ascent,
+                &labels[index],
+                colour,
+            );
+            // Close box, dim until the tab is the active one.
+            f.text(
+                x1 - CLOSE_COLS * l.cell.advance + 0.5 * l.cell.advance,
+                l.cell.ascent,
+                "x",
+                if active {
+                    theme.status_fg
+                } else {
+                    theme.gutter_fg
+                },
+            );
+        }
+    }
+
+    // ---- status bar ----
+    let status_y = l.text_y + l.text_h;
+    f.rect(0.0, status_y, l.width, l.cell.line_height, theme.status_bg);
+
+    let slots = status_buttons(&scene.panels());
+    let extents = status_button_extents(&l, &slots);
+    let mut text_x = l.cell.advance;
+    for (slot, (x0, x1)) in slots.iter().zip(&extents) {
+        if slot.active {
+            f.rect(
+                *x0,
+                status_y,
+                x1 - x0,
+                l.cell.line_height,
+                theme.panel_active,
+            );
+        }
+        // An active toggle gets a rule along its top edge as well as a
+        // fill, so it reads as pressed rather than merely tinted.
+        if slot.active {
+            f.rect(*x0, status_y, x1 - x0, 2.0, theme.cursor);
+        }
+        let size = icon_size(&l);
+        let drawn = icons::width(size);
+        icons::draw(
+            &mut f,
+            slot.icon,
+            (x0 + (x1 - x0 - drawn) / 2.0).round(),
+            (status_y + (l.cell.line_height - drawn) / 2.0).round(),
+            size,
+            if slot.active {
+                theme.fg
+            } else {
+                theme.tree_file
+            },
+        );
+        text_x = x1 + 2.0 * l.cell.advance;
+    }
+    // A divider, so the controls are not mistaken for the readout.
+    if let Some((_, end)) = extents.last() {
+        f.rect(
+            end + 0.5 * l.cell.advance,
+            status_y + 4.0,
+            1.0,
+            l.cell.line_height - 8.0,
+            theme.panel_active,
+        );
+    }
+
+    scratch.text.clear();
+    match scene.status {
+        Some(message) => scratch.text.push_str(message),
+        None => {
+            if let Some(editor) = scene.workspace.active() {
+                let (line, col) = editor.line_col(editor.sel.primary().head);
+                let _ = write!(
+                    scratch.text,
+                    "{}{}:{}   {} lines",
+                    if editor.dirty { "* " } else { "" },
+                    line + 1,
+                    col + 1,
+                    editor.doc.len_lines()
+                );
+                if editor.sel.len() > 1 {
+                    let _ = write!(scratch.text, "   {} cursors", editor.sel.len());
+                }
+                if let Some(language) = editor.language_name() {
+                    let _ = write!(scratch.text, "   {language}");
+                    if let Some(state) = scene.lsp {
+                        let _ = write!(scratch.text, " · {state}");
+                    }
+                }
+            }
+            if scene.autosave {
+                let _ = write!(scratch.text, "   autosave");
+            }
+            if let Some(branch) = scene.branch {
+                let _ = write!(scratch.text, "   {branch}");
+            }
+            if let Some(root) = &scene.workspace.root {
+                let name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let _ = write!(scratch.text, "   [{name}]");
+            }
+        }
+    }
+    f.text(
+        text_x,
+        status_y + l.cell.ascent,
+        &scratch.text,
+        if scene.status.is_some() {
+            theme.fg
+        } else {
+            theme.status_fg
+        },
+    );
+
+    // ---- find bar, or the prompt that shares its row ----
+    if let Some(prompt) = scene.prompt {
+        draw_prompt(&mut f, &l, prompt, theme, scratch);
+    } else if let Some(find) = scene.find {
+        draw_find_bar(&mut f, &l, find, theme, scratch);
+    }
+
+    // ---- overlays, on top of everything ----
+    if let Some(picker) = scene.picker {
+        draw_picker(&mut f, &l, picker, theme, scratch);
+    }
+    if let Some(search) = scene.search {
+        draw_project_search(&mut f, &l, search, theme, scratch);
+    }
+    if let Some(completion) = scene.completion {
+        draw_completion(&mut f, &l, completion, scene, scratch);
+    }
+    // After the completion popup: if both are up, the list is what is
+    // being used and the tooltip is what is in the way.
+    if let Some(hover) = scene.hover.filter(|_| scene.completion.is_none()) {
+        draw_hover(&mut f, &l, hover, theme);
+    }
+    if let Some(menu) = scene.context {
+        draw_context_menu(&mut f, &l, menu, theme, scratch);
+    }
+
+    f.present();
+}
+
+/// Where the caret is on screen, for anchoring a popup to it.
+///
+/// Shared with the completion popup rather than recomputed: a menu that
+/// appeared a line off from the caret would be its own bug.
+pub fn caret_point(l: &Layout, editor: &Editor, tab_width: usize) -> (f32, f32) {
+    let head = editor.sel.primary().head;
+    let line = editor.doc.char_to_line(head);
+    let col = head - editor.doc.line_to_char(line);
+    let caret_x = match editor.doc.line(line) {
+        Some(slice) => visual_col(slice, col, tab_width) as f32,
+        None => 0.0,
+    };
+    let row = line.saturating_sub(editor.top_line()) as f32;
+    (
+        l.text_x + caret_x * l.cell.advance,
+        l.tab_h + (row + 1.0) * l.cell.line_height - editor.pixel_offset(l.cell.line_height),
+    )
+}
+
+/// The completion popup, anchored under the cursor.
+fn draw_completion(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    completion: &Completion,
+    scene: &Scene<'_>,
+    scratch: &mut Scratch,
+) {
+    const ROWS: usize = 10;
+    let theme = scene.theme;
+    let Some(editor) = scene.workspace.active() else {
+        return;
+    };
+    if completion.is_empty() {
+        return;
+    }
+
+    // Anchor on the cursor, in the same coordinates the caret is drawn in.
+    let head = editor.sel.primary().head;
+    let line = editor.doc.char_to_line(head);
+    if line < editor.top_line() {
+        return;
+    }
+    let col = head - editor.doc.line_to_char(line);
+    let caret_x = match editor.doc.line(line) {
+        Some(slice) => visual_col(slice, col, scene.tab_width) as f32,
+        None => 0.0,
+    };
+    let x = (l.text_x + caret_x * l.cell.advance).min(l.width - 24.0 * l.cell.advance);
+    let row = (line - editor.top_line()) as f32;
+
+    let widest = completion
+        .shown
+        .iter()
+        .take(ROWS)
+        .filter_map(|_| None::<usize>)
+        .max()
+        .unwrap_or(0);
+    let _ = widest;
+    let shown = completion.shown.len().min(ROWS);
+    let width = 40.0 * l.cell.advance;
+    let height = shown as f32 * l.cell.line_height;
+
+    // Below the cursor normally, above it when there is no room.
+    let below = l.text_y + (row + 1.0) * l.cell.line_height;
+    let y = if below + height > l.text_y + l.text_h {
+        (l.text_y + row * l.cell.line_height - height).max(l.text_y)
+    } else {
+        below
+    };
+
+    f.rect(x, y, width, height, theme.panel_bg);
+    f.rect(x, y, 2.0, height, theme.cursor);
+
+    let first = completion.selected.saturating_sub(ROWS - 1);
+    for offset in 0..shown {
+        let index = first + offset;
+        let Some(entry) = completion.get(index) else {
+            break;
+        };
+        let row_y = y + offset as f32 * l.cell.line_height;
+        let selected = index == completion.selected;
+        if selected {
+            f.rect(x, row_y, width, l.cell.line_height, theme.panel_active);
+        }
+        scratch.text.clear();
+        truncate_tail(&mut scratch.text, &entry.label, 26);
+        f.text(
+            x + l.cell.advance,
+            row_y + l.cell.ascent,
+            &scratch.text,
+            if selected { theme.fg } else { theme.tree_file },
+        );
+        if let Some(detail) = entry.detail.as_deref() {
+            scratch.text.clear();
+            truncate_tail(&mut scratch.text, detail, 11);
+            let detail_x = x + width - l.cell.advance * (scratch.text.chars().count() as f32 + 1.0);
+            f.text(
+                detail_x,
+                row_y + l.cell.ascent,
+                &scratch.text,
+                theme.gutter_fg,
+            );
+        }
+    }
+}
+
+/// Where the scrollbar thumb sits, or `None` when everything fits.
+///
+/// Shared by drawing and by dragging, so the thumb cannot be drawn
+/// somewhere the mouse does not find it.
+pub fn scrollbar_extent(l: &Layout, total_lines: usize, scroll: f32) -> Option<(f32, f32)> {
+    let rows = l.rows as f32;
+    let total = total_lines as f32;
+    if total <= rows || l.text_h <= 0.0 {
+        return None;
+    }
+    // A thumb proportional to how much is visible, with a floor so it
+    // stays grabbable in a very long file.
+    let fraction = (rows / total).clamp(0.0, 1.0);
+    let height = (l.text_h * fraction).max(24.0).min(l.text_h);
+    let max_scroll = (total - rows).max(1.0);
+    let travel = l.text_h - height;
+    let top = l.text_y + travel * (scroll.max(0.0) / max_scroll).clamp(0.0, 1.0);
+    Some((top, height))
+}
+
+/// Turns a y position on the scrollbar into a scroll offset in lines.
+pub fn scrollbar_scroll_at(l: &Layout, total_lines: usize, y: f32) -> f32 {
+    let rows = l.rows as f32;
+    let total = total_lines as f32;
+    let max_scroll = (total - rows).max(0.0);
+    let Some((_, height)) = scrollbar_extent(l, total_lines, 0.0) else {
+        return 0.0;
+    };
+    let travel = (l.text_h - height).max(1.0);
+    // Grab the thumb by its middle, which is where the pointer feels like
+    // it is holding it.
+    let offset = (y - l.text_y - height / 2.0).clamp(0.0, travel);
+    (offset / travel) * max_scroll
+}
+
+/// How many columns the preview lays out to.
+pub fn preview_columns(l: &Layout) -> usize {
+    // Capped rather than filling the window: a line of prose a hundred and
+    // ten characters wide is hard to track back from the end of.
+    (((l.width - l.text_x - SCROLLBAR_W - 4.0 * l.cell.advance) / l.cell.advance) as usize)
+        .clamp(24, 88)
+}
+
+fn draw_context_menu(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    menu: &ContextMenu,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    let (x, y, width, height) = context_bounds(l, menu);
+    f.rect(x, y, width, height, theme.panel_bg);
+    f.rect(x, y, width, 1.0, theme.panel_active);
+    f.rect(x, y + height - 1.0, width, 1.0, theme.panel_active);
+
+    for (index, entry) in menu.entries.iter().enumerate() {
+        let row_y = y + 2.0 + index as f32 * l.cell.line_height;
+        if entry.is_separator() {
+            f.rect(
+                x + l.cell.advance,
+                row_y + l.cell.line_height / 2.0,
+                width - 2.0 * l.cell.advance,
+                1.0,
+                theme.panel_active,
+            );
+            continue;
+        }
+        let selected = index == menu.selected;
+        if selected {
+            f.rect(x, row_y, width, l.cell.line_height, theme.panel_active);
+        }
+        f.text(
+            x + 1.5 * l.cell.advance,
+            row_y + l.cell.ascent,
+            &entry.label,
+            if selected { theme.fg } else { theme.tree_file },
+        );
+        if !entry.hint.is_empty() {
+            scratch.text.clear();
+            scratch.text.push_str(entry.hint);
+            let hint_x = x + width - l.cell.advance * (entry.hint.chars().count() as f32 + 1.5);
+            f.text(
+                hint_x,
+                row_y + l.cell.ascent,
+                &scratch.text,
+                theme.gutter_fg,
+            );
+        }
+    }
+}
+
+fn draw_settings(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    settings: &Settings,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    let rows = setting_rows();
+    let (ox, oy, width) = settings_origin(l, rows.len());
+
+    for (index, row) in rows.iter().enumerate() {
+        let y = oy + index as f32 * l.cell.line_height;
+        let baseline = y + l.cell.ascent;
+        match row {
+            SettingRow::Blank => {}
+            SettingRow::Title => {
+                f.text(ox, baseline, "Settings", theme.fg);
+            }
+            SettingRow::Heading(text) => {
+                f.text(ox, baseline, text, theme.status_fg);
+            }
+            SettingRow::Switch(setting) => {
+                let on = setting.value(settings);
+                // A box that is filled or empty, rather than a tick: at
+                // one weight a tick and a cross look the same.
+                let box_x = ox + 2.0 * l.cell.advance;
+                let size = (l.cell.line_height * 0.42).round();
+                let box_y = (y + (l.cell.line_height - size) / 2.0).round();
+                f.rect(box_x, box_y, size, size, theme.panel_active);
+                if on {
+                    let pad = (size / 4.0).round();
+                    f.rect(
+                        box_x + pad,
+                        box_y + pad,
+                        size - 2.0 * pad,
+                        size - 2.0 * pad,
+                        theme.cursor,
+                    );
+                }
+                scratch.text.clear();
+                let room = ((width / l.cell.advance) as usize).saturating_sub(6);
+                truncate_tail(&mut scratch.text, setting.label(), room);
+                f.text(
+                    box_x + size + l.cell.advance,
+                    baseline,
+                    &scratch.text,
+                    if on { theme.fg } else { theme.tree_file },
+                );
+            }
+        }
+    }
+
+    let hint = "changes are saved as you make them";
+    f.text(
+        ox,
+        oy + rows.len() as f32 * l.cell.line_height + l.cell.ascent,
+        hint,
+        theme.gutter_fg,
+    );
+}
+
+fn draw_image(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    view: &crate::imageview::ImageView,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    // A caption, so the real pixel size is visible even when the picture
+    // has been scaled to fit.
+    scratch.text.clear();
+    let _ = write!(scratch.text, "{} × {}", view.width, view.height);
+    f.text(
+        l.text_x + l.cell.advance,
+        l.text_y + l.cell.ascent,
+        &scratch.text,
+        theme.gutter_fg,
+    );
+
+    let margin = 2.0 * l.cell.advance;
+    let top = l.text_y + l.cell.line_height;
+    let area_w = (l.width - l.text_x - 2.0 * margin).max(1.0);
+    let area_h = (l.text_h - l.cell.line_height - margin).max(1.0);
+    let (w, h) = crate::imageview::fit(view.width, view.height, area_w, area_h);
+
+    // Centred in what is left.
+    let x = (l.text_x + margin + (area_w - w) / 2.0).round();
+    let y = (top + (area_h - h) / 2.0).round();
+
+    // A one-pixel frame, so a white image against a dark window still has
+    // an edge.
+    f.rect(x - 1.0, y - 1.0, w + 2.0, h + 2.0, theme.panel_active);
+    f.image(&view.image, x, y, w, h);
+}
+
+/// Where the parts of a diff sit.
+///
+/// Shared by drawing and hit-testing, because an editable diff means a
+/// click has to land on the character it looks like it landed on, and two
+/// copies of this arithmetic would drift apart the first time either
+/// changed.
+struct DiffFrame {
+    body_y: f32,
+    rows: usize,
+    /// Left edge of the new side's text, where the working copy is shown.
+    new_text_x: f32,
+    /// How wide that text column is.
+    new_text_w: f32,
+}
+
+fn diff_frame(l: &Layout, side_by_side: bool) -> DiffFrame {
+    let title_h = l.cell.line_height;
+    let body_y = l.text_y + title_h;
+    let rows = ((l.text_h - title_h) / l.cell.line_height).ceil() as usize;
+
+    if side_by_side {
+        let full = l.width - l.text_x - SCROLLBAR_W;
+        let column = (full / 2.0).floor();
+        let numbers = SPLIT_NUMBER_COLS * l.cell.advance;
+        DiffFrame {
+            body_y,
+            rows,
+            new_text_x: l.text_x + column + numbers,
+            new_text_w: column - numbers,
+        }
+    } else {
+        // Two line-number columns, then the sign.
+        let text_x = l.text_x + UNIFIED_NUMBER_COLS * l.cell.advance;
+        DiffFrame {
+            body_y,
+            rows,
+            new_text_x: text_x + 2.0 * l.cell.advance,
+            new_text_w: l.width - text_x - SCROLLBAR_W - 2.0 * l.cell.advance,
+        }
+    }
+}
+
+/// Cells reserved for the two line-number columns and the sign.
+const UNIFIED_NUMBER_COLS: f32 = 9.0;
+/// Cells reserved for one line-number column in the split view.
+const SPLIT_NUMBER_COLS: f32 = 5.0;
+
+fn draw_diff(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    lines: &[lithe_vcs::DiffLine],
+    scene: &Scene<'_>,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    use lithe_vcs::LineKind;
+
+    // Title row, so it is obvious this is a diff and of what.
+    let title_h = l.cell.line_height;
+    f.rect(
+        l.text_x,
+        l.text_y,
+        l.width - l.text_x,
+        title_h,
+        theme.panel_bg,
+    );
+    scratch.text.clear();
+    let _ = write!(
+        scratch.text,
+        "diff · {}",
+        scene.diff_title.unwrap_or("working copy")
+    );
+    f.text(
+        l.text_x + l.cell.advance,
+        l.text_y + l.cell.ascent,
+        &scratch.text,
+        theme.fg,
+    );
+    let hint = if scene.diff_editable {
+        "the right side is the file · type in it"
+    } else {
+        "a committed version · read only"
+    };
+    f.text(
+        l.width - l.cell.advance * (hint.chars().count() as f32 + 1.0),
+        l.text_y + l.cell.ascent,
+        hint,
+        theme.gutter_fg,
+    );
+
+    let frame = diff_frame(l, scene.diff_side_by_side);
+    let DiffFrame { body_y, rows, .. } = frame;
+    let top = scene.diff_scroll.max(0.0) as usize;
+    let slip = (scene.diff_scroll.max(0.0).fract() * l.cell.line_height).round();
+
+    if scene.diff_side_by_side {
+        draw_diff_split(f, l, lines, &frame, scene, theme, scratch);
+        if let Some((top_y, height)) =
+            scrollbar_extent(l, lithe_vcs::pair_columns(lines).len(), scene.diff_scroll)
+        {
+            let x = l.width - SCROLLBAR_W;
+            f.rect(x, l.text_y, SCROLLBAR_W, l.text_h, theme.scrollbar_track);
+            f.rect(
+                x + 2.0,
+                top_y,
+                SCROLLBAR_W - 4.0,
+                height,
+                theme.scrollbar_thumb,
+            );
+        }
+        return;
+    }
+    let numbers = UNIFIED_NUMBER_COLS;
+
+    for row in 0..=rows {
+        let Some(line) = lines.get(top + row) else {
+            break;
+        };
+        let y = body_y + row as f32 * l.cell.line_height - slip;
+        let baseline = y + l.cell.ascent;
+
+        let (sign, colour, tint) = match line.kind {
+            LineKind::Added => ("+", theme.vcs_added, Some(theme.diff_added_bg)),
+            LineKind::Removed => ("-", theme.vcs_removed, Some(theme.diff_removed_bg)),
+            LineKind::Skipped => ("", theme.gutter_fg, None),
+            LineKind::Context => (" ", theme.fg, None),
+        };
+        if let Some(tint) = tint {
+            f.rect(
+                l.text_x + numbers * l.cell.advance,
+                y,
+                l.width - l.text_x - numbers * l.cell.advance - SCROLLBAR_W,
+                l.cell.line_height,
+                tint,
+            );
+        }
+
+        // Old and new line numbers, each blank where the line does not
+        // exist on that side.
+        scratch.text.clear();
+        match (line.old, line.new) {
+            (Some(old), Some(new)) => {
+                let _ = write!(scratch.text, "{old:>4} {new:>4}");
+            }
+            (Some(old), None) => {
+                let _ = write!(scratch.text, "{old:>4}     ");
+            }
+            (None, Some(new)) => {
+                let _ = write!(scratch.text, "     {new:>4}");
+            }
+            (None, None) => {}
+        }
+        f.text(l.text_x, baseline, &scratch.text, theme.gutter_fg);
+
+        let text_x = l.text_x + numbers * l.cell.advance;
+        f.text(text_x, baseline, sign, colour);
+
+        scratch.text.clear();
+        let room = (frame.new_text_w / l.cell.advance) as usize;
+        truncate_tail(&mut scratch.text, &line.text, room);
+        f.text(
+            text_x + 2.0 * l.cell.advance,
+            baseline,
+            &scratch.text,
+            if line.kind == LineKind::Skipped {
+                theme.gutter_fg
+            } else {
+                colour
+            },
+        );
+        if let Some(span) = selected_cells(scene, line) {
+            f.rect(
+                frame.new_text_x + span.start as f32 * l.cell.advance,
+                y,
+                (span.end - span.start).max(1) as f32 * l.cell.advance,
+                l.cell.line_height,
+                theme.selection,
+            );
+        }
+        if let Some(column) = caret_column(scene, line) {
+            f.rect(
+                frame.new_text_x + column as f32 * l.cell.advance,
+                y,
+                (l.cell.advance * 0.12).max(1.5),
+                l.cell.line_height,
+                theme.cursor,
+            );
+        }
+    }
+
+    if let Some((top_y, height)) = scrollbar_extent(l, lines.len(), scene.diff_scroll) {
+        let x = l.width - SCROLLBAR_W;
+        f.rect(x, l.text_y, SCROLLBAR_W, l.text_h, theme.scrollbar_track);
+        f.rect(
+            x + 2.0,
+            top_y,
+            SCROLLBAR_W - 4.0,
+            height,
+            theme.scrollbar_thumb,
+        );
+    }
+}
+
+/// Where the caret sits on a diff row, in cells from the start of the
+/// new side's text.
+///
+/// `None` unless this row is the one the cursor is on. The mapping is the
+/// line number: a diff row knows which line of the working copy it shows,
+/// which is the same thing the buffer's cursor is measured in.
+fn caret_column(scene: &Scene<'_>, line: &lithe_vcs::DiffLine) -> Option<usize> {
+    if !scene.diff_editable {
+        return None;
+    }
+    let editor = scene.workspace.active()?;
+    let here = line.new?;
+    let cursor = editor.sel.primary().head;
+    let row = editor.doc.char_to_line(cursor);
+    // Diff line numbers are 1-based, as every tool reports them.
+    if row + 1 != here {
+        return None;
+    }
+    Some(cursor - editor.doc.line_to_char(row))
+}
+
+/// The selected span on a diff row, in cells from the start of its text.
+///
+/// Empty when the row is not selected. Mapped through the line number,
+/// like the caret: the row knows which line of the working copy it shows.
+fn selected_cells(scene: &Scene<'_>, line: &lithe_vcs::DiffLine) -> Option<std::ops::Range<usize>> {
+    if !scene.diff_editable {
+        return None;
+    }
+    let editor = scene.workspace.active()?;
+    let here = line.new?;
+    let cursor = editor.sel.primary();
+    if cursor.is_empty() {
+        return None;
+    }
+    let row = here.checked_sub(1)?;
+    if row >= editor.doc.len_lines() {
+        return None;
+    }
+    let start = editor.doc.line_to_char(row);
+    let end = start + editor.doc.line_len_chars(row);
+    let (from, to) = (cursor.start().max(start), cursor.end().min(end));
+    (from < to || (from == to && to < end)).then(|| from - start..to - start)
+}
+
+/// The same diff in two columns: the committed version on the left, the
+/// working copy on the right.
+fn draw_diff_split(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    lines: &[lithe_vcs::DiffLine],
+    frame: &DiffFrame,
+    scene: &Scene<'_>,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    use lithe_vcs::LineKind;
+
+    let DiffFrame { body_y, rows, .. } = *frame;
+    let top = scene.diff_scroll.max(0.0) as usize;
+    let slip = (scene.diff_scroll.max(0.0).fract() * l.cell.line_height).round();
+    let pairs = lithe_vcs::pair_columns(lines);
+    let full = l.width - l.text_x - SCROLLBAR_W;
+    let column = (full / 2.0).floor();
+    let numbers = SPLIT_NUMBER_COLS * l.cell.advance;
+
+    // A divider down the middle, so the two sides are clearly two sides.
+    f.rect(l.text_x + column, body_y, 1.0, l.text_h, theme.panel_active);
+
+    for row in 0..=rows {
+        let Some((left, right)) = pairs.get(top + row) else {
+            break;
+        };
+        let y = body_y + row as f32 * l.cell.line_height - slip;
+        let baseline = y + l.cell.ascent;
+
+        for (side, index) in [(0.0, left), (1.0, right)] {
+            let origin = l.text_x + side * column;
+            let Some(index) = index else {
+                // Nothing on this side of the pair: a faint fill, so the
+                // gap reads as "absent" rather than "end of file".
+                f.rect(origin, y, column - 1.0, l.cell.line_height, theme.panel_bg);
+                continue;
+            };
+            let Some(line) = lines.get(*index) else {
+                continue;
+            };
+
+            // The left column shows the old side, the right the new.
+            let (colour, tint, number) = match (side == 0.0, line.kind) {
+                (true, LineKind::Removed) => {
+                    (theme.vcs_removed, Some(theme.diff_removed_bg), line.old)
+                }
+                (false, LineKind::Added) => (theme.vcs_added, Some(theme.diff_added_bg), line.new),
+                (true, _) => (theme.fg, None, line.old),
+                (false, _) => (theme.fg, None, line.new),
+            };
+            if let Some(tint) = tint {
+                f.rect(origin, y, column - 1.0, l.cell.line_height, tint);
+            }
+
+            scratch.text.clear();
+            if let Some(n) = number {
+                let _ = write!(scratch.text, "{n:>4}");
+            }
+            f.text(origin, baseline, &scratch.text, theme.gutter_fg);
+
+            scratch.text.clear();
+            let room = ((frame.new_text_w / l.cell.advance) as usize).saturating_sub(1);
+            truncate_tail(&mut scratch.text, &line.text, room);
+            f.text(
+                origin + numbers,
+                baseline,
+                &scratch.text,
+                if line.kind == LineKind::Skipped {
+                    theme.gutter_fg
+                } else {
+                    colour
+                },
+            );
+            // The caret belongs on the new side only; the old one is a
+            // committed version and has no cursor in it.
+            if side > 0.0 {
+                if let Some(span) = selected_cells(scene, line) {
+                    f.rect(
+                        frame.new_text_x + span.start as f32 * l.cell.advance,
+                        y,
+                        (span.end - span.start).max(1) as f32 * l.cell.advance,
+                        l.cell.line_height,
+                        theme.selection,
+                    );
+                }
+                if let Some(cell) = caret_column(scene, line) {
+                    f.rect(
+                        frame.new_text_x + cell as f32 * l.cell.advance,
+                        y,
+                        (l.cell.advance * 0.12).max(1.5),
+                        l.cell.line_height,
+                        theme.cursor,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// What the pointer is resting on, as the server described it.
+///
+/// A language server answers `textDocument/hover` in Markdown, so the
+/// preview's reader renders it: the same bold, the same code colouring,
+/// from the same code. A signature is the commonest answer and is almost
+/// always a fenced code block.
+pub struct Hover {
+    pub lines: Vec<MdLine>,
+    /// Where the popup points, in physical pixels: the character the
+    /// pointer was over, or the caret when it was asked for by name.
+    pub at: (f32, f32),
+}
+
+impl Hover {
+    /// How wide the text is laid out, and so how wide the popup is.
+    pub const COLUMNS: usize = 64;
+    /// Past this it is a document, not a tooltip, and scrolling a thing
+    /// that vanishes when the mouse moves is not a way to read it.
+    pub const ROWS: usize = 14;
+
+    pub fn rows(&self) -> usize {
+        preview_rows(&self.lines).min(Self::ROWS)
+    }
+}
+
+/// Where the hover popup sits, clamped inside the window.
+///
+/// Its own function for the same reason the context menu's is: the popup
+/// is placed relative to a point that can be anywhere, and a placement
+/// that is only in the drawing code cannot be checked.
+pub fn hover_bounds(l: &Layout, hover: &Hover) -> (f32, f32, f32, f32) {
+    let width = (Hover::COLUMNS as f32 + 2.0 * HOVER_PAD) * l.cell.advance;
+    let height = (hover.rows() as f32 + 2.0 * HOVER_PAD) * l.cell.line_height;
+
+    // Above the character rather than below: a tooltip under the pointer
+    // is a tooltip the pointer is about to cover.
+    let x = hover.at.0.min(l.width - width).max(0.0);
+    let above = hover.at.1 - height;
+    let y = if above >= l.text_y {
+        above
+    } else {
+        hover.at.1 + l.cell.line_height
+    };
+    // Clamped after the choice, not inside it: the anchor is a pointer
+    // position, and a pointer can be outside the window — or have been,
+    // when the window was last a different size.
+    let y = y.clamp(0.0, (l.height - height).max(0.0));
+    (x, y, width, height)
+}
+
+/// Cells of air between the popup's edge and its text.
+const HOVER_PAD: f32 = 1.0;
+
+fn draw_hover(f: &mut lithe_gpu::Frame<'_>, l: &Layout, hover: &Hover, theme: &Theme) {
+    if hover.lines.is_empty() {
+        return;
+    }
+    const PAD: f32 = HOVER_PAD;
+    let (x, y, width, height) = hover_bounds(l, hover);
+
+    f.rect(x, y, width, height, theme.panel_bg);
+    f.rect(x, y, 2.0, height, theme.cursor);
+
+    let left = x + PAD * l.cell.advance;
+    let mut row_y = y + PAD * l.cell.line_height;
+    let mut used = 0usize;
+    for line in &hover.lines {
+        let rows = line.rows();
+        if used + rows > Hover::ROWS {
+            break;
+        }
+        used += rows;
+        let height = rows as f32 * l.cell.line_height;
+        let baseline = row_y + height - (l.cell.line_height - l.cell.ascent);
+        if line.block == MdBlock::Code {
+            f.rect(
+                left,
+                row_y,
+                width - 2.0 * PAD * l.cell.advance,
+                height,
+                theme.panel_active,
+            );
+        }
+        let scale = match line.scale {
+            MdScale::Body => lithe_gpu::Size::Body,
+            MdScale::Large => lithe_gpu::Size::Large,
+            MdScale::Huge => lithe_gpu::Size::Huge,
+        };
+        let mut pen = left + line.indent as f32 * l.cell.advance;
+        for span in &line.spans {
+            let (colour, face) = span_style(span.style, theme);
+            pen = f.text_sized(pen, baseline, &span.text, colour, face, scale);
+        }
+        row_y += height;
+    }
+}
+
+/// Colour and weight for a rendered-Markdown run.
+///
+/// Shared by the preview and the hover popup, which show the same thing
+/// from the same reader and should not disagree about what bold looks
+/// like. Structure is carried by weight, colour and — for the top two
+/// heading levels — size; everything else is one size, because a uniform
+/// grid is what makes the rest of the editor cheap.
+fn span_style(style: MdStyle, theme: &Theme) -> (Rgba, lithe_gpu::Face) {
+    use lithe_gpu::Face;
+    match style {
+        MdStyle::Heading(1 | 2) => (theme.fg, Face::Bold),
+        MdStyle::Heading(_) => (theme.syntax.function, Face::Bold),
+        MdStyle::Bold => (theme.fg, Face::Bold),
+        MdStyle::Emphasis => (theme.syntax.keyword, Face::Regular),
+        MdStyle::BoldEmphasis => (theme.syntax.keyword, Face::Bold),
+        MdStyle::Code => (theme.syntax.string, Face::Regular),
+        MdStyle::Quote => (theme.status_fg, Face::Regular),
+        MdStyle::Link => (theme.cursor, Face::Regular),
+        MdStyle::Bullet => (theme.gutter_fg, Face::Regular),
+        MdStyle::Strike => (theme.status_fg, Face::Regular),
+        MdStyle::Divider => (theme.gutter_fg, Face::Regular),
+        MdStyle::Syntax(kind) => (theme.colour(Some(kind)), Face::Regular),
+        MdStyle::Body => (theme.fg, Face::Regular),
+    }
+}
+
+fn draw_preview(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    lines: &[MdLine],
+    scroll: f32,
+    theme: &Theme,
+) {
+    use lithe_gpu::Size;
+
+    let top = scroll.max(0.0) as usize;
+    // A margin either side, and above: prose pressed into the corner of a
+    // window is the main thing that made this not look like a document.
+    // Centred, but with a ceiling on the margin: on a wide window the
+    // text was being squeezed into a narrow ribbon with half the screen
+    // empty either side.
+    const MAX_MARGIN_COLS: f32 = 6.0;
+    let columns = preview_columns(l) as f32;
+    let available = l.width - l.text_x - SCROLLBAR_W;
+    let gutter = ((available - columns * l.cell.advance) / 2.0)
+        .clamp(2.0 * l.cell.advance, MAX_MARGIN_COLS * l.cell.advance);
+    let left = l.text_x + gutter;
+    let right = left + columns * l.cell.advance;
+    let top_margin = l.cell.line_height;
+
+    // Lines are no longer all one row tall, so the y of each is the sum of
+    // the ones above it rather than its index times the line height. The
+    // fractional part of the scroll still slips by one body row, which is
+    // what a wheel notch means.
+    let slip = (scroll.max(0.0).fract() * l.cell.line_height).round();
+    let mut y = l.text_y + top_margin - slip;
+    let bottom = l.text_y + l.text_h;
+
+    for line in lines.iter().skip(top) {
+        if y >= bottom {
+            break;
+        }
+        let height = line.rows() as f32 * l.cell.line_height;
+        let scale = match line.scale {
+            MdScale::Body => Size::Body,
+            MdScale::Large => Size::Large,
+            MdScale::Huge => Size::Huge,
+        };
+        // A heading sits on the lower of its two rows, so the extra row
+        // becomes air above it rather than a gap underneath.
+        let baseline = y + height - (l.cell.line_height - l.cell.ascent);
+
+        // Block decoration goes behind the text.
+        match line.block {
+            MdBlock::Code => f.rect(
+                left - 2.0 * l.cell.advance,
+                y,
+                right - left + 4.0 * l.cell.advance,
+                height,
+                theme.panel_bg,
+            ),
+            // As wide as the table, not as wide as the column: a tint
+            // running past the last cell reads as a band across the page
+            // rather than as the table's own header.
+            MdBlock::TableHead => {
+                let cells: usize = line.spans.iter().map(|s| s.text.chars().count()).sum();
+                f.rect(
+                    left + line.indent as f32 * l.cell.advance - l.cell.advance,
+                    y,
+                    (cells as f32 + 2.0) * l.cell.advance,
+                    height,
+                    theme.panel_bg,
+                )
+            }
+            MdBlock::Quote => f.rect(left - 2.0 * l.cell.advance, y, 2.0, height, theme.gutter_fg),
+            MdBlock::Rule => f.rect(
+                left,
+                y + height / 2.0,
+                right - left,
+                1.0,
+                theme.panel_active,
+            ),
+            MdBlock::HeadingRule => f.rect(
+                left,
+                y + height / 3.0,
+                right - left,
+                1.0,
+                theme.panel_active,
+            ),
+            MdBlock::Plain => {}
+        }
+
+        let mut x = left + line.indent as f32 * l.cell.advance;
+        for span in &line.spans {
+            let (colour, face) = span_style(span.style, theme);
+            let next = f.text_sized(x, baseline, &span.text, colour, face, scale);
+            // A line through or under the run, where colour alone is doing
+            // too much work in a single-weight preview.
+            let rule = match span.style {
+                // Skip the leading space a wrap may have put on the span,
+                // or the rule starts before the word does.
+                MdStyle::Link => Some(l.cell.line_height - 3.0),
+                MdStyle::Strike => Some(l.cell.ascent * 0.6),
+                _ => None,
+            };
+            if let Some(offset) = rule {
+                let lead = span.text.len() - span.text.trim_start().len();
+                let from = x + lead as f32 * l.cell.advance;
+                f.rect(from, y + offset, next - from, 1.0, colour);
+            }
+            x = next;
+        }
+        y += height;
+    }
+
+    // Scrollbar, same as the editor's.
+    if let Some((top_y, height)) = scrollbar_extent(l, preview_rows(lines), scroll) {
+        let x = l.width - SCROLLBAR_W;
+        f.rect(x, l.text_y, SCROLLBAR_W, l.text_h, theme.scrollbar_track);
+        f.rect(
+            x + 2.0,
+            top_y,
+            SCROLLBAR_W - 4.0,
+            height,
+            theme.scrollbar_thumb,
+        );
+    }
+}
+
+/// How many grid rows a rendered preview occupies.
+///
+/// More than `lines.len()`, because a top-level heading is two rows tall.
+/// The scrollbar and the scroll limit both want rows, not lines.
+pub fn preview_rows(lines: &[MdLine]) -> usize {
+    lines.iter().map(MdLine::rows).sum()
+}
+
+fn draw_prompt(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    prompt: &Prompt,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    let y = l.tab_h;
+    f.rect(0.0, y, l.width, l.find_h, theme.panel_bg);
+    f.rect(0.0, y, l.width, 1.0, theme.cursor);
+
+    scratch.text.clear();
+    let _ = write!(scratch.text, "{}  {}", prompt.label, prompt.text);
+    f.text(l.cell.advance, y + l.cell.ascent, &scratch.text, theme.fg);
+    f.rect(
+        l.cell.advance * (scratch.text.chars().count() as f32 + 1.2),
+        y,
+        (l.cell.advance * 0.12).max(1.5),
+        l.find_h,
+        theme.cursor,
+    );
+
+    let hint = "enter commits · esc cancels";
+    let hint_x = l.width - l.cell.advance * (hint.chars().count() as f32 + 1.0);
+    f.text(hint_x, y + l.cell.ascent, hint, theme.gutter_fg);
+}
+
+fn draw_find_bar(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    find: &Find,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    let y = l.tab_h;
+    f.rect(0.0, y, l.width, l.find_h, theme.panel_bg);
+    f.rect(0.0, y, l.width, 1.0, theme.panel_active);
+    let baseline = y + l.cell.ascent;
+
+    // find: <query>     replace: <text>        [no matches]
+    scratch.text.clear();
+    let _ = write!(scratch.text, "find  {}", find.query);
+    let query_cells = scratch.text.chars().count() as f32;
+    f.text(l.cell.advance, baseline, &scratch.text, theme.fg);
+    if find.focus == Field::Query {
+        f.rect(
+            l.cell.advance * (query_cells + 1.2),
+            y,
+            (l.cell.advance * 0.12).max(1.5),
+            l.find_h,
+            theme.cursor,
+        );
+    }
+
+    if find.replacing {
+        let x = l.cell.advance * (query_cells + 6.0);
+        scratch.text.clear();
+        let _ = write!(scratch.text, "replace  {}", find.replace);
+        f.text(x, baseline, &scratch.text, theme.fg);
+        if find.focus == Field::Replace {
+            let cells = scratch.text.chars().count() as f32;
+            f.rect(
+                x + l.cell.advance * (cells + 0.2),
+                y,
+                (l.cell.advance * 0.12).max(1.5),
+                l.find_h,
+                theme.cursor,
+            );
+        }
+    }
+
+    scratch.text.clear();
+    if find.missed {
+        scratch.text.push_str("no matches");
+    } else if find.replacing {
+        scratch
+            .text
+            .push_str("tab switches field · enter replaces · cmd+enter all");
+    } else {
+        scratch
+            .text
+            .push_str("enter next · shift+enter previous · esc close");
+    }
+    let hint_x = l.width - l.cell.advance * (scratch.text.chars().count() as f32 + 1.0);
+    f.text(
+        hint_x,
+        baseline,
+        &scratch.text,
+        if find.missed {
+            theme.error
+        } else {
+            theme.gutter_fg
+        },
+    );
+}
+
+fn draw_project_search(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    search: &ProjectSearch,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    f.rect(0.0, 0.0, l.width, l.height, theme.scrim);
+
+    let shown = search.hits.len().min(PICKER_ROWS);
+    let panel_w = (l.width * 0.78).clamp(40.0 * l.cell.advance, l.width - 4.0 * l.cell.advance);
+    let panel_x = ((l.width - panel_w) / 2.0).round();
+    let panel_y = (l.height * 0.1).round();
+    let panel_h = l.cell.line_height * (shown as f32 + 2.0);
+
+    f.rect(panel_x, panel_y, panel_w, panel_h, theme.panel_bg);
+    f.rect(panel_x, panel_y, panel_w, 2.0, theme.cursor);
+
+    scratch.text.clear();
+    let _ = write!(scratch.text, "search  {}", search.query);
+    f.text(
+        panel_x + l.cell.advance,
+        panel_y + l.cell.ascent,
+        &scratch.text,
+        theme.fg,
+    );
+    f.rect(
+        // +1 for the cell the text itself starts at; without it the
+        // caret trails the last character typed.
+        panel_x + l.cell.advance * (scratch.text.chars().count() as f32 + 1.2),
+        panel_y,
+        (l.cell.advance * 0.12).max(1.5),
+        l.cell.line_height,
+        theme.cursor,
+    );
+
+    scratch.text.clear();
+    if search.running {
+        let _ = write!(scratch.text, "{}…", search.hits.len());
+    } else if search.truncated {
+        let _ = write!(scratch.text, "{}+", search.hits.len());
+    } else {
+        let _ = write!(scratch.text, "{}", search.hits.len());
+    }
+    let count_x = panel_x + panel_w - l.cell.advance * (scratch.text.chars().count() as f32 + 1.0);
+    f.text(
+        count_x,
+        panel_y + l.cell.ascent,
+        &scratch.text,
+        theme.gutter_fg,
+    );
+
+    // Scroll so the selection stays visible.
+    let first = search.selected.saturating_sub(PICKER_ROWS - 1);
+    let columns = (panel_w / l.cell.advance) as usize;
+    for row in 0..shown {
+        let index = first + row;
+        let Some(hit) = search.hits.get(index) else {
+            break;
+        };
+        let y = panel_y + l.cell.line_height * (row as f32 + 1.0);
+        let selected = index == search.selected;
+        if selected {
+            f.rect(panel_x, y, panel_w, l.cell.line_height, theme.panel_active);
+        }
+
+        // "path:line" in one colour, the matching line in another, so the
+        // eye can separate location from content.
+        scratch.text.clear();
+        let name = hit
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = write!(scratch.text, "{name}:{}", hit.line);
+        let location_cells = scratch.text.chars().count();
+        f.text(
+            panel_x + l.cell.advance * 1.5,
+            y + l.cell.ascent,
+            &scratch.text,
+            theme.syntax.function,
+        );
+
+        let text_x = panel_x + l.cell.advance * (location_cells as f32 + 3.0);
+        let room = columns.saturating_sub(location_cells + 5);
+        scratch.text.clear();
+        let trimmed = hit.text.trim_start();
+        truncate_tail(&mut scratch.text, trimmed, room);
+        f.text(
+            text_x,
+            y + l.cell.ascent,
+            &scratch.text,
+            if selected { theme.fg } else { theme.tree_file },
+        );
+    }
+
+    if search.hits.is_empty() {
+        f.text(
+            panel_x + l.cell.advance * 1.5,
+            panel_y + l.cell.line_height + l.cell.ascent,
+            if search.running {
+                "searching…"
+            } else {
+                "no matches"
+            },
+            theme.gutter_fg,
+        );
+    }
+}
+
+/// Copies `text`, cutting the end off when it will not fit. The opposite of
+/// `truncate_into`: a matching line is most informative at its start.
+fn truncate_tail(out: &mut String, text: &str, room: usize) {
+    if text.chars().count() <= room {
+        out.push_str(text);
+        return;
+    }
+    out.extend(text.chars().take(room.saturating_sub(1)));
+    out.push('…');
+}
+
+fn draw_landing(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    scene: &Scene<'_>,
+    scratch: &mut Scratch,
+) {
+    let theme = scene.theme;
+    let rows = landing_rows(scene.recents);
+    let (ox, oy) = landing_origin(l, rows.len());
+    let width = LANDING_COLS * l.cell.advance;
+    let indent = 2.0 * l.cell.advance;
+
+    for (index, entry) in rows.iter().enumerate() {
+        let y = oy + index as f32 * l.cell.line_height;
+        let baseline = y + l.cell.ascent;
+
+        match &entry.row {
+            Row::Blank => {}
+            Row::Title => {
+                f.text(ox, baseline, "lithe", theme.fg);
+            }
+            Row::Subtitle => {
+                scratch.text.clear();
+                let _ = write!(
+                    scratch.text,
+                    "a local editor  ·  v{}",
+                    env!("CARGO_PKG_VERSION")
+                );
+                f.text(ox, baseline, &scratch.text, theme.gutter_fg);
+            }
+            Row::Heading(text) => {
+                f.text(ox, baseline, text, theme.status_fg);
+            }
+            Row::Action { label, hint } => {
+                f.text(ox + indent, baseline, label, theme.cursor);
+                // Shortcut hint, right-aligned in the column.
+                let hint_x = ox + width - hint.chars().count() as f32 * l.cell.advance;
+                f.text(hint_x, baseline, hint, theme.gutter_fg);
+            }
+            Row::Recent(recent) => {
+                let Some(path) = scene.recents.get(*recent) else {
+                    continue;
+                };
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                f.text(ox + indent, baseline, &name, theme.cursor);
+
+                // The parent directory, right-aligned and elided from the
+                // left: the tail of a path is what identifies it.
+                let parent = path.parent().map(shorten_home).unwrap_or_default();
+                let room = (LANDING_COLS - 2.0 - name.chars().count() as f32 - 2.0).max(4.0);
+                scratch.text.clear();
+                truncate_into(&mut scratch.text, &parent, room as usize);
+                let detail_x = ox + width - scratch.text.chars().count() as f32 * l.cell.advance;
+                f.text(detail_x, baseline, &scratch.text, theme.gutter_fg);
+            }
+            Row::Footer(text) => {
+                f.text(ox, baseline, text, theme.gutter_fg);
+            }
+        }
+    }
+}
+
+/// Replaces the home directory with `~`, the way every shell shows it.
+fn shorten_home(path: &Path) -> String {
+    let text = path.display().to_string();
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) => match path.strip_prefix(&home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => text,
+        },
+        None => text,
+    }
+}
+
+fn draw_editor(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    editor: &Editor,
+    scene: &Scene<'_>,
+    scratch: &mut Scratch,
+) {
+    let theme = scene.theme;
+    let tab_width = scene.tab_width;
+    let doc = &editor.doc;
+    let total_lines = doc.len_lines();
+    let top = editor.top_line();
+    // How far the top line is clipped by, which every row shifts up by.
+    let slip = editor.pixel_offset(l.cell.line_height);
+    // Last line with any pixels on screen. Fractional scrolling means the
+    // bottom row is usually partial, so this is inclusive — and every loop
+    // below uses it. They did not always agree, and the row that only the
+    // text loop reached drew characters with no caret under them.
+    let last_visible = top + l.rows;
+    // Reserve the scrollbar's column so a long line does not run under it.
+    let text_right = l.width - SCROLLBAR_W;
+    let max_cols = (((text_right - l.text_x) / l.cell.advance).ceil() as usize).max(1);
+
+    let cursor_lines: Vec<usize> = editor
+        .sel
+        .cursors()
+        .iter()
+        .map(|c| doc.char_to_line(c.head))
+        .collect();
+
+    let row_y = |line: usize| l.text_y + (line - top) as f32 * l.cell.line_height - slip;
+
+    // Current-line highlight, behind everything else.
+    for &line in &cursor_lines {
+        if line >= top && line <= last_visible {
+            f.rect(
+                l.text_x,
+                row_y(line),
+                l.width - l.text_x,
+                l.cell.line_height,
+                theme.cursor_line,
+            );
+        }
+    }
+
+    // Selections, as rects behind the text.
+    for cursor in editor.sel.cursors() {
+        if cursor.is_empty() {
+            continue;
+        }
+        let (start, end) = (cursor.start(), cursor.end());
+        let first = doc.char_to_line(start).max(top);
+        let last = doc.char_to_line(end).min(last_visible);
+
+        for line in first..=last {
+            let Some(slice) = doc.line(line) else {
+                continue;
+            };
+            let line_start = doc.line_to_char(line);
+            let line_chars = doc.line_len_chars(line);
+
+            let from = start.saturating_sub(line_start).min(line_chars);
+            let spans_past_end = end >= line_start + line_chars;
+            let to = if spans_past_end {
+                line_chars + 1
+            } else {
+                end - line_start
+            };
+            if to <= from && !spans_past_end {
+                continue;
+            }
+
+            let x0 = visual_col(slice, from, tab_width) as f32;
+            let x1 = visual_col(slice, to.min(line_chars), tab_width) as f32
+                + if to > line_chars { 1.0 } else { 0.0 };
+            f.rect(
+                l.text_x + x0 * l.cell.advance,
+                row_y(line),
+                (x1 - x0).max(0.0) * l.cell.advance,
+                l.cell.line_height,
+                theme.selection,
+            );
+        }
+    }
+
+    // Search matches, behind the text and above the selection, so a
+    // selected match still reads as both.
+    for span in scene.find_matches {
+        let line = doc.char_to_line(span.start);
+        if line < top || line > last_visible {
+            continue;
+        }
+        let Some(slice) = doc.line(line) else {
+            continue;
+        };
+        let line_start = doc.line_to_char(line);
+        let from = span.start - line_start;
+        let to = (span.end - line_start).min(doc.line_len_chars(line));
+        let x0 = visual_col(slice, from, tab_width) as f32;
+        let x1 = visual_col(slice, to, tab_width) as f32;
+        f.rect(
+            l.text_x + x0 * l.cell.advance,
+            row_y(line),
+            (x1 - x0).max(1.0) * l.cell.advance,
+            l.cell.line_height,
+            theme.match_bg,
+        );
+    }
+
+    f.rect(l.tree_w, l.text_y, l.gutter_w, l.text_h, theme.gutter_bg);
+
+    // Text, bounded by the viewport.
+    for row in 0..=l.rows {
+        let line = top + row;
+        if line >= total_lines {
+            break;
+        }
+        let Some(slice) = doc.line(line) else { break };
+        let baseline = l.text_y + row as f32 * l.cell.line_height + l.cell.ascent;
+
+        scratch.text.clear();
+        let _ = write!(scratch.text, "{}", line + 1);
+        let number_x = l.text_x - l.cell.advance * (1 + scratch.text.chars().count()) as f32;
+        f.text(
+            number_x,
+            baseline,
+            &scratch.text,
+            if cursor_lines.contains(&line) {
+                theme.gutter_fg_active
+            } else {
+                theme.gutter_fg
+            },
+        );
+
+        // Highlight kind per character of this line. Spans are byte
+        // ranges in paint order, so filling them in sequence lets the
+        // narrower, more specific capture win.
+        let line_chars = doc.line_len_chars(line);
+        scratch.styles.clear();
+        scratch.styles.resize(line_chars, None);
+        if !scene.highlights.is_empty() && line_chars > 0 {
+            let rope = doc.rope();
+            let line_start_char = doc.line_to_char(line);
+            let line_start_byte = rope.char_to_byte(line_start_char);
+            let line_end_byte = rope.char_to_byte(line_start_char + line_chars);
+
+            for span in scene.highlights {
+                // Spans are sorted by start, so once one begins past this
+                // line, every later one does too.
+                if span.start >= line_end_byte {
+                    break;
+                }
+                if span.end <= line_start_byte {
+                    continue;
+                }
+                let from = rope.byte_to_char(span.start.max(line_start_byte)) - line_start_char;
+                let to = rope.byte_to_char(span.end.min(line_end_byte)) - line_start_char;
+                for style in scratch.styles[from.min(line_chars)..to.min(line_chars)].iter_mut() {
+                    *style = Some(span.kind);
+                }
+            }
+        }
+
+        // Emit one run of text per colour change, so a line costs a handful
+        // of draws rather than one per character.
+        scratch.text.clear();
+        let mut col = 0usize;
+        let mut run_col = 0usize;
+        let mut run_kind: Option<Kind> = None;
+
+        for (index, ch) in slice.chars().enumerate() {
+            if col >= max_cols || ch == '\n' || ch == '\r' {
+                break;
+            }
+            let kind = scratch.styles.get(index).copied().flatten();
+            if kind != run_kind && !scratch.text.is_empty() {
+                f.text(
+                    l.text_x + run_col as f32 * l.cell.advance,
+                    baseline,
+                    &scratch.text,
+                    theme.colour(run_kind),
+                );
+                scratch.text.clear();
+                run_col = col;
+            }
+            run_kind = kind;
+
+            if ch == '\t' {
+                let stop = tab_width - (col % tab_width);
+                for _ in 0..stop.min(max_cols - col) {
+                    scratch.text.push(' ');
+                }
+                col += stop;
+            } else {
+                scratch.text.push(ch);
+                col += 1;
+            }
+        }
+        if !scratch.text.is_empty() {
+            f.text(
+                l.text_x + run_col as f32 * l.cell.advance,
+                baseline,
+                &scratch.text,
+                theme.colour(run_kind),
+            );
+        }
+    }
+
+    // Line blame, trailing the cursor's line.
+    //
+    // At the end of the text rather than in a column of its own: a fixed
+    // column would either waste width on short files or clip on long
+    // lines, and the thing you are reading is the line, not the margin.
+    if let Some(note) = scene.blame {
+        if let Some(editor) = scene.workspace.active() {
+            let line = editor.doc.char_to_line(editor.sel.primary().head);
+            if line >= top && line <= last_visible && !note.is_empty() {
+                let end = doc
+                    .line(line)
+                    .map(|slice| visual_col(slice, doc.line_len_chars(line), tab_width))
+                    .unwrap_or(0);
+                // A gap wide enough that it reads as an annotation and
+                // not as more of the line.
+                let col = end + 4;
+                let room = max_cols.saturating_sub(col);
+                if room >= 8 {
+                    scratch.text.clear();
+                    truncate_tail(&mut scratch.text, note, room);
+                    f.text(
+                        l.text_x + col as f32 * l.cell.advance,
+                        row_y(line) + l.cell.ascent,
+                        &scratch.text,
+                        theme.gutter_fg,
+                    );
+                }
+            }
+        }
+    }
+
+    // Version control, at the very left of the gutter. Drawn before
+    // diagnostics so a diagnostic bar sits beside it rather than under it.
+    for hunk in scene.hunks {
+        let colour = match hunk.change {
+            lithe_vcs::Change::Added => theme.vcs_added,
+            lithe_vcs::Change::Modified => theme.vcs_modified,
+            lithe_vcs::Change::Removed => theme.vcs_removed,
+        };
+        if hunk.change == lithe_vcs::Change::Removed {
+            // Nothing was left behind to mark, so show a stub at the
+            // boundary the deleted lines collapsed to.
+            let line = hunk.line.max(top);
+            if line <= last_visible {
+                f.rect(
+                    l.tree_w,
+                    row_y(line) + l.cell.line_height - 2.0,
+                    l.cell.advance * 0.5,
+                    3.0,
+                    colour,
+                );
+            }
+            continue;
+        }
+        for offset in 0..hunk.lines {
+            let line = hunk.line + offset;
+            if line < top || line > last_visible {
+                continue;
+            }
+            f.rect(l.tree_w, row_y(line), 3.0, l.cell.line_height, colour);
+        }
+    }
+
+    // Diagnostics: a bar in the gutter for the line, and a rule under the
+    // offending span. A rule rather than a squiggle because at one device
+    // pixel a squiggle is mud, and the colour already carries the meaning.
+    for mark in scene.diagnostics {
+        let line = doc.char_to_line(mark.start);
+        if line < top || line > last_visible {
+            continue;
+        }
+        let colour = match mark.severity {
+            Severity::Error => theme.error,
+            Severity::Warning => theme.diagnostic_warning,
+            _ => theme.diagnostic_hint,
+        };
+        let y = row_y(line);
+        // Offset past the version-control stripe.
+        f.rect(l.tree_w + 4.0, y, 2.0, l.cell.line_height, colour);
+
+        let Some(slice) = doc.line(line) else {
+            continue;
+        };
+        let line_start = doc.line_to_char(line);
+        let from = mark.start.saturating_sub(line_start);
+        let to = (mark.end - line_start).min(doc.line_len_chars(line));
+        let x0 = visual_col(slice, from, tab_width) as f32;
+        let x1 = visual_col(slice, to.max(from + 1), tab_width) as f32;
+        f.rect(
+            l.text_x + x0 * l.cell.advance,
+            y + l.cell.line_height - 2.0,
+            (x1 - x0).max(1.0) * l.cell.advance,
+            2.0,
+            colour,
+        );
+    }
+
+    // Scrollbar. Only when there is something to scroll, so a short file
+    // does not grow furniture it has no use for.
+    if let Some((top_y, height)) = scrollbar_extent(l, total_lines, editor.scroll) {
+        let x = l.width - SCROLLBAR_W;
+        f.rect(x, l.text_y, SCROLLBAR_W, l.text_h, theme.scrollbar_track);
+        f.rect(
+            x + 2.0,
+            top_y,
+            SCROLLBAR_W - 4.0,
+            height,
+            theme.scrollbar_thumb,
+        );
+    }
+
+    // Cursors, on top. These blink while you are working and settle to
+    // solid once the window is left alone; see `BLINK_FOR` in the app.
+    let caret_w = (l.cell.advance * 0.12).max(1.5);
+    for cursor in editor.sel.cursors() {
+        let line = doc.char_to_line(cursor.head);
+        if line < top || line > last_visible {
+            continue;
+        }
+        let Some(slice) = doc.line(line) else {
+            continue;
+        };
+        let col = cursor.head - doc.line_to_char(line);
+        if !scene.caret_visible {
+            continue;
+        }
+        let x = l.text_x + visual_col(slice, col, tab_width) as f32 * l.cell.advance;
+        f.rect(x, row_y(line), caret_w, l.cell.line_height, theme.cursor);
+    }
+}
+
+fn draw_picker(
+    f: &mut lithe_gpu::Frame<'_>,
+    l: &Layout,
+    picker: &Picker,
+    theme: &Theme,
+    scratch: &mut Scratch,
+) {
+    // Dim what is behind, so the overlay reads as a layer rather than a
+    // panel that happens to be on top.
+    f.rect(0.0, 0.0, l.width, l.height, theme.scrim);
+
+    let shown = (picker.matched() as usize).min(PICKER_ROWS);
+    let panel_w = (l.width * 0.6).clamp(40.0 * l.cell.advance, l.width - 8.0 * l.cell.advance);
+    let panel_x = ((l.width - panel_w) / 2.0).round();
+    let panel_y = (l.height * 0.12).round();
+    let panel_h = l.cell.line_height * (shown as f32 + 2.0);
+
+    f.rect(panel_x, panel_y, panel_w, panel_h, theme.panel_bg);
+    f.rect(panel_x, panel_y, panel_w, 2.0, theme.cursor);
+
+    // Query line.
+    scratch.text.clear();
+    let _ = write!(scratch.text, "{}  {}", picker.kind.prompt(), picker.query);
+    f.text(
+        panel_x + l.cell.advance,
+        panel_y + l.cell.ascent,
+        &scratch.text,
+        theme.fg,
+    );
+    // Caret at the end of the query.
+    f.rect(
+        // +1 for the cell the text itself starts at; without it the
+        // caret trails the last character typed.
+        panel_x + l.cell.advance * (scratch.text.chars().count() as f32 + 1.2),
+        panel_y,
+        (l.cell.advance * 0.12).max(1.5),
+        l.cell.line_height,
+        theme.cursor,
+    );
+
+    // Result count, right-aligned on the query line.
+    scratch.text.clear();
+    let _ = write!(scratch.text, "{}/{}", picker.matched(), picker.total());
+    let count_x = panel_x + panel_w - l.cell.advance * (scratch.text.chars().count() as f32 + 1.0);
+    f.text(
+        count_x,
+        panel_y + l.cell.ascent,
+        &scratch.text,
+        theme.gutter_fg,
+    );
+
+    // Results. Scrolled so the selection stays visible.
+    let first = (picker.selected as usize).saturating_sub(PICKER_ROWS - 1);
+    let room = ((panel_w / l.cell.advance) as usize).saturating_sub(3);
+    for row in 0..shown {
+        let index = (first + row) as u32;
+        let Some(label) = picker.label(index) else {
+            break;
+        };
+        let y = panel_y + l.cell.line_height * (row as f32 + 1.0);
+        let selected = index == picker.selected;
+        if selected {
+            f.rect(panel_x, y, panel_w, l.cell.line_height, theme.panel_active);
+        }
+        scratch.text.clear();
+        truncate_into(&mut scratch.text, label, room);
+        f.text(
+            panel_x + l.cell.advance * 1.5,
+            y + l.cell.ascent,
+            &scratch.text,
+            if selected { theme.fg } else { theme.tree_file },
+        );
+    }
+}
+
+/// Copies `text` into `out`, eliding the middle when it will not fit. Paths
+/// are most recognisable at their ends, so the tail is kept.
+fn truncate_into(out: &mut String, text: &str, room: usize) {
+    let len = text.chars().count();
+    if len <= room || room < 4 {
+        out.push_str(text);
+        return;
+    }
+    let tail = room - 1;
+    out.push('…');
+    out.extend(text.chars().skip(len - tail));
+}
+
+fn decimal_width(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+#[allow(dead_code)]
+pub fn dim(colour: Rgba, alpha: f32) -> Rgba {
+    colour.alpha(alpha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::Workspace;
+    use lithe_core::{Cursor, Selection, TextBuffer};
+
+    fn scene_for(editor: Editor, theme: &Theme) -> (Workspace, usize) {
+        let mut ws = Workspace::empty(None);
+        ws.push(editor);
+        let _ = theme;
+        (ws, 4)
+    }
+
+    /// A scene showing nothing but the workspace, for tests that care
+    /// about one field of it.
+    fn probe_scene<'a>(ws: &'a Workspace, theme: &'a Theme) -> Scene<'a> {
+        Scene {
+            blame: None,
+            workspace: ws,
+            find: None,
+            search: None,
+            find_matches: &[],
+            completion: None,
+            diagnostics: &[],
+            hunks: &[],
+            branch: None,
+            lsp: None,
+            autosave: false,
+            prompt: None,
+            caret_visible: true,
+            recents: &[],
+            highlights: &[],
+            tree: None,
+            git: None,
+            sidebar_cols: TREE_COLS,
+            preview: None,
+            preview_scroll: 0.0,
+            diff: None,
+            diff_title: None,
+            diff_scroll: 0.0,
+            diff_side_by_side: false,
+            diff_editable: false,
+            hover: None,
+            image: None,
+            settings: None,
+            context: None,
+            picker: None,
+            theme,
+            status: None,
+            tab_width: 4,
+        }
+    }
+
+    fn render(editor: Editor) -> Option<(Vec<u8>, Layout, u32, Theme)> {
+        const W: u32 = 640;
+        const H: u32 = 240;
+        let mut r = match Renderer::offscreen(W, H, 1.0, 16.0) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping, no usable GPU: {e}");
+                return None;
+            }
+        };
+        let theme = Theme::default();
+        let (ws, tab_width) = scene_for(editor, &theme);
+        let scene = Scene {
+            tab_width,
+            ..probe_scene(&ws, &theme)
+        };
+        let mut scratch = Scratch::default();
+        draw(&mut r, &scene, &mut scratch);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        Some((r.read_rgba().ok()?, l, W, Theme::default()))
+    }
+
+    fn probe_panels<'a>(ws: &'a Workspace) -> Panels<'a> {
+        Panels {
+            workspace: ws,
+            tree: None,
+            git: None,
+            recents: &[],
+            search_open: false,
+            preview_open: false,
+            settings_open: false,
+            context: None,
+            diff_editable: false,
+            diff_scroll: 0.0,
+            diff_side_by_side: false,
+        }
+    }
+
+    fn probe_panels_with<'a>(ws: &'a Workspace, recents: &'a [&'a Path]) -> Panels<'a> {
+        Panels {
+            workspace: ws,
+            recents,
+            ..probe_panels(ws)
+        }
+    }
+
+    fn is(px: &[u8], want: Rgba) -> bool {
+        (0..3).all(|c| {
+            let expected = (want.0[c] * 255.0).round() as i32;
+            (px[c] as i32 - expected).abs() <= 1
+        })
+    }
+
+    fn find(
+        buf: &[u8],
+        stride: u32,
+        colour: Rgba,
+        x: std::ops::Range<u32>,
+        y: std::ops::Range<u32>,
+    ) -> (usize, Option<(u32, u32)>) {
+        let (mut count, mut lo, mut hi) = (0usize, u32::MAX, 0u32);
+        for yy in y {
+            for xx in x.clone() {
+                let i = ((yy * stride + xx) * 4) as usize;
+                if is(&buf[i..i + 4], colour) {
+                    count += 1;
+                    lo = lo.min(xx);
+                    hi = hi.max(xx);
+                }
+            }
+        }
+        (count, (count > 0).then_some((lo, hi)))
+    }
+
+    #[test]
+    fn gutter_width_tracks_line_count() {
+        assert_eq!(decimal_width(0), 1);
+        assert_eq!(decimal_width(9), 1);
+        assert_eq!(decimal_width(10), 2);
+        assert_eq!(decimal_width(1000), 4);
+    }
+
+    #[test]
+    fn tabs_shift_visual_columns() {
+        let doc = TextBuffer::from_text("\tx\n");
+        let line = doc.line(0).unwrap();
+        assert_eq!(visual_col(line, 0, 4), 0);
+        assert_eq!(visual_col(line, 1, 4), 4, "one tab is a full stop");
+        assert_eq!(visual_col(line, 2, 4), 5);
+    }
+
+    #[test]
+    fn clicking_maps_back_through_tabs() {
+        let doc = TextBuffer::from_text("\tx\n");
+        let line = doc.line(0).unwrap();
+        assert_eq!(char_col_at_visual(line, 0, 4, true), 0);
+        assert_eq!(char_col_at_visual(line, 3, 4, true), 1);
+        assert_eq!(char_col_at_visual(line, 99, 4, true), 2);
+    }
+
+    #[test]
+    fn visual_and_char_columns_round_trip() {
+        let doc = TextBuffer::from_text("a\tbc\td\n");
+        let line = doc.line(0).unwrap();
+        for char_col in 0..6 {
+            let v = visual_col(line, char_col, 4);
+            assert_eq!(
+                char_col_at_visual(line, v, 4, true),
+                char_col,
+                "at {char_col}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_paths_keep_their_tail() {
+        let mut out = String::new();
+        truncate_into(&mut out, "crates/app/src/view.rs", 12);
+        assert!(out.ends_with("src/view.rs"), "got {out:?}");
+        assert_eq!(out.chars().count(), 12);
+
+        let mut out = String::new();
+        truncate_into(&mut out, "short.rs", 20);
+        assert_eq!(out, "short.rs", "no eliding when it fits");
+    }
+
+    #[test]
+    fn selection_is_drawn_over_exactly_the_selected_columns() {
+        let mut editor = Editor::new(TextBuffer::from_text("abcdefghij\nklmno\n"), None, 4);
+        editor.sel = Selection::from_cursor(Cursor { anchor: 2, head: 6 });
+
+        let Some((buf, l, stride, theme)) = render(editor) else {
+            return;
+        };
+        let y0 = l.text_y as u32;
+        let row = y0..y0 + l.cell.line_height as u32;
+
+        let (count, span) = find(&buf, stride, theme.selection, 0..stride, row);
+        assert!(count > 0, "no selection highlight was drawn at all");
+        let (lo, hi) = span.unwrap();
+        let expect_lo = (l.text_x + 2.0 * l.cell.advance).round() as u32;
+        let expect_hi = (l.text_x + 6.0 * l.cell.advance).round() as u32;
+        assert!(
+            lo.abs_diff(expect_lo) <= 2,
+            "starts at {lo}, want ~{expect_lo}"
+        );
+        assert!(
+            hi.abs_diff(expect_hi) <= 2,
+            "ends at {hi}, want ~{expect_hi}"
+        );
+    }
+
+    #[test]
+    fn every_cursor_gets_a_caret() {
+        let mut editor = Editor::new(TextBuffer::from_text("abcdef\nghijkl\n"), None, 4);
+        editor.sel = Selection::from_cursors(vec![Cursor::at(2), Cursor::at(10)]);
+
+        let Some((buf, l, stride, theme)) = render(editor) else {
+            return;
+        };
+        let h = l.cell.line_height as u32;
+        let y0 = l.text_y as u32;
+
+        let (first, span0) = find(&buf, stride, theme.cursor, 0..stride, y0..y0 + h);
+        let (second, span1) = find(&buf, stride, theme.cursor, 0..stride, y0 + h..y0 + h * 2);
+        assert!(first > 0, "no caret on the first line");
+        assert!(second > 0, "no caret on the second line");
+
+        let want0 = (l.text_x + 2.0 * l.cell.advance).round() as u32;
+        let want1 = (l.text_x + 3.0 * l.cell.advance).round() as u32;
+        assert!(
+            span0.unwrap().0.abs_diff(want0) <= 2,
+            "first caret misplaced"
+        );
+        assert!(
+            span1.unwrap().0.abs_diff(want1) <= 2,
+            "second caret misplaced"
+        );
+    }
+
+    #[test]
+    fn the_landing_page_shows_only_with_no_project_and_no_buffer() {
+        let empty = Workspace::empty(None);
+        assert!(showing_landing(&empty));
+
+        let with_project = Workspace::empty(Some(std::path::PathBuf::from("/p")));
+        assert!(
+            !showing_landing(&with_project),
+            "an open project means the tree is the affordance, not the landing page"
+        );
+
+        let mut with_buffer = Workspace::empty(None);
+        with_buffer.push(Editor::new(TextBuffer::new(), None, 4));
+        assert!(!showing_landing(&with_buffer));
+    }
+
+    #[test]
+    fn landing_rows_are_clickable_where_they_look_clickable() {
+        let Ok(r) = Renderer::offscreen(1200, 800, 1.0, 16.0) else {
+            eprintln!("skipping, no usable GPU");
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let recents: Vec<&Path> = vec![Path::new("/projects/alpha"), Path::new("/projects/beta")];
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+
+        let rows = landing_rows(&recents);
+        let (ox, oy) = landing_origin(&l, rows.len());
+        let x = ox + 3.0 * l.cell.advance;
+        let row_y = |i: usize| oy + (i as f32 + 0.5) * l.cell.line_height;
+
+        // Every row that declares an action must hit-test to that action,
+        // and every row that does not must not be clickable. This is the
+        // pairing that silently drifts when the two are written separately.
+        for (index, entry) in rows.iter().enumerate() {
+            let hit = hit_test(&l, &probe_panels_with(&ws, &recents), x, row_y(index));
+            match entry.action {
+                Some(expected) => assert!(
+                    matches!(hit, Hit::Landing(got) if got == expected),
+                    "row {index} should activate {expected:?}"
+                ),
+                None => assert!(
+                    matches!(hit, Hit::Elsewhere),
+                    "row {index} is a heading or gap and must not be clickable"
+                ),
+            }
+        }
+
+        // Both recents are reachable, by index.
+        let recent_rows: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r.action {
+                Some(LandingAction::OpenRecent(i)) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recent_rows, vec![0, 1]);
+
+        // Outside the column, nothing is hit.
+        assert!(matches!(
+            hit_test(&l, &probe_panels_with(&ws, &recents), ox - 10.0, row_y(4)),
+            Hit::Elsewhere
+        ));
+    }
+
+    #[test]
+    fn the_landing_page_drops_the_recent_section_when_there_is_none() {
+        let with_none = landing_rows(&[]);
+        assert!(
+            !with_none
+                .iter()
+                .any(|r| matches!(r.action, Some(LandingAction::OpenRecent(_)))),
+            "an empty history should not leave a bare Recent heading"
+        );
+        let with_some = landing_rows(&[Path::new("/p")]);
+        assert!(with_some.len() > with_none.len());
+    }
+
+    #[test]
+    fn home_is_shortened_the_way_a_shell_shows_it() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        assert_eq!(shorten_home(&home), "~");
+        assert_eq!(shorten_home(&home.join("code/thing")), "~/code/thing");
+        assert_eq!(shorten_home(Path::new("/opt/elsewhere")), "/opt/elsewhere");
+    }
+
+    /// Where the caret is drawn for a char offset, in window coordinates.
+    /// Mirrors `draw_editor` exactly; if the two drift, the test is the
+    /// thing that notices.
+    fn caret_at(l: &Layout, editor: &Editor, offset: usize, tab: usize) -> (f32, f32) {
+        let doc = &editor.doc;
+        let line = doc.char_to_line(offset);
+        let col = offset - doc.line_to_char(line);
+        let slice = doc.line(line).unwrap();
+        let x = l.text_x + visual_col(slice, col, tab) as f32 * l.cell.advance;
+        let y = l.text_y + (line - editor.top_line()) as f32 * l.cell.line_height
+            - editor.pixel_offset(l.cell.line_height);
+        (x, y)
+    }
+
+    #[test]
+    fn clicking_where_the_caret_is_drawn_lands_back_on_it() {
+        let Ok(r) = Renderer::offscreen(900, 500, 1.0, 16.0) else {
+            return;
+        };
+        let text: String = (0..200)
+            .map(|i| format!("line {i} with\ta tab and words\n"))
+            .collect();
+        let mut editor = Editor::new(TextBuffer::from_text(&text), None, 4);
+        let ws = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+
+        // Whole and fractional scroll positions alike.
+        for scroll in [0.0_f32, 1.0, 3.5, 7.25, 12.75, 40.5] {
+            editor.scroll = scroll;
+            let top = editor.top_line();
+            for line in top..(top + 4) {
+                let start = editor.doc.line_to_char(line);
+                for col in [0usize, 3, 6, 11] {
+                    let offset = start + col;
+                    let (x, y) = caret_at(&l, &editor, offset, 4);
+                    // Aim at the middle of the cell, as a person would.
+                    let got = point_to_char(
+                        &l,
+                        &editor.doc,
+                        editor.scroll,
+                        x + l.cell.advance * 0.25,
+                        y + l.cell.line_height * 0.5,
+                        4,
+                    );
+                    assert_eq!(
+                        got, offset,
+                        "scroll {scroll}, line {line}, col {col}: clicked the caret and got {got}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_caret_is_drawn_on_the_partly_visible_bottom_row() {
+        let Ok(mut r) = Renderer::offscreen(600, 240, 1.0, 16.0) else {
+            return;
+        };
+        let text: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        let mut editor = Editor::new(TextBuffer::from_text(&text), None, 4);
+
+        let ws_probe = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws_probe,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        // Scroll by a half line, then put the cursor on the last row that
+        // has any pixels on screen.
+        editor.scroll = 5.5;
+        let bottom = editor.top_line() + l.rows;
+        editor.sel = Selection::single(editor.doc.line_to_char(bottom));
+
+        let mut ws = Workspace::empty(None);
+        ws.push(editor);
+        let theme = Theme::default();
+        let scene = Scene {
+            blame: None,
+            workspace: &ws,
+            recents: &[],
+            highlights: &[],
+            diagnostics: &[],
+            completion: None,
+            hunks: &[],
+            branch: None,
+            lsp: None,
+            autosave: false,
+            prompt: None,
+            caret_visible: true,
+            find: None,
+            search: None,
+            find_matches: &[],
+            tree: None,
+            git: None,
+            sidebar_cols: TREE_COLS,
+            preview: None,
+            preview_scroll: 0.0,
+            diff: None,
+            diff_title: None,
+            diff_scroll: 0.0,
+            diff_side_by_side: false,
+            diff_editable: false,
+            hover: None,
+            image: None,
+            settings: None,
+            context: None,
+            picker: None,
+            theme: &theme,
+            status: None,
+            tab_width: 4,
+        };
+        let mut scratch = Scratch::default();
+        draw(&mut r, &scene, &mut scratch);
+        let buf = r.read_rgba().expect("readback");
+
+        let (count, _) = find(&buf, 600, theme.cursor, 0..600, 0..240);
+        assert!(
+            count > 0,
+            "the caret vanished on the bottom row; the draw loops disagreed \
+             about which rows are visible"
+        );
+    }
+
+    /// Every kind with a preview needs a way back to its source, and
+    /// the eye is that way. It used to appear for Markdown alone, which
+    /// left HTML and SVG with one mode each.
+    #[test]
+    fn the_eye_is_offered_for_every_previewable_kind() {
+        let has_eye = |name: &str| {
+            let mut ws = Workspace::empty(None);
+            ws.push(Editor::new(
+                lithe_core::TextBuffer::from_text(""),
+                Some(std::path::PathBuf::from(name)),
+                4,
+            ));
+            status_buttons(&probe_panels(&ws))
+                .iter()
+                .any(|s| s.button == StatusButton::Preview)
+        };
+        for name in ["a.md", "a.svg", "a.png"] {
+            assert!(
+                has_eye(name),
+                "{name} has a preview but no way to toggle it"
+            );
+        }
+        for name in ["a.rs", "a.html"] {
+            assert!(!has_eye(name), "{name} has no preview to offer");
+        }
+    }
+
+    #[test]
+    fn status_buttons_report_what_is_open() {
+        let ws = Workspace::empty(None);
+        let mut panels = probe_panels(&ws);
+        let slots = status_buttons(&panels);
+        assert!(
+            slots.iter().all(|s| !s.active),
+            "nothing is open, so nothing should look on"
+        );
+        assert_eq!(
+            slots.iter().map(|s| s.icon).collect::<Vec<_>>(),
+            vec![Icon::Files, Icon::Git, Icon::Search],
+            "the eye is only offered for a previewable file"
+        );
+
+        panels.search_open = true;
+        let slots = status_buttons(&panels);
+        assert!(
+            slots
+                .iter()
+                .find(|s| s.button == StatusButton::Search)
+                .unwrap()
+                .active,
+            "the search button should light up while the panel is open"
+        );
+    }
+
+    #[test]
+    fn the_preview_button_appears_only_for_markdown() {
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(
+            TextBuffer::new(),
+            Some(std::path::PathBuf::from("notes.md")),
+            4,
+        ));
+        let slots = status_buttons(&probe_panels(&ws));
+        assert!(slots.iter().any(|s| s.button == StatusButton::Preview));
+
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(
+            TextBuffer::new(),
+            Some(std::path::PathBuf::from("main.rs")),
+            4,
+        ));
+        let slots = status_buttons(&probe_panels(&ws));
+        assert!(!slots.iter().any(|s| s.button == StatusButton::Preview));
+    }
+
+    #[test]
+    fn a_click_in_an_editable_diff_lands_on_the_text_it_looks_like() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        // A diff is only ever open over a file, so the workspace has one:
+        // with no buffer at all the landing page takes the click first.
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(TextBuffer::from_text("a\nb\nc\n"), None, 4));
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        for side_by_side in [false, true] {
+            let panels = Panels {
+                diff_editable: true,
+                diff_side_by_side: side_by_side,
+                diff_scroll: 7.0,
+                ..probe_panels(&ws)
+            };
+            let frame = diff_frame(&l, side_by_side);
+
+            // Third visible row, fifth cell of the new side's text.
+            let x = frame.new_text_x + 5.0 * l.cell.advance;
+            let y = frame.body_y + 2.5 * l.cell.line_height;
+            assert_eq!(
+                hit_test(&l, &panels, x, y),
+                Hit::DiffText { row: 9, column: 5 },
+                "side_by_side={side_by_side}: the scroll is part of the row"
+            );
+
+            // The old side is a committed version, so it is not text.
+            let old = frame.new_text_x - 4.0 * l.cell.advance;
+            assert!(
+                !matches!(hit_test(&l, &panels, old, y), Hit::DiffText { .. }),
+                "side_by_side={side_by_side}: the left column takes no caret"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_diff_takes_no_caret_at_all() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(TextBuffer::from_text("a\nb\nc\n"), None, 4));
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let frame = diff_frame(&l, true);
+        let panels = probe_panels(&ws);
+        let hit = hit_test(
+            &l,
+            &panels,
+            frame.new_text_x + 2.0 * l.cell.advance,
+            frame.body_y + l.cell.line_height,
+        );
+        assert!(
+            !matches!(hit, Hit::DiffText { .. }),
+            "a commit's diff has no buffer behind it, got {hit:?}"
+        );
+    }
+
+    #[test]
+    fn the_caret_follows_the_line_the_diff_row_shows() {
+        use lithe_vcs::{DiffLine, LineKind};
+
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(
+            TextBuffer::from_text("one\ntwo\nthree\n"),
+            None,
+            4,
+        ));
+        let editor = ws.active_mut().expect("the buffer just pushed");
+        // Second line, two characters in.
+        let at = editor.doc.line_to_char(1) + 2;
+        editor.sel.collapse_to(lithe_core::Cursor::at(at));
+
+        let theme = Theme::default();
+        let scene = Scene {
+            diff_editable: true,
+            ..probe_scene(&ws, &theme)
+        };
+        let row = |new: Option<usize>| DiffLine {
+            kind: LineKind::Context,
+            old: None,
+            new,
+            text: String::new(),
+        };
+        assert_eq!(caret_column(&scene, &row(Some(2))), Some(2));
+        assert_eq!(
+            caret_column(&scene, &row(Some(1))),
+            None,
+            "only the cursor's own line carries the caret"
+        );
+        assert_eq!(
+            caret_column(&scene, &row(None)),
+            None,
+            "a removed line is not in the working copy"
+        );
+    }
+
+    #[test]
+    fn the_hover_popup_stays_inside_the_window() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(TextBuffer::from_text("a\n"), None, 4));
+        let l = layout(&r, &ws, Chrome::default());
+
+        let hover = |at| Hover {
+            lines: crate::markdown::render("a signature\n", Hover::COLUMNS),
+            at,
+        };
+        // Every corner, including well outside the window.
+        for at in [
+            (0.0, 0.0),
+            (l.width - 1.0, l.text_y + 4.0),
+            (l.width * 2.0, l.height * 2.0),
+            (l.width / 2.0, l.height - 1.0),
+        ] {
+            let h = hover(at);
+            let (x, y, w, height) = hover_bounds(&l, &h);
+            assert!(
+                x >= 0.0 && x + w <= l.width + 0.5,
+                "off the side at {at:?}: {x} + {w}"
+            );
+            assert!(y >= 0.0, "off the top at {at:?}: {y}");
+            assert!(
+                y + height <= l.height + 0.5,
+                "off the bottom at {at:?}: {y} + {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hover_with_room_above_it_sits_above_the_character() {
+        let Ok(r) = Renderer::offscreen(900, 600, 1.0, 16.0) else {
+            return;
+        };
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(TextBuffer::from_text("a\n"), None, 4));
+        let l = layout(&r, &ws, Chrome::default());
+
+        let hover = Hover {
+            lines: crate::markdown::render("short\n", Hover::COLUMNS),
+            at: (100.0, l.text_y + l.text_h - 20.0),
+        };
+        let (_, y, _, height) = hover_bounds(&l, &hover);
+        assert!(
+            y + height <= hover.at.1 + 0.5,
+            "a tooltip the pointer covers is no use: {y} + {height} vs {}",
+            hover.at.1
+        );
+    }
+
+    #[test]
+    fn a_long_hover_is_capped_rather_than_filling_the_window() {
+        let long = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let hover = Hover {
+            lines: crate::markdown::render(&long, Hover::COLUMNS),
+            at: (0.0, 0.0),
+        };
+        assert!(
+            hover.lines.len() > Hover::ROWS,
+            "the fixture is long enough"
+        );
+        assert_eq!(hover.rows(), Hover::ROWS);
+    }
+
+    #[test]
+    fn a_full_area_page_leaves_the_chrome_clickable() {
+        let Ok(r) = Renderer::offscreen(1200, 700, 1.0, 16.0) else {
+            return;
+        };
+        // A real directory, so the tree has a row to be clicked.
+        let dir = crate::testutil::TempDir::new();
+        dir.write("a.rs", "fn x() {}\n");
+        let mut ws = Workspace::empty(Some(dir.path().to_path_buf()));
+        ws.push(Editor::new(TextBuffer::from_text("a\n"), None, 4));
+        ws.show_settings();
+        let tree = Tree::new(dir.path().to_path_buf());
+        assert!(!tree.rows.is_empty(), "the fixture has a file in it");
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar: true,
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let panels = Panels {
+            tree: Some(&tree),
+            settings_open: true,
+            ..probe_panels(&ws)
+        };
+
+        // The tab strip: with the settings page claiming every click
+        // before the chrome was tested, there was no way back to the file.
+        let labels = ws.labels();
+        let (x0, x1) = tab_extents(&l, &labels)[0];
+        assert_eq!(
+            hit_test(&l, &panels, (x0 + x1) / 2.0, l.tab_h / 2.0),
+            Hit::Tab(0)
+        );
+
+        // And the sidebar.
+        // The sidebar's rows start at the top of the window, beside the
+        // tab strip rather than below it.
+        let in_tree = hit_test(&l, &panels, l.tree_w / 2.0, l.cell.line_height / 2.0);
+        assert!(
+            matches!(in_tree, Hit::Tree(_)),
+            "the sidebar should still take its own clicks, got {in_tree:?}"
+        );
+
+        // The page itself still works, which is the thing that used to.
+        let rows = setting_rows();
+        let (ox, oy, _) = settings_origin(&l, rows.len());
+        let switch = rows
+            .iter()
+            .position(|r| matches!(r, SettingRow::Switch(_)))
+            .expect("a switch");
+        assert!(matches!(
+            hit_test(
+                &l,
+                &panels,
+                ox + l.cell.advance,
+                oy + (switch as f32 + 0.5) * l.cell.line_height
+            ),
+            Hit::Setting(_)
+        ));
+    }
+
+    #[test]
+    fn clicking_a_status_button_hits_the_one_it_looks_like() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let panels = probe_panels(&ws);
+        let slots = status_buttons(&panels);
+        let extents = status_button_extents(&l, &slots);
+
+        let y = l.text_y + l.text_h + l.cell.line_height / 2.0;
+        for (slot, (x0, x1)) in slots.iter().zip(&extents) {
+            let middle = (x0 + x1) / 2.0;
+            match hit_test(&l, &panels, middle, y) {
+                Hit::Status(got) => assert_eq!(got, slot.button, "wrong button"),
+                other => panic!("expected {:?}, got {other:?}", slot.button),
+            }
+        }
+        // Past the last button, the status bar is inert again.
+        let past = extents.last().unwrap().1 + 10.0 * l.cell.advance;
+        assert!(matches!(hit_test(&l, &panels, past, y), Hit::Elsewhere));
+    }
+
+    #[test]
+    fn a_short_file_grows_no_scrollbar() {
+        let Ok(r) = Renderer::offscreen(600, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        assert!(
+            scrollbar_extent(&l, 3, 0.0).is_none(),
+            "three lines in a tall window need no scrollbar"
+        );
+        assert!(scrollbar_extent(&l, 10_000, 0.0).is_some());
+    }
+
+    #[test]
+    fn the_thumb_tracks_the_scroll_and_stays_inside_the_track() {
+        let Ok(r) = Renderer::offscreen(600, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let total = 1000;
+        let max_scroll = total as f32 - l.rows as f32;
+
+        let (top_at_start, height) = scrollbar_extent(&l, total, 0.0).unwrap();
+        let (top_at_end, _) = scrollbar_extent(&l, total, max_scroll).unwrap();
+
+        assert!(
+            (top_at_start - l.text_y).abs() < 1.0,
+            "should start at the top"
+        );
+        assert!(top_at_end > top_at_start, "should move down as you scroll");
+        assert!(
+            top_at_end + height <= l.text_y + l.text_h + 1.0,
+            "the thumb must not run past the end of the track"
+        );
+        assert!(height >= 24.0, "the thumb has to stay grabbable");
+    }
+
+    #[test]
+    fn dragging_the_thumb_round_trips_with_where_it_is_drawn() {
+        let Ok(r) = Renderer::offscreen(600, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let total = 500;
+
+        for scroll in [0.0, 37.0, 120.0, total as f32 - l.rows as f32] {
+            let (top, height) = scrollbar_extent(&l, total, scroll).unwrap();
+            // Grabbing the thumb by its middle should not move it.
+            let back = scrollbar_scroll_at(&l, total, top + height / 2.0);
+            assert!(
+                (back - scroll).abs() < 1.0,
+                "drag and draw disagree at {scroll}: got {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tab_separates_its_body_from_its_close_box() {
+        let Ok(r) = Renderer::offscreen(900, 200, 1.0, 16.0) else {
+            eprintln!("skipping, no usable GPU");
+            return;
+        };
+        let mut ws = Workspace::empty(None);
+        for name in ["alpha.rs", "beta.rs"] {
+            ws.push(Editor::new(
+                TextBuffer::new(),
+                Some(std::path::PathBuf::from(name)),
+                4,
+            ));
+        }
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let labels = ws.labels();
+        let tabs = tab_extents(&l, &labels);
+        assert_eq!(tabs.len(), 2);
+
+        // Clicking the name selects; clicking the trailing box closes.
+        let (x0, x1) = tabs[1];
+        let on_name = x0 + l.cell.advance;
+        let on_close = x1 - l.cell.advance;
+        let y = l.cell.line_height / 2.0;
+
+        assert!(
+            matches!(hit_test(&l, &probe_panels(&ws), on_name, y), Hit::Tab(1)),
+            "clicking the label should select the tab"
+        );
+        assert!(
+            matches!(
+                hit_test(&l, &probe_panels(&ws), on_close, y),
+                Hit::TabClose(1)
+            ),
+            "clicking the trailing box should close the tab"
+        );
+        // And the two regions must not overlap.
+        assert!(on_name < x1 - CLOSE_COLS * l.cell.advance);
+    }
+
+    #[test]
+    fn keywords_are_painted_in_the_keyword_colour() {
+        const W: u32 = 640;
+        const H: u32 = 240;
+        let Ok(mut r) = Renderer::offscreen(W, H, 1.0, 16.0) else {
+            eprintln!("skipping, no usable GPU");
+            return;
+        };
+
+        // A path is enough to pick the grammar; nothing is read from disk.
+        let mut editor = Editor::new(
+            TextBuffer::from_text("fn main() {}\n"),
+            Some(std::path::PathBuf::from("scratch.rs")),
+            4,
+        );
+        assert_eq!(editor.language_name(), Some("rust"), "grammar not attached");
+
+        let mut highlights = Vec::new();
+        editor.highlights(0..editor.doc.len_bytes(), &mut highlights);
+        assert!(!highlights.is_empty(), "no spans produced");
+
+        let mut ws = Workspace::empty(None);
+        ws.push(editor);
+        let theme = Theme::default();
+        let scene = Scene {
+            blame: None,
+            workspace: &ws,
+            find: None,
+            search: None,
+            find_matches: &[],
+            completion: None,
+            diagnostics: &[],
+            hunks: &[],
+            branch: None,
+            lsp: None,
+            autosave: false,
+            prompt: None,
+            caret_visible: true,
+            recents: &[],
+            highlights: &highlights,
+            tree: None,
+            git: None,
+            sidebar_cols: TREE_COLS,
+            preview: None,
+            preview_scroll: 0.0,
+            diff: None,
+            diff_title: None,
+            diff_scroll: 0.0,
+            diff_side_by_side: false,
+            diff_editable: false,
+            hover: None,
+            image: None,
+            settings: None,
+            context: None,
+            picker: None,
+            theme: &theme,
+            status: None,
+            tab_width: 4,
+        };
+        let mut scratch = Scratch::default();
+        draw(&mut r, &scene, &mut scratch);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let buf = r.read_rgba().expect("readback");
+
+        let y0 = l.text_y as u32;
+        let row = y0..y0 + l.cell.line_height as u32;
+
+        // "fn" is a keyword and sits in the first two cells.
+        let (keyword_px, span) = find(&buf, W, theme.syntax.keyword, 0..W, row.clone());
+        assert!(
+            keyword_px > 0,
+            "no keyword-coloured pixels; highlighting is not reaching the renderer"
+        );
+        let first_cell = (l.text_x + 2.0 * l.cell.advance).round() as u32;
+        assert!(
+            span.unwrap().0 < first_cell,
+            "keyword colour appeared outside the keyword"
+        );
+
+        // "main" is a function, and must be a different colour.
+        let (function_px, _) = find(&buf, W, theme.syntax.function, 0..W, row);
+        assert!(
+            function_px > 0,
+            "the function name was not painted in the function colour"
+        );
+    }
+
+    #[test]
+    fn a_tabbed_line_puts_the_caret_on_the_tab_stop() {
+        let mut editor = Editor::new(TextBuffer::from_text("\tx\n"), None, 4);
+        editor.sel = Selection::single(1);
+
+        let Some((buf, l, stride, theme)) = render(editor) else {
+            return;
+        };
+        let y0 = l.text_y as u32;
+        let (count, span) = find(
+            &buf,
+            stride,
+            theme.cursor,
+            0..stride,
+            y0..y0 + l.cell.line_height as u32,
+        );
+        assert!(count > 0, "no caret drawn");
+        let want = (l.text_x + 4.0 * l.cell.advance).round() as u32;
+        assert!(
+            span.unwrap().0.abs_diff(want) <= 2,
+            "caret missed the tab stop"
+        );
+    }
+}
