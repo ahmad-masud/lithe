@@ -1,0 +1,15 @@
+[package]
+name = "lithe-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+winit.workspace = true
+wgpu.workspace = true
+cosmic-text.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+log.workspace = true
+image.workspace = true
