@@ -1,0 +1,10 @@
+[package]
+name = "lithe-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately has no I/O, no GPU, no async. Editing logic must stay unit
+# testable in milliseconds.
+[dependencies]
+ropey.workspace = true
