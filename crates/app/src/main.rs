@@ -3946,7 +3946,29 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
 
-            WindowEvent::Focused(true) => self.focused = Some(id),
+            // Becoming frontmost, and being uncovered, are the two
+            // moments a window is first really on screen. Both redraw.
+            //
+            // Asking for a frame when the window is created is not
+            // enough, and that is what made a bundle launched from
+            // Finder come up blank: the frame is drawn before AppKit has
+            // finished activating the app, so nothing composites it, and
+            // the next frame only came when something else happened to
+            // ask for one — a keystroke, or the pointer arriving. Run
+            // from a terminal the pointer was usually already over the
+            // window, which is why this looked fixed.
+            WindowEvent::Focused(true) => {
+                self.focused = Some(id);
+                if let Some(pane) = self.panes.get(&id) {
+                    pane.redraw();
+                }
+            }
+
+            WindowEvent::Occluded(false) => {
+                if let Some(pane) = self.panes.get(&id) {
+                    pane.redraw();
+                }
+            }
 
             // Leaving the window is the other moment people expect their
             // work to be written.
