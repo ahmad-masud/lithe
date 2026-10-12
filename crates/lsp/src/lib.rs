@@ -103,6 +103,8 @@ pub struct Client {
     completion_triggers: Vec<String>,
     /// Documents we have sent `didOpen` for, and their version counters.
     open: HashMap<PathBuf, i32>,
+    /// Notifications made before the handshake finished, in order.
+    deferred: Vec<Value>,
     stop: Arc<AtomicBool>,
 }
 
@@ -160,6 +162,7 @@ impl Client {
             ready: false,
             completion_triggers: Vec::new(),
             open: HashMap::new(),
+            deferred: Vec::new(),
             stop,
         };
         client.initialize(root)?;
@@ -174,8 +177,21 @@ impl Client {
         }
     }
 
-    fn notify(&self, method: &str, params: Value) {
-        self.send(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+    /// Sends a notification, or holds it until the handshake is done.
+    ///
+    /// The protocol says a server receives nothing between `initialize`
+    /// and `initialized`, and rust-analyzer enforces it: sent a
+    /// `didOpen` first it answers "expected initialized notification"
+    /// and exits, which the editor then reports as a missing language
+    /// server. clangd and gopls tolerate the wrong order, which is why
+    /// this only ever looked like a Rust problem.
+    fn notify(&mut self, method: &str, params: Value) {
+        let message = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        if self.ready || method == "initialized" {
+            self.send(message);
+        } else {
+            self.deferred.push(message);
+        }
     }
 
     fn request(&mut self, method: &str, params: Value, kind: Pending) -> i64 {
@@ -297,6 +313,11 @@ impl Client {
             "initialized",
             serde_json::to_value(InitializedParams {}).unwrap_or(Value::Null),
         );
+        // Everything the editor said while the server was starting, now
+        // that it is allowed to hear it.
+        for message in std::mem::take(&mut self.deferred) {
+            self.send(message);
+        }
     }
 
     /// Whether typing `text` should open a completion list by itself.
@@ -803,6 +824,18 @@ pub fn range_to_chars(buffer: &TextBuffer, range: Range) -> std::ops::Range<usiz
 
 pub fn path_to_uri(path: &Path) -> Result<Uri> {
     use std::str::FromStr;
+    // Absolute, always. A relative path yields `file://crates/a.rs`,
+    // where `crates` is read as the host and the server is told about a
+    // document on another machine.
+    let absolute;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        absolute = std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        &absolute
+    };
     let text = path.to_string_lossy();
     let mut encoded = String::with_capacity(text.len() + 8);
     encoded.push_str("file://");

@@ -379,3 +379,20 @@ It sets the process environment rather than keeping a private search
 list, because the servers need the wider `PATH` too: rust-analyzer
 shells out to `cargo` to read a workspace, and a `cargo` it cannot find
 leaves it running and useless.
+
+A server hears nothing between `initialize` and `initialized`. The
+protocol says so and rust-analyzer enforces it: sent a `didOpen` first
+it answers "expected initialized notification" and exits, and the
+editor reports a missing language server for one that is installed and
+working. clangd and gopls tolerate the wrong order, which is the whole
+reason this presented as a Rust-only fault.
+
+The editor opens a file the moment it has one, which is normally before
+the reply has arrived, so the ordering cannot be fixed by calling in a
+different order. `Client::notify` holds anything sent before the
+handshake finishes and `on_initialized` flushes it, which puts the rule
+in the one place every notification already goes through.
+
+A document's URI is made absolute first. A relative path yields
+`file://crates/a.rs`, where `crates` parses as the host — the server is
+told about a document on another machine and answers about nothing.

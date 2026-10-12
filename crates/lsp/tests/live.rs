@@ -538,3 +538,83 @@ fn rust_analyzer_says_it_is_busy_before_it_answers() {
         .unwrap_or_default();
     assert!(text.contains("answer"), "got {answer}");
 }
+
+/// A document opened before the handshake finished must not kill the
+/// server.
+///
+/// The editor opens a file the moment it has one, which is normally
+/// before `initialize` has been answered. The protocol says a server
+/// receives nothing between `initialize` and `initialized`, and
+/// rust-analyzer enforces it: sent a `didOpen` first it answers
+/// "expected initialized notification" and exits, and the editor then
+/// reports a missing language server for one that is installed and
+/// working. clangd and gopls tolerate the wrong order, which is why
+/// this only ever looked like a Rust problem.
+#[test]
+fn opening_a_file_before_the_handshake_does_not_kill_the_server() {
+    if !on_path("rust-analyzer") {
+        eprintln!("skipping: rust-analyzer is not installed");
+        return;
+    }
+    let dir = Scratch::new("handshake");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let file = dir.path().join("src/lib.rs");
+    let source = "pub fn answer() -> u32 {\n    42\n}\n\npub fn ask() -> u32 {\n    answer()\n}\n";
+    std::fs::write(&file, source).unwrap();
+
+    let (tx, rx) = channel();
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let mut client = Client::start("rust", dir.path(), tx, wake)
+        .expect("spawn")
+        .expect("rust-analyzer is on PATH");
+
+    // The thing that used to break it: said before the reply arrives.
+    assert!(!client.ready, "the fixture must open the file too early");
+    client.did_open(&file, source.to_string());
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut answer = None;
+    let mut asked_at = Instant::now();
+    while Instant::now() < deadline && answer.is_none() {
+        let Ok(event) = rx.recv_timeout(Duration::from_millis(400)) else {
+            if client.ready && asked_at.elapsed() > Duration::from_millis(800) {
+                client.hover(
+                    &file,
+                    lithe_lsp::Position {
+                        line: 5,
+                        character: 6,
+                    },
+                );
+                asked_at = Instant::now();
+            }
+            continue;
+        };
+        match event {
+            Event::Response { id, result } if !client.ready => {
+                client.pending.remove(&id);
+                client.on_initialized(&result);
+            }
+            Event::Response { result, .. } if !result.is_null() => answer = Some(result),
+            Event::Exited { .. } => {
+                panic!("the server exited — the deferred didOpen reached it too early")
+            }
+            _ => {}
+        }
+    }
+
+    let answer = answer.expect("no hover within 120s");
+    let text = answer
+        .get("contents")
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("answer"),
+        "the deferred didOpen should have reached it once ready: {answer}"
+    );
+}
