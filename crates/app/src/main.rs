@@ -1769,6 +1769,11 @@ impl App {
             resizing: false,
         };
         pane.retitle();
+        // Ask for the first frame. Drawing is damage-driven and the loop
+        // waits rather than polls, so without this nothing paints until
+        // some event happens to arrive — the window came up blank and
+        // stayed blank until it was clicked.
+        pane.redraw();
         self.panes.insert(id, pane);
         self.focused = Some(id);
     }
