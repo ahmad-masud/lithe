@@ -182,6 +182,13 @@ further typing narrows what it already has, which costs nothing and
 needs no round trip. The list is filtered by the word already typed, and
 accepting one replaces that word rather than following it.
 
+**Launched from Finder, the app widens its own `PATH` first.** macOS
+gives a GUI application launchd's `PATH` — four system directories —
+not the shell's, so a server installed into `~/.cargo/bin` or
+`~/go/bin` would be invisible and reported missing. lithe asks the
+login shell what `PATH` should be, and falls back to the usual places
+if that is slow or absent. Started from a terminal it does nothing.
+
 **rust-analyzer loads before it answers.** It is the one server that
 does: clangd and gopls reply the moment they start, while rust-analyzer
 reads a Cargo workspace and indexes it first, answering nothing until

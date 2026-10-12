@@ -359,3 +359,23 @@ There is deliberately no retry. A hover that arrives three seconds late
 is tolerable; a go-to-definition that jumps three seconds after the
 click is not, so the editor says why the answer was empty and leaves
 asking again to the person.
+
+A bundled app cannot see the tools the person installed. macOS hands a
+GUI application launchd's `PATH` — `/usr/bin:/bin:/usr/sbin:/sbin` —
+not the shell's, so rust-analyzer in `~/.cargo/bin` and gopls in
+`~/go/bin` are both invisible and the editor reports "lsp missing" for
+a server that is installed and working. clangd lives in `/usr/bin`, so
+C kept working and made it look language-specific. The same build run
+from a terminal finds everything, which is most of why this is hard to
+notice.
+
+`widen_search_path` runs first thing in `main`, before any thread, and
+only when `PATH` holds nothing under `$HOME` or a package prefix —
+launched from a shell it costs nothing and does nothing. It asks the
+login shell, because a fixed list of directories never covers version
+managers, and falls back to that list when the shell is slow or absent.
+
+It sets the process environment rather than keeping a private search
+list, because the servers need the wider `PATH` too: rust-analyzer
+shells out to `cargo` to read a workspace, and a `cargo` it cannot find
+leaves it running and useless.

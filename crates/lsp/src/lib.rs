@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 // Re-exported so callers need not depend on lsp-types directly.
 pub use lsp_types::{CompletionItem, DiagnosticSeverity, Location};
 pub use lsp_types::{Diagnostic, Position, Range, Uri};
-pub use servers::{config_for, ServerConfig};
+pub use servers::{config_for, widen_search_path, ServerConfig};
 
 /// What a server told us, delivered to the event loop.
 #[derive(Debug)]

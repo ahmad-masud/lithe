@@ -5053,6 +5053,11 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
+    // Before anything else, and before any thread exists: macOS gives a
+    // bundled app launchd's PATH, which holds four system directories
+    // and none of the places language servers are installed into.
+    lithe_lsp::widen_search_path();
+
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
 
     // Hidden development flag; not part of the editor's interface.

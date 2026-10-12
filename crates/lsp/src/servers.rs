@@ -98,9 +98,198 @@ fn on_path(binary: &str) -> bool {
     })
 }
 
+/// Puts the tools a person actually has back on `PATH`.
+///
+/// macOS hands a GUI application launchd's `PATH`, not the shell's:
+/// `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else. Every language
+/// server installed into a user directory — rust-analyzer in
+/// `~/.cargo/bin`, gopls in `~/go/bin` — is then invisible, and the
+/// editor reports "lsp missing" for a server that is installed and
+/// working. Run from a terminal the same build finds everything,
+/// which is what makes this so confusing to hit.
+///
+/// The process environment is changed rather than a private search
+/// list kept, because the servers need it too: rust-analyzer shells
+/// out to `cargo` to read a workspace, and a `cargo` it cannot find
+/// leaves it running but useless.
+///
+/// Must be called before any threads are started — it mutates
+/// process-global state.
+pub fn widen_search_path() {
+    let Some(current) = std::env::var_os("PATH") else {
+        return;
+    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
+    // Asking the login shell costs a subprocess, so it is only asked
+    // when the `PATH` we were given looks like one nobody chose.
+    let from_shell = if looks_stripped(&dirs, home.as_deref()) {
+        login_shell_path()
+    } else {
+        Vec::new()
+    };
+    if let Some(widened) = widened(&current, home.as_deref(), &from_shell) {
+        // SAFETY: called from `main` before any thread is started.
+        unsafe { std::env::set_var("PATH", widened) };
+    }
+}
+
+/// The widened `PATH`, or `None` when a shell evidently built it and
+/// there is nothing to add.
+///
+/// Pure, and given its inputs rather than reading them, so it can be
+/// tested without changing a process-global that every other test in
+/// the binary is also reading.
+fn widened(
+    current: &std::ffi::OsStr,
+    home: Option<&std::path::Path>,
+    from_shell: &[std::path::PathBuf],
+) -> Option<std::ffi::OsString> {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(current).collect();
+    if !looks_stripped(&dirs, home) {
+        return None;
+    }
+
+    let mut add = |dir: std::path::PathBuf| {
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+    // What the login shell says, which is the only answer that covers
+    // version managers and hand-rolled setups.
+    for dir in from_shell {
+        add(dir.clone());
+    }
+    // Then the usual places, for when there is no shell to ask or it
+    // took too long to answer.
+    if let Some(home) = home {
+        for suffix in [
+            ".cargo/bin",
+            "go/bin",
+            ".local/bin",
+            ".bun/bin",
+            ".deno/bin",
+        ] {
+            add(home.join(suffix));
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"] {
+        add(std::path::PathBuf::from(dir));
+    }
+    std::env::join_paths(&dirs).ok()
+}
+
+/// Whether `PATH` looks like the one launchd gives a GUI app rather
+/// than one a shell built.
+///
+/// A shell's `PATH` almost always holds something under `$HOME` or a
+/// package manager's prefix. launchd's holds four system directories.
+fn looks_stripped(dirs: &[std::path::PathBuf], home: Option<&std::path::Path>) -> bool {
+    !dirs.iter().any(|dir| {
+        home.is_some_and(|home| dir.starts_with(home))
+            || dir.starts_with("/opt/homebrew")
+            || dir.starts_with("/usr/local")
+    })
+}
+
+/// `PATH` as the person's login shell builds it.
+///
+/// Empty when there is no shell, it fails, or it takes too long: a
+/// slow `.zshrc` must not hold up the editor, so the answer is given
+/// up on rather than waited for.
+fn login_shell_path() -> Vec<std::path::PathBuf> {
+    let Some(shell) = std::env::var_os("SHELL") else {
+        return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A thread, because `Command` cannot be waited on with a deadline.
+    // One that outlives the wait is left to finish on its own.
+    std::thread::Builder::new()
+        .name("lithe-path".into())
+        .spawn(move || {
+            let out = std::process::Command::new(shell)
+                // Login and interactive, which is where `PATH` is set.
+                // `command printf` steps past a shell function of the
+                // same name, and the marker separates our answer from
+                // whatever the profile printed on its way past.
+                .args(["-lic", "command printf '<<PATH>>%s' \"$PATH\""])
+                .output();
+            let _ = tx.send(out);
+        })
+        .ok();
+
+    let Ok(Ok(out)) = rx.recv_timeout(std::time::Duration::from_secs(2)) else {
+        log::debug!("no PATH from the login shell; falling back to the usual places");
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(answer) = text.rsplit("<<PATH>>").next() else {
+        return Vec::new();
+    };
+    std::env::split_paths(answer.trim()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS hands a GUI app launchd's `PATH`, so a server installed
+    /// into a user directory is invisible and the editor reports "lsp
+    /// missing" for one that is installed and working.
+    #[test]
+    fn a_launchd_path_is_widened_back_to_the_usual_places() {
+        let home = std::env::temp_dir().join("lithe-path-fixture");
+        let cargo = home.join(".cargo/bin");
+        std::fs::create_dir_all(&cargo).unwrap();
+
+        let stripped = std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
+        let widened = widened(&stripped, Some(&home), &[]).expect("should widen");
+        let dirs: Vec<_> = std::env::split_paths(&widened).collect();
+
+        assert!(
+            dirs.contains(&cargo),
+            "~/.cargo/bin should be back: {dirs:?}"
+        );
+        assert!(
+            dirs.starts_with(&[std::path::PathBuf::from("/usr/bin")]),
+            "what was there already comes first: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_shell_built_path_is_left_alone() {
+        let home = std::path::Path::new("/Users/someone");
+        // Anything under $HOME, or a package prefix, means a shell set
+        // this up and there is nothing to add.
+        for path in [
+            "/usr/bin:/Users/someone/.cargo/bin",
+            "/usr/bin:/opt/homebrew/bin",
+            "/usr/local/bin:/usr/bin",
+        ] {
+            assert!(
+                widened(&std::ffi::OsString::from(path), Some(home), &[]).is_none(),
+                "{path} should be left alone"
+            );
+        }
+    }
+
+    #[test]
+    fn what_the_login_shell_says_wins_over_the_guesses() {
+        let home = std::env::temp_dir().join("lithe-path-shell");
+        let exotic = home.join("mise/shims");
+        std::fs::create_dir_all(&exotic).unwrap();
+
+        let stripped = std::ffi::OsString::from("/usr/bin:/bin");
+        let widened =
+            widened(&stripped, Some(&home), std::slice::from_ref(&exotic)).expect("should widen");
+        let dirs: Vec<_> = std::env::split_paths(&widened).collect();
+        assert!(
+            dirs.contains(&exotic),
+            "a version manager's shims are only ever found this way: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn every_language_maps_to_at_least_one_command() {
