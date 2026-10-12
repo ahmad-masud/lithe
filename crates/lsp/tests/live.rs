@@ -458,3 +458,83 @@ fn hovering_a_name_describes_it() {
         Some("markdown")
     );
 }
+
+/// rust-analyzer answers nothing until it has loaded the workspace.
+///
+/// It is the one server here that does, and the reason it looked
+/// broken: a hover asked the instant `initialize` is answered comes
+/// back `null`, which is indistinguishable from "there is nothing to
+/// say" unless the progress notifications are read. This proves both
+/// halves — that it says it is working, and that it answers once it
+/// has stopped.
+#[test]
+fn rust_analyzer_says_it_is_busy_before_it_answers() {
+    if !on_path("rust-analyzer") {
+        eprintln!("skipping: rust-analyzer is not installed");
+        return;
+    }
+    let dir = Scratch::new("ra");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let file = dir.path().join("src/lib.rs");
+    let source = "pub fn answer() -> u32 {\n    42\n}\n\npub fn ask() -> u32 {\n    answer()\n}\n";
+    std::fs::write(&file, source).unwrap();
+
+    let (tx, rx) = channel();
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let mut client = Client::start("rust", dir.path(), tx, wake)
+        .expect("spawn")
+        .expect("rust-analyzer is on PATH");
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut said_busy = false;
+    let mut answer = None;
+    let mut asked_at = Instant::now();
+
+    while Instant::now() < deadline && answer.is_none() {
+        let Ok(event) = rx.recv_timeout(Duration::from_millis(400)) else {
+            // Keep asking. The first answers are null; one of them will
+            // not be, and that is the behaviour being pinned down.
+            if client.ready && asked_at.elapsed() > Duration::from_millis(800) {
+                client.hover(
+                    &file,
+                    lithe_lsp::Position {
+                        line: 5,
+                        character: 6,
+                    },
+                );
+                asked_at = Instant::now();
+            }
+            continue;
+        };
+        match event {
+            Event::Response { id, result } if !client.ready => {
+                client.pending.remove(&id);
+                client.on_initialized(&result);
+                client.did_open(&file, source.to_string());
+            }
+            // The whole point: it tells us it is working.
+            Event::Progress { message: Some(_) } => said_busy = true,
+            Event::Response { result, .. } if !result.is_null() => answer = Some(result),
+            Event::Exited { .. } => panic!("the server exited"),
+            _ => {}
+        }
+    }
+
+    assert!(
+        said_busy,
+        "rust-analyzer should report progress while it loads; without that \
+         an empty answer cannot be told from an unready one"
+    );
+    let answer = answer.expect("no hover within 120s");
+    let text = answer
+        .get("contents")
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(text.contains("answer"), "got {answer}");
+}

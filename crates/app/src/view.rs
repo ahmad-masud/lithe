@@ -382,6 +382,8 @@ pub struct Scene<'a> {
     pub blame: Option<&'a str>,
     /// Language-server state, for the status bar.
     pub lsp: Option<&'a str>,
+    /// What the language server is busy doing, while it is.
+    pub lsp_busy: Option<&'a str>,
     /// Whether autosave is on, for the status bar.
     pub autosave: bool,
     /// Projects offered on the landing page, newest first.
@@ -1205,8 +1207,18 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                 }
                 if let Some(language) = editor.language_name() {
                     let _ = write!(scratch.text, "   {language}");
-                    if let Some(state) = scene.lsp {
-                        let _ = write!(scratch.text, " · {state}");
+                    // What the server is busy with outranks the fact
+                    // that it is up: while rust-analyzer indexes, every
+                    // answer is empty, and "lsp" alone does not explain
+                    // why nothing is happening.
+                    match (scene.lsp_busy, scene.lsp) {
+                        (Some(doing), _) => {
+                            let _ = write!(scratch.text, " · {doing}");
+                        }
+                        (None, Some(state)) => {
+                            let _ = write!(scratch.text, " · {state}");
+                        }
+                        (None, None) => {}
                     }
                 }
             }
@@ -2940,6 +2952,7 @@ mod tests {
             hunks: &[],
             branch: None,
             lsp: None,
+            lsp_busy: None,
             autosave: false,
             prompt: None,
             caret_visible: true,
@@ -3346,6 +3359,7 @@ mod tests {
             hunks: &[],
             branch: None,
             lsp: None,
+            lsp_busy: None,
             autosave: false,
             prompt: None,
             caret_visible: true,
@@ -3899,6 +3913,7 @@ mod tests {
             hunks: &[],
             branch: None,
             lsp: None,
+            lsp_busy: None,
             autosave: false,
             prompt: None,
             caret_visible: true,

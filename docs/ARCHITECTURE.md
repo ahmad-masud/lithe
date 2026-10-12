@@ -341,3 +341,21 @@ are then drawn only where the text is not. The other order put a `│`
 through every message that reached past one lifeline. The canvas is also
 widened to the longest message rather than the text being cut at the
 next lifeline, because `UNAVAILABLE + l` has lost the part that mattered.
+
+rust-analyzer is the one server that answers nothing until it is ready.
+clangd and gopls reply usefully the moment `initialize` comes back;
+rust-analyzer has to load a Cargo workspace and index it first, and
+until it has, every request gets `null`. Asking once and reporting "no
+information" made a working server look like a missing one — the whole
+of what "the Rust LSP is broken" turned out to be.
+
+Two things fix it, and the first is a capability. A server sends
+`$/progress` only to a client that declares `window.workDoneProgress`,
+which this did not, so the loading happened in silence. With it
+declared, the status bar says what the server is busy with, and an
+empty answer says "still indexing" instead of "nothing found".
+
+There is deliberately no retry. A hover that arrives three seconds late
+is tolerable; a go-to-definition that jumps three seconds after the
+click is not, so the editor says why the answer was empty and leaves
+asking again to the person.

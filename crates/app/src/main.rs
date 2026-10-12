@@ -129,6 +129,8 @@ struct Pane {
     marks: Vec<Mark>,
     /// Language-server state for the active file, for the status bar.
     lsp_state: Option<&'static str>,
+    /// What the language server is busy doing, while it is.
+    lsp_busy: Option<String>,
     completion: Option<find::Completion>,
     /// What the pointer is resting on, once the server has said.
     hover: Option<view::Hover>,
@@ -854,6 +856,7 @@ impl Pane {
             highlights,
             status,
             lsp_state,
+            lsp_busy,
             ..
         } = self;
         let scene = Scene {
@@ -868,6 +871,7 @@ impl Pane {
             hunks,
             branch: branch.as_deref(),
             lsp: *lsp_state,
+            lsp_busy: lsp_busy.as_deref(),
             autosave,
             find: find.as_ref(),
             search: search.as_ref(),
@@ -1010,6 +1014,9 @@ impl App {
             return;
         };
         pane.lsp_state = editor.language_name().map(|l| lsp.state_of(l));
+        // What the server is busy with outranks the fact that it is up:
+        // "indexing 40%" is the answer to "why is nothing happening".
+        pane.lsp_busy = lsp.busy().map(str::to_string);
 
         for diagnostic in lsp.diagnostics_for(path) {
             let range = lithe_lsp::range_to_chars(&editor.doc, diagnostic.range);
@@ -1188,11 +1195,25 @@ impl App {
         );
     }
 
+    /// Why an empty answer was empty.
+    ///
+    /// A server that has not finished loading answers `null` to
+    /// everything, which is not the same as having nothing to say.
+    /// Reporting the two alike is what made rust-analyzer look broken
+    /// for the first few seconds of every project.
+    fn empty_because(&self, otherwise: &str) -> String {
+        match self.lsp.busy() {
+            Some(doing) => format!("language server is still {doing}"),
+            None => otherwise.to_string(),
+        }
+    }
+
     /// Acts on a reply the editor asked for.
     fn on_lsp_reply(&mut self, what: Awaiting, result: serde_json::Value) {
         match what {
             Awaiting::Hover { at, dwell } => {
                 let text = hover_text(&result);
+                let why = self.empty_because("no information");
                 let Some(pane) = self.pane_mut() else { return };
                 pane.hover_asked = false;
                 match text {
@@ -1205,7 +1226,7 @@ impl App {
                     // Nothing to say. Worth a line when it was asked for
                     // by name; not worth one every time the pointer
                     // happens to rest on a comma.
-                    None if !dwell => pane.status = Some("no information".into()),
+                    None if !dwell => pane.status = Some(why),
                     None => {}
                 }
             }
@@ -1216,16 +1237,18 @@ impl App {
                     }
                 }
                 None => {
+                    let why = self.empty_because("no definition found");
                     if let Some(pane) = self.pane_mut() {
-                        pane.status = Some("no definition found".into());
+                        pane.status = Some(why);
                     }
                 }
             },
             Awaiting::Completion => {
                 let items = completion_items(&result);
+                let why = self.empty_because("no completions");
                 if let Some(pane) = self.pane_mut() {
                     if items.is_empty() {
-                        pane.status = Some("no completions".into());
+                        pane.status = Some(why);
                         return;
                     }
                     let mut completion = find::Completion::new(items);
@@ -1363,8 +1386,9 @@ impl App {
         places: Vec<(PathBuf, u64)>,
     ) {
         if places.is_empty() {
+            let why = self.empty_because(&format!("no {what}s found"));
             if let Some(pane) = self.pane_mut() {
-                pane.status = Some(format!("no {what}s found"));
+                pane.status = Some(why);
             }
             return;
         }
@@ -1752,6 +1776,7 @@ impl App {
             find_matches: Vec::new(),
             marks: Vec::new(),
             lsp_state: None,
+            lsp_busy: None,
             completion: None,
             hover: None,
             pointer_moved: std::time::Instant::now(),
@@ -4985,6 +5010,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         hunks: &hunks,
         branch: branch.as_deref(),
         lsp: None,
+        lsp_busy: None,
         autosave: false,
         image: picture.as_ref(),
         settings: ws.showing_settings().then_some(&defaults),

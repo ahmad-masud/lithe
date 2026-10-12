@@ -182,6 +182,13 @@ further typing narrows what it already has, which costs nothing and
 needs no round trip. The list is filtered by the word already typed, and
 accepting one replaces that word rather than following it.
 
+**rust-analyzer loads before it answers.** It is the one server that
+does: clangd and gopls reply the moment they start, while rust-analyzer
+reads a Cargo workspace and indexes it first, answering nothing until
+it has. The status bar says what it is busy with, and a question asked
+too early reports that rather than "nothing found". On a large project
+the first few seconds after opening are a wait, not a failure.
+
 Resting the pointer over a name for 400ms asks what it is, and the
 answer is drawn as a small document — a server sends Markdown, so the
 preview's reader renders it, and a signature arrives as a highlighted

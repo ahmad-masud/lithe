@@ -51,6 +51,17 @@ pub enum Event {
         id: i64,
         message: String,
     },
+    /// The server is doing something long enough to say so, or has
+    /// finished doing it.
+    ///
+    /// rust-analyzer loads a Cargo workspace and indexes it before it
+    /// can answer anything, and until it has it replies `null` to every
+    /// question. Without this that is indistinguishable from "there is
+    /// no answer", which is what made it look broken.
+    Progress {
+        /// `None` once the work is done.
+        message: Option<String>,
+    },
     /// The server process ended.
     Exited {
         language: &'static str,
@@ -249,6 +260,16 @@ impl Client {
                     },
                 }),
             );
+        }
+        if let Some(capabilities) = params
+            .get_mut("capabilities")
+            .and_then(Value::as_object_mut)
+        {
+            // A server sends `$/progress` only to a client that says it
+            // can receive it. Without this rust-analyzer loads a
+            // workspace in silence, answering `null` to everything, and
+            // there is no way to tell that from having no answer.
+            capabilities.insert("window".into(), json!({ "workDoneProgress": true }));
         }
         if let Some(workspace) = params
             .get_mut("capabilities")
@@ -631,6 +652,39 @@ fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
 }
 
 /// Turns a message into an [`Event`], or `None` when it needs no action.
+/// Reads a `$/progress` notification into something worth showing.
+///
+/// Only the title and percentage, not the token: one line in the
+/// status bar is all the room there is, and a server doing two things
+/// at once is still just "busy".
+fn progress(params: &Value) -> Option<Event> {
+    let value = params.get("value")?;
+    match value.get("kind").and_then(Value::as_str)? {
+        "end" => Some(Event::Progress { message: None }),
+        kind => {
+            let title = value
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("working");
+            let detail = value.get("message").and_then(Value::as_str);
+            let percent = value.get("percentage").and_then(Value::as_u64);
+            let mut text = title.to_string();
+            if let Some(detail) = detail {
+                text.push_str(" · ");
+                text.push_str(detail);
+            }
+            if let Some(percent) = percent {
+                text.push_str(&format!(" {percent}%"));
+            }
+            // `begin` and `report` both mean "still going".
+            let _ = kind;
+            Some(Event::Progress {
+                message: Some(text),
+            })
+        }
+    }
+}
+
 fn classify(message: Value) -> Option<Event> {
     let id = message.get("id").and_then(Value::as_i64);
 
@@ -649,7 +703,10 @@ fn classify(message: Value) -> Option<Event> {
                 items: params.diagnostics,
             });
         }
-        // Progress, log messages and the rest are noise for now.
+        if method == "$/progress" {
+            return progress(message.get("params")?);
+        }
+        // Log messages and the rest are noise for now.
         return None;
     }
 

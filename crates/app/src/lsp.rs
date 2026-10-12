@@ -110,6 +110,13 @@ pub struct Lsp {
     wake: Arc<dyn Fn() + Send + Sync>,
     /// Maps a request id to what the editor asked for.
     outstanding: HashMap<i64, (&'static str, Awaiting)>,
+    /// What a server is busy doing, while it is doing it.
+    ///
+    /// rust-analyzer answers `null` to everything until it has loaded
+    /// and indexed the workspace, so without this the editor reported
+    /// "no information" for a few seconds after opening a Rust project
+    /// and looked like it had no language server at all.
+    busy: Option<String>,
 }
 
 impl Lsp {
@@ -123,12 +130,18 @@ impl Lsp {
             sender,
             wake,
             outstanding: HashMap::new(),
+            busy: None,
         }
     }
 
     /// A word for the status bar: whether this language has a server, and
     /// whether it came up. Silence here is why "is the LSP even on?" is
     /// otherwise unanswerable from inside the editor.
+    /// What the server is busy with, if it has said so.
+    pub fn busy(&self) -> Option<&str> {
+        self.busy.as_deref()
+    }
+
     pub fn state_of(&self, language: &str) -> &'static str {
         if self.clients.contains_key(language) {
             return "lsp";
@@ -352,6 +365,7 @@ impl Lsp {
                     log::debug!("language server request {id} failed: {message}");
                     self.outstanding.remove(&id);
                 }
+                Event::Progress { message } => self.busy = message,
                 Event::Exited { language } => {
                     // Mark it unavailable, not merely absent. A server that
                     // dies on startup — a rustup proxy whose component is
