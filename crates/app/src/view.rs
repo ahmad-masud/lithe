@@ -152,6 +152,9 @@ pub struct Panels<'a> {
     /// landed on rather than the row it would have landed on unscrolled.
     pub diff_scroll: f32,
     pub diff_side_by_side: bool,
+    /// The rendered preview, for finding the fenced block under a click.
+    pub preview: Option<&'a [MdLine]>,
+    pub preview_scroll: f32,
 }
 
 /// The buttons, in order. Built from what is open, so "on" always matches
@@ -596,6 +599,10 @@ pub enum Hit {
     Scrollbar(f32),
     /// The draggable edge of the sidebar.
     SidebarDivider,
+    /// A fenced block in the preview, by its line index. Clicking one
+    /// copies it, which is the only way to get text out of a preview
+    /// that is drawn rather than selectable.
+    PreviewCode(usize),
     /// A row in an editable diff's new side: which row of the diff, and
     /// how many cells into the text the click landed.
     DiffText {
@@ -748,6 +755,31 @@ pub fn hit_test(l: &Layout, panels: &Panels<'_>, x: f32, y: f32) -> Hit {
         }
     }
 
+    // A fenced block in the preview takes its own clicks, so the code in
+    // it can be copied out. Rows are not all one height, so the line is
+    // found by walking them rather than by dividing.
+    if let Some(preview) = panels.preview.filter(|p| !p.is_empty()) {
+        if x >= l.tree_w && y >= l.text_y {
+            let top = panels.preview_scroll.max(0.0) as usize;
+            let slip = (panels.preview_scroll.max(0.0).fract() * l.cell.line_height).round();
+            let mut row_y = l.text_y + l.cell.line_height - slip;
+            for (offset, line) in preview.iter().skip(top).enumerate() {
+                let height = line.rows() as f32 * l.cell.line_height;
+                if y >= row_y && y < row_y + height {
+                    return match line.code {
+                        Some(_) => Hit::PreviewCode(top + offset),
+                        None => Hit::Elsewhere,
+                    };
+                }
+                row_y += height;
+                if row_y > l.text_y + l.text_h {
+                    break;
+                }
+            }
+            return Hit::Elsewhere;
+        }
+    }
+
     // The two full-area pages are tested here rather than up front,
     // because that is where they are: they fill the text area and nothing
     // else. Checked before the chrome, they swallowed every click in the
@@ -814,6 +846,8 @@ impl<'a> Scene<'a> {
             diff_editable: self.diff.is_some() && self.diff_editable,
             diff_scroll: self.diff_scroll,
             diff_side_by_side: self.diff_side_by_side,
+            preview: self.preview,
+            preview_scroll: self.preview_scroll,
         }
     }
 }
@@ -2027,7 +2061,7 @@ fn draw_preview(
     let mut y = l.text_y + top_margin - slip;
     let bottom = l.text_y + l.text_h;
 
-    for line in lines.iter().skip(top) {
+    for (drawn, line) in lines.iter().skip(top).enumerate() {
         if y >= bottom {
             break;
         }
@@ -2043,7 +2077,7 @@ fn draw_preview(
 
         // Block decoration goes behind the text.
         match line.block {
-            MdBlock::Code => f.rect(
+            MdBlock::Code | MdBlock::Diagram => f.rect(
                 left - 2.0 * l.cell.advance,
                 y,
                 right - left + 4.0 * l.cell.advance,
@@ -2056,9 +2090,9 @@ fn draw_preview(
             MdBlock::TableHead => {
                 let cells: usize = line.spans.iter().map(|s| s.text.chars().count()).sum();
                 f.rect(
-                    left + line.indent as f32 * l.cell.advance - l.cell.advance,
+                    left + line.indent as f32 * l.cell.advance,
                     y,
-                    (cells as f32 + 2.0) * l.cell.advance,
+                    cells as f32 * l.cell.advance,
                     height,
                     theme.panel_bg,
                 )
@@ -2079,6 +2113,23 @@ fn draw_preview(
                 theme.panel_active,
             ),
             MdBlock::Plain => {}
+        }
+
+        // `copy` on the first row of a fenced block, so it is discoverable
+        // that the block is clickable at all. Only the first row: a label
+        // on every row would read as part of the code.
+        let first_of_block = line.code.is_some()
+            && lines
+                .get((top + drawn).wrapping_sub(1))
+                .is_none_or(|above| above.code.is_none());
+        if first_of_block {
+            const COPY: &str = "copy";
+            f.text(
+                right - COPY.len() as f32 * l.cell.advance,
+                baseline,
+                COPY,
+                theme.gutter_fg,
+            );
         }
 
         let mut x = left + line.indent as f32 * l.cell.advance;
@@ -2957,6 +3008,8 @@ mod tests {
             diff_editable: false,
             diff_scroll: 0.0,
             diff_side_by_side: false,
+            preview: None,
+            preview_scroll: 0.0,
         }
     }
 

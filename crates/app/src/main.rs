@@ -9,6 +9,7 @@ mod imageview;
 mod lsp;
 mod markdown;
 mod menu;
+mod mermaid;
 mod picker;
 mod recents;
 mod settings;
@@ -193,6 +194,8 @@ impl Pane {
             context: self.context.as_ref(),
             diff_editable: self.ws.diff().is_some_and(workspace::Diff::editable),
             diff_scroll: self.ws.diff().map_or(0.0, |d| d.scroll),
+            preview: self.preview.as_deref(),
+            preview_scroll: self.preview_scroll,
             diff_side_by_side: self.preview_defaults.side_by_side_diff,
         }
     }
@@ -3699,6 +3702,23 @@ impl App {
                     panel.set_mode(mode, repo.as_ref());
                 }
                 pane.repo = repo;
+            }
+            // Clicking a fenced block in the preview copies it. A drawn
+            // preview has no selection to drag, so this is the only way
+            // the code in it gets out.
+            Hit::PreviewCode(row) => {
+                let text = pane
+                    .preview
+                    .as_ref()
+                    .and_then(|lines| lines.get(row))
+                    .and_then(|line| line.code.clone());
+                let Some(text) = text else { return };
+                let lines = text.lines().count();
+                self.put_on_clipboard(
+                    Some(text.to_string()),
+                    if lines == 1 { "1 line" } else { "the block" },
+                );
+                return;
             }
             Hit::GitInit => {
                 let root = pane.search_root();

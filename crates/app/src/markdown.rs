@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// How a run of text is shown.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,8 +56,11 @@ pub enum Block {
     Rule,
     /// A hairline under a heading, as under an `<h1>`.
     HeadingRule,
-    /// A table's header: tinted, and followed by a [`Block::Rule`].
+    /// A table's header: tinted, inside the table's own border.
     TableHead,
+    /// A row of a rendered Mermaid diagram. Tinted like code, because it
+    /// came from a fence and is copied back out as its source.
+    Diagram,
 }
 
 /// How tall a line is, in grid rows, and how large its glyphs are.
@@ -107,6 +111,13 @@ pub struct Line {
     /// Glyph size, and so the row height. Only headings are ever anything
     /// but [`Scale::Body`].
     pub scale: Scale,
+    /// The verbatim source of the fenced block this row belongs to.
+    ///
+    /// Carried on every row of the block rather than only its first, so
+    /// a click anywhere in it can copy it without having to walk back to
+    /// find where it started. An `Arc` because every row of one block
+    /// shares the same text — cloning a row costs a refcount.
+    pub code: Option<Arc<str>>,
 }
 
 impl Line {
@@ -294,12 +305,44 @@ fn picture(alt: &str) -> Span {
     }
 }
 
+/// How a column's cells sit in their width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Align {
+    #[default]
+    Left,
+    Centre,
+    Right,
+}
+
+impl Align {
+    /// Reads one cell of a `|:---|:--:|---:|` delimiter row.
+    fn of(cell: &str) -> Self {
+        match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => Self::Centre,
+            (false, true) => Self::Right,
+            _ => Self::Left,
+        }
+    }
+
+    /// Spaces to put before and after a cell of `used` cells in `width`.
+    fn pad(self, used: usize, width: usize) -> (usize, usize) {
+        let slack = width.saturating_sub(used);
+        match self {
+            Self::Left => (0, slack),
+            Self::Right => (slack, 0),
+            Self::Centre => (slack / 2, slack - slack / 2),
+        }
+    }
+}
+
 /// A table being collected, and then laid out into a monospace grid.
 #[derive(Default)]
 struct Table {
     rows: Vec<Vec<Vec<Span>>>,
     /// Which of `rows` are headings.
     head: Vec<bool>,
+    /// Per column, from the delimiter row. Empty means all left.
+    aligns: Vec<Align>,
 }
 
 impl Table {
@@ -327,18 +370,21 @@ impl Table {
         }
     }
 
-    /// One line per row, cells padded to a common width and divided.
+    fn align(&self, column: usize) -> Align {
+        self.aligns.get(column).copied().unwrap_or_default()
+    }
+
+    /// One line per row, inside a drawn frame.
     ///
     /// Emits lines directly rather than through [`wrap`]: the padding is
     /// what holds the columns in line, and re-flowing a row at word
     /// boundaries would take the table apart.
     ///
-    /// Widths come from the content, then shrink to fit: a table is the
+    /// Widths come from the content, then shrink to fit. A table is the
     /// one construct here whose shape depends on every line of it, which
     /// is why it is collected whole before anything is emitted.
     fn lay_out(self, columns: usize, indent: usize) -> Vec<Line> {
         const MIN: usize = 3;
-        const GAP: usize = 3; // " │ "
 
         let count = self.rows.iter().map(Vec::len).max().unwrap_or(0);
         if count == 0 {
@@ -351,12 +397,15 @@ impl Table {
             }
         }
 
-        // Shrink the widest column, repeatedly, until the row fits. Taking
-        // from the widest keeps a narrow column readable instead of
-        // trimming every column into uselessness.
+        // A frame costs one cell per edge and three between columns:
+        // `│ a │ b │`.
+        let frame = |widths: &[usize]| widths.iter().sum::<usize>() + 3 * count + 1;
+
+        // Shrink the widest column, repeatedly, until the row fits.
+        // Taking from the widest keeps a narrow column readable instead
+        // of trimming every column into uselessness.
         let room = columns.saturating_sub(indent);
-        let dividers = GAP * (count - 1);
-        while widths.iter().sum::<usize>() + dividers > room {
+        while frame(&widths) > room {
             let Some(widest) = widths
                 .iter()
                 .enumerate()
@@ -371,32 +420,71 @@ impl Table {
             widths[widest] -= 1;
         }
 
-        let mut out = Vec::with_capacity(self.rows.len() + 1);
-        for (row, heading) in self.rows.into_iter().zip(self.head) {
-            let mut spans: Vec<Span> = Vec::new();
+        let rule = |left: char, join: char, right: char| {
+            let mut text = String::from(left);
             for (i, width) in widths.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span {
-                        text: " │ ".into(),
-                        style: Style::Divider,
-                    });
+                    text.push(join);
                 }
+                text.extend(std::iter::repeat_n('─', width + 2));
+            }
+            text.push(right);
+            Line {
+                spans: vec![Span {
+                    text,
+                    style: Style::Divider,
+                }],
+                indent,
+                block: Block::Plain,
+                scale: Scale::Body,
+                code: None,
+            }
+        };
+
+        let mut out = Vec::with_capacity(self.rows.len() + 3);
+        out.push(rule('┌', '┬', '┐'));
+
+        // Aligns is read per cell below, so it is taken before the rows
+        // move out of `self`.
+        let aligns: Vec<Align> = (0..count).map(|i| self.align(i)).collect();
+        let mut rows = self.rows.into_iter().zip(self.head).peekable();
+        while let Some((row, heading)) = rows.next() {
+            let mut spans: Vec<Span> = Vec::new();
+            for (i, width) in widths.iter().enumerate() {
+                spans.push(Span {
+                    text: if i == 0 {
+                        "│ ".into()
+                    } else {
+                        " │ ".into()
+                    },
+                    style: Style::Divider,
+                });
                 let cell = row.get(i).cloned().unwrap_or_default();
                 let used = width_of(&cell).min(*width);
+                let (before, after) = aligns[i].pad(used, *width);
+                if before > 0 {
+                    spans.push(Span {
+                        text: " ".repeat(before),
+                        style: Style::Body,
+                    });
+                }
                 for mut span in clip(cell, *width) {
                     if heading && span.style == Style::Body {
                         span.style = Style::Bold;
                     }
                     spans.push(span);
                 }
-                // Pad to the column width, so the next divider lines up.
-                if used < *width {
+                if after > 0 {
                     spans.push(Span {
-                        text: " ".repeat(width - used),
+                        text: " ".repeat(after),
                         style: Style::Body,
                     });
                 }
             }
+            spans.push(Span {
+                text: " │".into(),
+                style: Style::Divider,
+            });
             out.push(Line {
                 spans,
                 indent,
@@ -406,31 +494,15 @@ impl Table {
                     Block::Plain
                 },
                 scale: Scale::Body,
+                code: None,
             });
-            // The separator is typed rather than drawn, so it is exactly
-            // as wide as the table instead of as wide as the column.
-            if heading {
-                let mut rule: Vec<Span> = Vec::new();
-                for (i, width) in widths.iter().enumerate() {
-                    if i > 0 {
-                        rule.push(Span {
-                            text: "─┼─".into(),
-                            style: Style::Divider,
-                        });
-                    }
-                    rule.push(Span {
-                        text: "─".repeat(*width),
-                        style: Style::Divider,
-                    });
-                }
-                out.push(Line {
-                    spans: rule,
-                    indent,
-                    block: Block::Plain,
-                    scale: Scale::Body,
-                });
+            // A heading is separated from the body, but only when there
+            // is a body to separate it from.
+            if heading && rows.peek().is_some() {
+                out.push(rule('├', '┼', '┤'));
             }
         }
+        out.push(rule('└', '┴', '┘'));
         out
     }
 }
@@ -559,7 +631,19 @@ pub fn render(source: &str, columns: usize) -> Vec<Line> {
                 }
                 code.push(line);
             }
-            out.extend(code_block(fence.1, &code, columns));
+            // The source as written, which is what a copy hands back and
+            // what a diagram is drawn from.
+            let source: Arc<str> = Arc::from(code.join("\n"));
+            out.extend(match diagram(&fence.1, &source, columns) {
+                Some(drawn) => drawn,
+                None => code_block(fence.1, &code, columns),
+            });
+            for line in out.iter_mut().rev() {
+                if !matches!(line.block, Block::Code | Block::Diagram) {
+                    break;
+                }
+                line.code = Some(source.clone());
+            }
             list_pad = None;
             continue;
         }
@@ -568,7 +652,14 @@ pub fn render(source: &str, columns: usize) -> Vec<Line> {
         // thing that tells a row of pipes from a sentence with pipes in it.
         if bare.contains('|') && lines.get(i).is_some_and(|next| is_table_rule(next)) {
             flush(&mut paragraph, paragraph_indent, columns, &mut out);
-            let mut table = Table::default();
+            let mut table = Table {
+                // The delimiter row is where the alignment is written.
+                aligns: lines
+                    .get(i)
+                    .map(|rule| table_cells(rule).iter().map(|c| Align::of(c)).collect())
+                    .unwrap_or_default(),
+                ..Table::default()
+            };
             table.row();
             table.heading_row();
             for cell in table_cells(bare) {
@@ -788,6 +879,31 @@ fn fence_closes(bare: &str, marker: char) -> bool {
         && bare.chars().all(|c| c == marker || c.is_whitespace())
 }
 
+/// A `mermaid` fence drawn as a diagram, when it is one this can draw.
+///
+/// `None` for every other fence, and for a Mermaid diagram the reader
+/// will not lay out — the preview then shows the source, which says
+/// what was meant even when the picture cannot be drawn.
+fn diagram(language: &str, source: &str, columns: usize) -> Option<Vec<Line>> {
+    if !language.trim().eq_ignore_ascii_case("mermaid") {
+        return None;
+    }
+    let drawn = crate::mermaid::render(source, columns.saturating_sub(4))?;
+    let mut out = vec![Line::default().decorated(Block::Diagram)];
+    out.extend(drawn.into_iter().map(|text| Line {
+        spans: vec![Span {
+            text,
+            style: Style::Body,
+        }],
+        indent: 2,
+        block: Block::Diagram,
+        scale: Scale::Body,
+        code: None,
+    }));
+    out.push(Line::default().decorated(Block::Diagram));
+    Some(out)
+}
+
 /// A fenced block: tinted, padded, and highlighted when the fence names a
 /// language the editor already has a grammar for.
 fn code_block(language: String, code: &[&str], columns: usize) -> Vec<Line> {
@@ -816,6 +932,7 @@ fn code_block(language: String, code: &[&str], columns: usize) -> Vec<Line> {
                 indent: 2,
                 block: Block::Code,
                 scale: Scale::Body,
+                code: None,
             });
         }
     }
@@ -956,6 +1073,7 @@ fn wrap(spans: Vec<Span>, indent: usize, columns: usize, scale: Scale) -> Vec<Li
                 indent,
                 block: Block::Plain,
                 scale,
+                code: None,
             });
             used = 0;
         }
@@ -983,6 +1101,7 @@ fn wrap(spans: Vec<Span>, indent: usize, columns: usize, scale: Scale) -> Vec<Li
             indent,
             block: Block::Plain,
             scale,
+            code: None,
         });
     }
     lines
@@ -1514,34 +1633,62 @@ mod tests {
     }
 
     #[test]
-    fn a_pipe_table_becomes_an_aligned_grid() {
+    fn a_pipe_table_is_drawn_inside_a_frame() {
         let out = render(
             "| Name | Size |\n|---|---:|\n| a.rs | 12 |\n| bb.rs | 3 |\n",
             60,
         );
-        let head = out
-            .iter()
-            .position(|l| l.block == Block::TableHead)
-            .expect("a header row");
-        assert!(text_of(&out[head]).starts_with("Name"));
-        // Every row is the same width, which is what makes the dividers
-        // line up into columns.
-        let widths: Vec<usize> = out[head..head + 4]
-            .iter()
-            .map(|l| text_of(l).chars().count())
-            .collect();
+        let rows: Vec<String> = out.iter().map(text_of).filter(|t| !t.is_empty()).collect();
+
+        assert!(
+            rows[0].starts_with('┌') && rows[0].ends_with('┐'),
+            "{rows:#?}"
+        );
+        assert!(rows[1].starts_with("│ Name"), "{rows:#?}");
+        assert!(
+            rows[2].starts_with('├') && rows[2].ends_with('┤'),
+            "{rows:#?}"
+        );
+        assert!(rows.last().unwrap().starts_with('└'), "{rows:#?}");
+
+        // Every row the same width is what makes the columns line up.
+        let widths: Vec<usize> = rows.iter().map(|r| r.chars().count()).collect();
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "rows should be padded alike, got {widths:?}"
         );
+    }
+
+    #[test]
+    fn a_column_is_aligned_the_way_its_delimiter_says() {
+        // The markers were being parsed and then thrown away, so every
+        // column came out left-aligned however it was written.
+        let out = render("| L | C | R |\n|:--|:-:|--:|\n| a | b | c |\n", 60);
+        let body = out
+            .iter()
+            .map(text_of)
+            .find(|t| t.contains('a'))
+            .expect("the body row");
+        let cells: Vec<&str> = body
+            .trim_matches(|c| c == '│' || c == ' ')
+            .split('│')
+            .collect();
+        assert_eq!(cells.len(), 3, "{body:?}");
+        assert!(cells[0].starts_with('a'), "left: {:?}", cells[0]);
         assert!(
-            text_of(&out[head + 1])
-                .chars()
-                .all(|c| c == '─' || c == '┼'),
-            "the header is underlined by a typed rule: {:?}",
-            text_of(&out[head + 1])
+            cells[1].starts_with(' ') && cells[1].ends_with(' '),
+            "centre: {:?}",
+            cells[1]
         );
-        assert!(text_of(&out[head + 2]).contains('│'), "cells are divided");
+        assert!(cells[2].ends_with('c'), "right: {:?}", cells[2]);
+    }
+
+    #[test]
+    fn a_table_with_only_a_header_needs_no_separator() {
+        let out = render("| One | Two |\n|---|---|\n", 60);
+        let rows: Vec<String> = out.iter().map(text_of).filter(|t| !t.is_empty()).collect();
+        assert_eq!(rows.len(), 3, "top, header, bottom: {rows:#?}");
+        assert!(rows[2].starts_with('└'), "{rows:#?}");
     }
 
     #[test]
@@ -1576,6 +1723,61 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, Style::Syntax(lithe_syntax::Kind::Keyword))),
             "`fn` should be a keyword, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn every_row_of_a_fence_carries_its_source() {
+        // A drawn preview has no selection to drag, so a click has to be
+        // able to copy the block from whichever of its rows was hit.
+        let out = render(
+            "before\n\n```rust\nfn a() {}\nfn b() {}\n```\n\nafter\n",
+            60,
+        );
+        let fenced: Vec<&Line> = out.iter().filter(|l| l.code.is_some()).collect();
+        assert!(fenced.len() >= 2, "got {}", fenced.len());
+        for line in &fenced {
+            assert_eq!(
+                line.code.as_deref(),
+                Some("fn a() {}\nfn b() {}"),
+                "the source as written, not as rendered"
+            );
+        }
+        assert!(
+            out.iter()
+                .filter(|l| l.code.is_none())
+                .any(|l| text_of(l).contains("before")),
+            "prose carries none of it"
+        );
+    }
+
+    #[test]
+    fn a_mermaid_fence_is_drawn_and_still_copies_its_source() {
+        let src = "```mermaid\nflowchart TB\n  A[One] --> B[Two]\n```\n";
+        let out = render(src, 60);
+        let drawn: String = out.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(drawn.contains("One") && drawn.contains('▼'), "{drawn}");
+        assert!(
+            out.iter().any(|l| l.block == Block::Diagram),
+            "it should be a diagram, not a code block"
+        );
+        // Copying gives back the mermaid, not the picture.
+        let source = out.iter().find_map(|l| l.code.clone()).expect("a source");
+        assert!(source.contains("flowchart TB"), "{source}");
+    }
+
+    #[test]
+    fn a_mermaid_fence_it_cannot_draw_stays_a_code_block() {
+        let src = "```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n";
+        let out = render(src, 60);
+        assert!(
+            out.iter().all(|l| l.block != Block::Diagram),
+            "a sequence diagram is not a flowchart"
+        );
+        let text: String = out.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("sequenceDiagram"),
+            "the source says what was meant: {text}"
         );
     }
 
