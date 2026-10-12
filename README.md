@@ -132,18 +132,30 @@ drag, so the block is the unit: click anywhere in one and the source
 goes to the clipboard, as written rather than as rendered. The first row
 of each block says `copy`, so it is discoverable that it can be.
 
-**A `mermaid` fence is drawn as a diagram** when it is a flowchart —
-`flowchart`/`graph` with `TB`, `TD`, `BT`, `LR` or `RL`, node shapes,
-and labelled edges in either `-->|label|` or `-- label -->` form. It is
-laid out in box-drawing characters on the same grid as everything else.
-A step is square and everything else is rounded, because a monospace
-grid can honestly express two outlines and a rhombus made of box
-characters reads as a mistake.
+**A `mermaid` fence is drawn as a diagram**, in box-drawing characters
+on the same grid as everything else. Two kinds, which is what a
+project's documentation actually contains:
 
-Anything it cannot lay out — a sequence diagram, a subgraph, styling, or
-a chart too wide for the column — stays a code block. A diagram drawn
-wrong is worse than the fence it came from: the source at least says
-what was meant.
+- **Flowcharts** — `flowchart`/`graph` with `TB`, `TD`, `BT`, `LR` or
+  `RL`, node shapes, `subgraph` groups drawn as labelled frames, and
+  labelled edges in either `-->|label|` or `-- label -->` form. A step
+  is square and everything else is rounded: a monospace grid can
+  honestly express two outlines, and a rhombus made of box characters
+  reads as a mistake.
+- **Sequence diagrams** — participants across the top, lifelines down,
+  messages as arrows between them, replies dashed, and a message to
+  itself turning back on its own lifeline.
+
+Anything else — a pie chart, a gantt chart, an ER diagram, `loop`/`alt`
+blocks, `style` directives, or a chart too wide for the column — stays
+a code block. A diagram drawn wrong is worse than the fence it came
+from: the source at least says what was meant.
+
+Two limits worth knowing. A subgraph frame is dropped, and the nodes
+drawn without it, when the group's nodes did not land in a clean
+rectangle — a frame that encloses something it does not own says
+something false. And a quoted label's `\n` becomes a space, because one
+row per box is what keeps the layout arithmetic honest.
 
 Tables honour their alignment row: `:---` left, `:--:` centred, `---:`
 right. They are drawn inside a frame, and a column too wide for the

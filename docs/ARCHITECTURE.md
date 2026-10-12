@@ -314,3 +314,30 @@ to drag-select; the block is the unit instead, and a click anywhere in
 it copies. Carrying the text on every row rather than only the first
 means the click needs no walk back to find where the block started, and
 an `Arc` means a row still costs a refcount to clone.
+
+Asking for a frame when a window is created is not enough on macOS. The
+frame is drawn before AppKit has finished activating the app, so nothing
+composites it, and the next frame only came when something else happened
+to ask for one. Run from a terminal the pointer was usually already over
+the window, so a `CursorEntered` covered it up; launched from Finder
+with the pointer elsewhere, nothing did, and the window stayed blank
+until it was clicked. `Focused(true)` and `Occluded(false)` — the two
+events that mean the window is really on screen — now redraw.
+
+The Mermaid canvas locks the cells a box owns. Checking for a blank cell
+is not enough, because a box's own characters are not blank: an arrow
+routed past one wrote its corners straight through the label, and
+`Node 0 (leader)` came out as `N┴de╮0 (leader)`. Only box drawing may
+write to a locked cell.
+
+Subgraphs are flattened into the layering and framed afterwards, which
+is what lets the layering stay one simple pass. The frame is skipped
+when the group's nodes did not land in a clean rectangle — a frame round
+nodes it does not own is a worse error than no frame, and the diagram is
+still drawn either way.
+
+A sequence diagram's message text goes down before its lifelines, which
+are then drawn only where the text is not. The other order put a `│`
+through every message that reached past one lifeline. The canvas is also
+widened to the longest message rather than the text being cut at the
+next lifeline, because `UNAVAILABLE + l` has lost the part that mattered.
