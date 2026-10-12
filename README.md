@@ -127,6 +127,29 @@ uses, picked from the language on the fence. A fence naming a language
 nothing is installed for stays plain rather than being coloured by a
 guess.
 
+**Click a fenced block to copy it.** A drawn preview has no selection to
+drag, so the block is the unit: click anywhere in one and the source
+goes to the clipboard, as written rather than as rendered. The first row
+of each block says `copy`, so it is discoverable that it can be.
+
+**A `mermaid` fence is drawn as a diagram** when it is a flowchart —
+`flowchart`/`graph` with `TB`, `TD`, `BT`, `LR` or `RL`, node shapes,
+and labelled edges in either `-->|label|` or `-- label -->` form. It is
+laid out in box-drawing characters on the same grid as everything else.
+A step is square and everything else is rounded, because a monospace
+grid can honestly express two outlines and a rhombus made of box
+characters reads as a mistake.
+
+Anything it cannot lay out — a sequence diagram, a subgraph, styling, or
+a chart too wide for the column — stays a code block. A diagram drawn
+wrong is worse than the fence it came from: the source at least says
+what was meant.
+
+Tables honour their alignment row: `:---` left, `:--:` centred, `---:`
+right. They are drawn inside a frame, and a column too wide for the
+window is narrowed from the widest one first, so the narrow columns stay
+readable instead of every column being trimmed into uselessness.
+
 Two boundaries worth stating. An unknown tag is left as written rather
 than dropped, because `Vec<T>` in prose is commoner in a code editor's
 README than hand-written HTML. And an image is named, not drawn: a

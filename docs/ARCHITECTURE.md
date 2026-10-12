@@ -289,3 +289,28 @@ result is nobody's idea of a swap. `toggle_comment` makes one decision
 for the whole block — if every line is commented it uncomments, else it
 comments all of it — because line by line turns a half-commented block
 into its own inverse, which is never what was meant.
+
+A window must ask for its first frame. Drawing is damage-driven and the
+loop waits rather than polls, so a window created without a
+`request_redraw` stays blank until some unrelated event arrives — which,
+for a freshly launched app, meant until it was clicked.
+
+The Mermaid reader draws one diagram and refuses the rest. Refusing is
+the half that matters: a sequence diagram rendered as a bad flowchart is
+worse than the fence it came from, because the source at least says what
+was meant. Anything it cannot lay out returns `None` and the preview
+shows the code.
+
+Its arrows are found as maximal runs of `-=.<>` rather than matched
+against a table of literals. A table scanned from the right picks the
+`->` *inside* `-->` and splits the line there, leaving `A -` as the
+source node; a maximal run cannot, and it also handles the
+`A -- label --> B` form, where the real arrow is the second run and the
+label sits between them.
+
+A fenced block carries its own source on every one of its rows. The
+preview is drawn, not laid out as selectable text, so there is nothing
+to drag-select; the block is the unit instead, and a click anywhere in
+it copies. Carrying the text on every row rather than only the first
+means the click needs no walk back to find where the block started, and
+an `Arc` means a row still costs a refcount to clone.
