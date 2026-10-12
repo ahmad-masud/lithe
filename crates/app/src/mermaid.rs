@@ -75,13 +75,22 @@ struct Edge {
 /// Renders a `mermaid` fence, or `None` when it is not a flowchart this
 /// can lay out honestly.
 pub fn render(source: &str, columns: usize) -> Option<Vec<String>> {
-    let (dir, mut nodes, edges) = parse(source)?;
+    let kind = source
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("%%"))?
+        .split_whitespace()
+        .next()?;
+    if kind == "sequenceDiagram" {
+        return sequence::render(source, columns);
+    }
+    let (dir, mut nodes, edges, groups) = parse(source)?;
     if nodes.is_empty() {
         return None;
     }
     layer(&mut nodes, &edges);
     let canvas = if dir.vertical() {
-        draw_vertical(dir, &mut nodes, &edges, columns)
+        draw_vertical(dir, &mut nodes, &edges, &groups, columns)
     } else {
         draw_horizontal(dir, &mut nodes, &edges, columns)
     }?;
@@ -90,7 +99,7 @@ pub fn render(source: &str, columns: usize) -> Option<Vec<String>> {
 
 /// Reads the subset of the flowchart grammar that a README uses.
 #[allow(clippy::type_complexity)]
-fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>)> {
+fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>, Vec<Group>)> {
     let mut lines = source
         .lines()
         .map(str::trim)
@@ -111,6 +120,8 @@ fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>)> {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
 
     for line in lines {
         let line = line.trim_end_matches(';');
@@ -121,25 +132,70 @@ fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>)> {
         let first = line.split_whitespace().next().unwrap_or("");
         if matches!(
             first,
-            "subgraph" | "end" | "style" | "classDef" | "class" | "click" | "linkStyle"
+            "style" | "classDef" | "class" | "click" | "linkStyle"
         ) {
             return None;
+        }
+        if first == "subgraph" {
+            let rest = line["subgraph".len()..].trim();
+            groups.push(Group {
+                title: group_title(rest),
+                members: Vec::new(),
+            });
+            open.push(groups.len() - 1);
+            continue;
+        }
+        if first == "end" {
+            open.pop();
+            continue;
         }
 
         match split_edge(line) {
             Some((left, label, right)) => {
                 let from = intern(left, &mut index, &mut nodes)?;
                 let to = intern(right, &mut index, &mut nodes)?;
+                enrol(&mut groups, &open, from);
+                enrol(&mut groups, &open, to);
                 edges.push(Edge { from, to, label });
             }
             // A bare declaration, which is how a node gets a label it is
             // not given at its first edge.
             None => {
-                intern(line, &mut index, &mut nodes)?;
+                let at = intern(line, &mut index, &mut nodes)?;
+                enrol(&mut groups, &open, at);
             }
         }
     }
-    Some((dir, nodes, edges))
+    Some((dir, nodes, edges, groups))
+}
+
+/// A `subgraph` and the nodes declared inside it.
+#[derive(Clone, Debug)]
+struct Group {
+    title: String,
+    members: Vec<usize>,
+}
+
+/// `subgraph cluster [Raft Cluster]` names the group twice: an id and a
+/// title. The title is what anyone reads, so it wins.
+fn group_title(rest: &str) -> String {
+    match rest.split_once('[') {
+        Some((_, title)) => title
+            .trim_end_matches([']', '"'])
+            .trim_matches('"')
+            .trim()
+            .to_string(),
+        None => rest.trim_matches('"').trim().to_string(),
+    }
+}
+
+/// Records a node as belonging to whichever subgraphs are open.
+fn enrol(groups: &mut [Group], open: &[usize], node: usize) {
+    for &g in open {
+        if !groups[g].members.contains(&node) {
+            groups[g].members.push(node);
+        }
+    }
 }
 
 /// Splits `A -->|label| B` into its three parts.
@@ -284,7 +340,13 @@ fn node_parts(token: &str) -> Option<(String, Option<String>, Shape)> {
     let label = inner
         .trim_matches(|c| matches!(c, '[' | ']' | '(' | ')' | '{' | '}' | '>' | '"'))
         .trim()
+        // A quoted label can carry `\n`, which is a line break Mermaid
+        // draws and this cannot: one row per box is what keeps the
+        // layout arithmetic honest, so it becomes a space.
+        .replace("\\n", " ")
+        .replace('"', "")
         .to_string();
+    let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
     Some((id, (!label.is_empty()).then_some(label), shape))
 }
 
@@ -341,16 +403,49 @@ const GAP_LR: usize = 4;
 
 struct Canvas {
     cells: Vec<Vec<char>>,
+    /// Cells a box owns. Nothing else may write to them.
+    ///
+    /// Without this an arrow routed past a box wrote its corners and
+    /// arrowheads straight through the label — `Node 0 (leader)` came
+    /// out as `N┴de╮0 (leader)`. Checking for a blank cell is not
+    /// enough, because a box's own characters are not blank.
+    locked: Vec<Vec<bool>>,
 }
 
 impl Canvas {
     fn new(width: usize, height: usize) -> Self {
         Self {
             cells: vec![vec![' '; width]; height],
+            locked: vec![vec![false; width]; height],
         }
     }
 
+    /// Writes regardless of who owns the cell. Only box drawing may.
+    fn set(&mut self, x: usize, y: usize, ch: char) {
+        if let Some(row) = self.cells.get_mut(y) {
+            if let Some(cell) = row.get_mut(x) {
+                *cell = ch;
+            }
+        }
+        if let Some(row) = self.locked.get_mut(y) {
+            if let Some(cell) = row.get_mut(x) {
+                *cell = true;
+            }
+        }
+    }
+
+    fn owned(&self, x: usize, y: usize) -> bool {
+        self.locked
+            .get(y)
+            .and_then(|r| r.get(x))
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn put(&mut self, x: usize, y: usize, ch: char) {
+        if self.owned(x, y) {
+            return;
+        }
         if let Some(row) = self.cells.get_mut(y) {
             if let Some(cell) = row.get_mut(x) {
                 *cell = ch;
@@ -361,7 +456,7 @@ impl Canvas {
     /// Draws a character only where the cell is still blank, so a box
     /// is never scribbled over by an arrow routed past it.
     fn under(&mut self, x: usize, y: usize, ch: char) {
-        if self.cells.get(y).and_then(|r| r.get(x)) == Some(&' ') {
+        if !self.owned(x, y) && self.cells.get(y).and_then(|r| r.get(x)) == Some(&' ') {
             self.put(x, y, ch);
         }
     }
@@ -370,6 +465,9 @@ impl Canvas {
     /// edges that branch from one box share a cell, and the second must
     /// not erase the first.
     fn join(&mut self, x: usize, y: usize, ch: char, joined: char) {
+        if self.owned(x, y) {
+            return;
+        }
         let here = self.cells.get(y).and_then(|r| r.get(x)).copied();
         let occupied = matches!(here, Some(c) if c != ' ' && c != '─' && c != '│');
         self.put(x, y, if occupied { joined } else { ch });
@@ -381,6 +479,14 @@ impl Canvas {
         }
     }
 
+    /// Text that gives way to anything already there, so a label never
+    /// lands on a box or a line it does not own.
+    fn label(&mut self, x: usize, y: usize, text: &str) {
+        for (i, ch) in text.chars().enumerate() {
+            self.under(x + i, y, ch);
+        }
+    }
+
     /// A box with its label centred, at `x`,`y`.
     fn boxed(&mut self, x: usize, y: usize, label: &str, shape: Shape) {
         let width = box_width(label);
@@ -388,17 +494,49 @@ impl Canvas {
             Shape::Rect => ('┌', '┐', '└', '┘'),
             Shape::Round => ('╭', '╮', '╰', '╯'),
         };
-        self.put(x, y, tl);
-        self.put(x + width - 1, y, tr);
-        self.put(x, y + 2, bl);
-        self.put(x + width - 1, y + 2, br);
-        for i in 1..width - 1 {
-            self.put(x + i, y, '─');
-            self.put(x + i, y + 2, '─');
+        for row in 0..3 {
+            for i in 0..width {
+                self.set(x + i, y + row, ' ');
+            }
         }
-        self.put(x, y + 1, '│');
-        self.put(x + width - 1, y + 1, '│');
-        self.text(x + 2, y + 1, label);
+        self.set(x, y, tl);
+        self.set(x + width - 1, y, tr);
+        self.set(x, y + 2, bl);
+        self.set(x + width - 1, y + 2, br);
+        for i in 1..width - 1 {
+            self.set(x + i, y, '─');
+            self.set(x + i, y + 2, '─');
+        }
+        self.set(x, y + 1, '│');
+        self.set(x + width - 1, y + 1, '│');
+        for (i, ch) in label.chars().enumerate() {
+            self.set(x + 2 + i, y + 1, ch);
+        }
+    }
+
+    /// A light frame with a title on its top edge, drawn only where the
+    /// cells are free.
+    fn frame(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, title: &str) {
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        for x in x0 + 1..x1 {
+            self.under(x, y0, '╌');
+            self.under(x, y1, '╌');
+        }
+        for y in y0 + 1..y1 {
+            self.under(x0, y, '╎');
+            self.under(x1, y, '╎');
+        }
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            self.under(x, y, '┼');
+        }
+        if !title.is_empty() {
+            let at = x0 + 2;
+            if at + title.chars().count() < x1 {
+                self.text(at, y0, title);
+            }
+        }
     }
 
     fn into_lines(self) -> Vec<String> {
@@ -434,6 +572,7 @@ fn draw_vertical(
     dir: Dir,
     nodes: &mut [Node],
     edges: &[Edge],
+    groups: &[Group],
     columns: usize,
 ) -> Option<Vec<String>> {
     let rows = layers(nodes, dir.reversed());
@@ -465,13 +604,22 @@ fn draw_vertical(
     if width > columns {
         return None;
     }
-    let height = rows.len() * BOX_H + rows.len().saturating_sub(1) * GAP_V;
+    // A group frame is drawn one row above the layer it starts on, so
+    // the canvas needs a row of headroom or the frame lands on the box.
+    let headroom = usize::from(!groups.is_empty());
+    let height = headroom + rows.len() * BOX_H + rows.len().saturating_sub(1) * GAP_V + headroom;
+    // The order layers were drawn in, so a group frame can find the row
+    // a layer landed on even when the direction reversed them.
+    let rows_order: Vec<usize> = rows
+        .iter()
+        .map(|layer| layer.first().map_or(0, |i| nodes[*i].layer))
+        .collect();
 
-    let mut canvas = Canvas::new(width, height);
+    let mut canvas = Canvas::new(width + 4, height);
     let mut tops: Vec<usize> = vec![0; nodes.len()];
 
     for (depth, layer) in rows.iter().enumerate() {
-        let y = depth * (BOX_H + GAP_V);
+        let y = headroom + depth * (BOX_H + GAP_V);
         let mut x = (content - widths[depth]) / 2;
         for &i in layer {
             let w = box_width(&nodes[i].label);
@@ -480,6 +628,47 @@ fn draw_vertical(
             tops[i] = y;
             x += w + GAP_H;
         }
+    }
+
+    // A subgraph is drawn as a frame round the boxes it holds, once they
+    // have been placed. Flattening the group into the layout and framing
+    // it afterwards is what lets the layering stay one simple pass; the
+    // frame is skipped when the nodes did not land in a clean rectangle,
+    // because a frame that encloses something it does not own says
+    // something false.
+    for group in groups {
+        if group.members.is_empty() {
+            continue;
+        }
+        let rows: Vec<usize> = group.members.iter().map(|i| nodes[*i].layer).collect();
+        let (first, last) = (*rows.iter().min()?, *rows.iter().max()?);
+        let foreign = nodes
+            .iter()
+            .enumerate()
+            .any(|(i, n)| n.layer >= first && n.layer <= last && !group.members.contains(&i));
+        if foreign {
+            continue;
+        }
+        let left = group
+            .members
+            .iter()
+            .map(|i| nodes[*i].centre - box_width(&nodes[*i].label) / 2)
+            .min()?;
+        let right = group
+            .members
+            .iter()
+            .map(|i| nodes[*i].centre + box_width(&nodes[*i].label) / 2)
+            .max()?;
+        let depth = |layer: usize| rows_order.iter().position(|l| *l == layer).unwrap_or(layer);
+        let top = headroom + depth(first) * (BOX_H + GAP_V);
+        let bottom = headroom + depth(last) * (BOX_H + GAP_V) + BOX_H;
+        canvas.frame(
+            left.saturating_sub(2),
+            top - 1,
+            right + 2,
+            bottom,
+            &group.title,
+        );
     }
 
     for edge in edges {
@@ -525,7 +714,7 @@ fn draw_vertical(
             // was written over the line it belonged to.
             let at = x1 + 2;
             if at + label.chars().count() < width {
-                canvas.text(at, head, label);
+                canvas.label(at, head, label);
             }
         }
     }
@@ -619,6 +808,241 @@ fn draw_horizontal(
     Some(canvas.into_lines())
 }
 
+/// Sequence diagrams: participants across the top, time down.
+///
+/// A different drawing entirely from a flowchart, and an easier one —
+/// the layout is a column per participant and a row per message, with
+/// no layering to work out. It is here because `sequenceDiagram` is the
+/// other half of what a project's documentation actually contains.
+mod sequence {
+    use super::Canvas;
+
+    /// How a message's line is drawn.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Line {
+        Solid,
+        /// A reply, which Mermaid writes `-->>` and draws dashed.
+        Dashed,
+    }
+
+    struct Message {
+        from: usize,
+        to: usize,
+        text: String,
+        line: Line,
+    }
+
+    /// Cells of air either side of a participant's name in its box.
+    const PAD: usize = 2;
+    /// Cells between one participant's box and the next.
+    const GAP: usize = 3;
+
+    pub fn render(source: &str, columns: usize) -> Option<Vec<String>> {
+        let (names, messages) = parse(source)?;
+        if names.is_empty() || messages.is_empty() {
+            return None;
+        }
+
+        let widths: Vec<usize> = names.iter().map(|n| n.chars().count() + PAD * 2).collect();
+        let columns_wide: usize = widths.iter().sum::<usize>() + GAP * (names.len() - 1) + 1;
+
+        // Lifelines first, because how much room a message's text needs
+        // depends on where its own lifeline is.
+        let mut lifelines = Vec::with_capacity(names.len());
+        let mut x = 0;
+        for width in &widths {
+            lifelines.push(x + width / 2);
+            x += width + GAP;
+        }
+
+        // The canvas is widened to fit the longest message rather than
+        // the text being cut at the next lifeline. A message clipped to
+        // `UNAVAILABLE + l` has lost the part that mattered.
+        let needed = messages
+            .iter()
+            .map(|m| {
+                let start = if m.from == m.to {
+                    lifelines[m.from] + 4
+                } else {
+                    lifelines[m.from].min(lifelines[m.to]) + 2
+                };
+                start + m.text.chars().count() + 1
+            })
+            .max()
+            .unwrap_or(0);
+        let width = columns_wide.max(needed);
+        if width > columns {
+            return None;
+        }
+
+        // Three rows per message: its text, its arrow, and air.
+        let head = 3;
+        let height = head + messages.len() * 3 + 1;
+        let mut canvas = Canvas::new(width, height);
+
+        let mut x = 0;
+        for (i, name) in names.iter().enumerate() {
+            canvas.boxed(x, 0, name, super::Shape::Rect);
+            x += widths[i] + GAP;
+        }
+
+        for (i, message) in messages.iter().enumerate() {
+            let row = head + i * 3;
+            let (a, b) = (lifelines[message.from], lifelines[message.to]);
+            let arrow = row + 1;
+
+            // The text goes down before the lifelines, which are then
+            // drawn only where it is not. The other order put a `│`
+            // through every message that reached past one lifeline:
+            // `Set(key, value│`.
+            let (text_at, text_row) = if message.from == message.to {
+                (a + 4, arrow)
+            } else {
+                (a.min(b) + 2, row)
+            };
+            canvas.text(text_at, text_row, &message.text);
+
+            // Lifelines run the whole height, under everything, so a
+            // message crossing one stays readable.
+            for line in &lifelines {
+                for y in row..row + 3 {
+                    canvas.under(*line, y, '│');
+                }
+            }
+
+            if message.from == message.to {
+                // A message to itself turns back on its own lifeline.
+                canvas.put(a + 1, row, '─');
+                canvas.put(a + 2, row, '╮');
+                canvas.put(a + 2, arrow, '│');
+                canvas.put(a + 2, arrow + 1, '╯');
+                canvas.put(a + 1, arrow + 1, '─');
+                canvas.put(a, arrow + 1, '◀');
+                continue;
+            }
+
+            let (lo, hi) = (a.min(b), a.max(b));
+            for x in lo + 1..hi {
+                canvas.put(
+                    x,
+                    arrow,
+                    match message.line {
+                        Line::Solid => '─',
+                        // A hyphen rather than a box-drawing dash: it is
+                        // in every font, and a reply that renders as a
+                        // missing glyph is worse than one that is plain.
+                        Line::Dashed => '-',
+                    },
+                );
+            }
+            // The tail is on the sender's side whichever way the
+            // message runs; `├` on the right end of a leftward arrow
+            // pointed the wrong way.
+            canvas.put(a, arrow, if b > a { '├' } else { '┤' });
+            canvas.put(b, arrow, if b > a { '▶' } else { '◀' });
+        }
+        Some(canvas.into_lines())
+    }
+
+    /// Reads participants and messages, and refuses the rest.
+    ///
+    /// `loop`, `alt`, `opt` and `par` are control flow drawn as nested
+    /// frames; without them the messages inside would be shown as though
+    /// they always happen, which is a different diagram.
+    fn parse(source: &str) -> Option<(Vec<String>, Vec<Message>)> {
+        let mut names: Vec<String> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+        let mut messages: Vec<Message> = Vec::new();
+
+        let id_of = |ids: &mut Vec<String>, names: &mut Vec<String>, token: &str| {
+            let token = token.trim();
+            match ids.iter().position(|i| i == token) {
+                Some(at) => Some(at),
+                None if token.is_empty() => None,
+                None => {
+                    ids.push(token.to_string());
+                    names.push(token.to_string());
+                    Some(ids.len() - 1)
+                }
+            }
+        };
+
+        for line in source.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with("%%") || line == "sequenceDiagram" {
+                continue;
+            }
+            let first = line.split_whitespace().next().unwrap_or("");
+            if matches!(
+                first,
+                "loop"
+                    | "alt"
+                    | "else"
+                    | "opt"
+                    | "par"
+                    | "and"
+                    | "end"
+                    | "rect"
+                    | "critical"
+                    | "break"
+                    | "activate"
+                    | "deactivate"
+                    | "autonumber"
+            ) {
+                return None;
+            }
+            if matches!(first, "Note" | "note") {
+                continue;
+            }
+
+            if let Some(rest) = line
+                .strip_prefix("participant ")
+                .or_else(|| line.strip_prefix("actor "))
+            {
+                let (id, shown) = match rest.split_once(" as ") {
+                    Some((id, shown)) => (id.trim(), shown.trim()),
+                    None => (rest.trim(), rest.trim()),
+                };
+                if ids.iter().all(|i| i != id) {
+                    ids.push(id.to_string());
+                    names.push(shown.to_string());
+                }
+                continue;
+            }
+
+            // `A->>B: text`. Longest arrow first, so `->>` is not read
+            // as `->` with a stray `>` on the target.
+            const ARROWS: &[(&str, Line)] = &[
+                ("-->>", Line::Dashed),
+                ("--)", Line::Dashed),
+                ("-->", Line::Dashed),
+                ("->>", Line::Solid),
+                ("-)", Line::Solid),
+                ("->", Line::Solid),
+            ];
+            let found = ARROWS
+                .iter()
+                .find_map(|(arrow, line_kind)| line.find(arrow).map(|at| (at, *arrow, *line_kind)));
+            let Some((at, arrow, line_kind)) = found else {
+                // Not a message and not a participant: something this
+                // does not read, so the whole diagram is refused.
+                return None;
+            };
+            let from = &line[..at];
+            let rest = &line[at + arrow.len()..];
+            let (to, text) = rest.split_once(':').unwrap_or((rest, ""));
+            let from = id_of(&mut ids, &mut names, from)?;
+            let to = id_of(&mut ids, &mut names, to)?;
+            messages.push(Message {
+                from,
+                to,
+                text: text.trim().to_string(),
+                line: line_kind,
+            });
+        }
+        Some((names, messages))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,14 +1110,115 @@ mod tests {
     }
 
     #[test]
+    fn a_subgraph_groups_its_nodes_inside_a_frame() {
+        let out = drawn(
+            "flowchart TB\n  subgraph clients [Clients]\n    A[One]\n    B[Two]\n  end\n  A --> C[Out]\n",
+        );
+        assert!(out.contains("Clients"), "the group is named: {out}");
+        assert!(out.contains('╎'), "and framed: {out}");
+        for name in ["One", "Two", "Out"] {
+            assert!(out.contains(name), "{name} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_frame_is_dropped_rather_than_drawn_round_the_wrong_nodes() {
+        // `B` is not in the group but shares its layer, so a frame round
+        // the group's bounding box would enclose it and say something
+        // false. The nodes are still drawn.
+        let out =
+            drawn("flowchart TB\n  subgraph g [G]\n    A[Aaa]\n  end\n  B[Bbb]\n  A --> C[Ccc]\n");
+        assert!(!out.contains('╎'), "no frame should be drawn:\n{out}");
+        for name in ["Aaa", "Bbb", "Ccc"] {
+            assert!(out.contains(name), "{name} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_label_loses_its_escapes_rather_than_showing_them() {
+        let out = drawn("flowchart TB\n  A[\"Node 0 (leader)\\ngRPC\"] --> B[Next]\n");
+        assert!(out.contains("Node 0 (leader) gRPC"), "{out}");
+        assert!(!out.contains('\\'), "the escape should not survive:\n{out}");
+        assert!(!out.contains('"'), "nor the quotes:\n{out}");
+    }
+
+    #[test]
+    fn a_label_never_lands_on_top_of_a_box() {
+        // An arrow routed past a box used to write its corners through
+        // the label: `Node 0 (leader)` came out as `N┴de╮0 (leader)`.
+        let out = drawn(
+            "flowchart TB\n  A[Aaaaaaaaaa] --> B[Bbbbbbbbbb]\n  B --> C[Cccccccccc]\n  A --> C\n",
+        );
+        for name in ["Aaaaaaaaaa", "Bbbbbbbbbb", "Cccccccccc"] {
+            assert!(out.contains(name), "{name} was written through:\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_sequence_diagram_draws_lifelines_and_messages() {
+        let out = drawn(
+            "sequenceDiagram\n  participant C as Client\n  participant S as Server\n\
+             \n  C->>S: Set(key)\n  S-->>C: ok\n",
+        );
+        assert!(out.contains("Client") && out.contains("Server"), "{out}");
+        assert!(out.contains("Set(key)") && out.contains("ok"), "{out}");
+        assert!(
+            out.contains('▶') && out.contains('◀'),
+            "both directions: {out}"
+        );
+        // A reply is dashed, a call is not.
+        assert!(out.contains('-'), "{out}");
+    }
+
+    #[test]
+    fn a_message_is_not_cut_off_at_the_next_lifeline() {
+        // The canvas widens to the longest message instead:
+        // `UNAVAILABLE + l` had lost the part that mattered.
+        let long = "UNAVAILABLE plus a leader-address header";
+        let out = drawn(&format!(
+            "sequenceDiagram\n  participant A\n  participant B\n  A->>B: {long}\n"
+        ));
+        assert!(out.contains(long), "{out}");
+    }
+
+    #[test]
+    fn a_message_to_itself_turns_back_on_its_own_lifeline() {
+        let out = drawn("sequenceDiagram\n  participant R\n  R->>R: replicate\n");
+        assert!(out.contains("replicate"), "{out}");
+        assert!(out.contains('╮') && out.contains('╯'), "{out}");
+    }
+
+    #[test]
+    fn participants_are_named_by_their_alias_and_in_order() {
+        let out = drawn(
+            "sequenceDiagram\n  participant L as Leader\n  participant F as Follower\n\
+             \n  F->>L: hello\n",
+        );
+        let header = out.lines().nth(1).expect("the name row");
+        let leader = header.find("Leader").expect("Leader");
+        let follower = header.find("Follower").expect("Follower");
+        assert!(leader < follower, "declared order wins: {header:?}");
+    }
+
+    #[test]
     fn what_it_cannot_draw_it_refuses() {
-        // Not a flowchart at all.
-        assert!(render("sequenceDiagram\n  Alice->>Bob: hi\n", 100).is_none());
+        // Neither of the two diagrams this draws.
         assert!(render("pie title Pets\n  \"Dogs\" : 1\n", 100).is_none());
-        // A flowchart with parts this does not lay out. Drawing it
-        // without the subgraph would be a diagram missing something.
-        assert!(render("flowchart TB\n  subgraph one\n  A --> B\n  end\n", 100).is_none());
+        assert!(render(
+            "gantt\n  title A\n  section S\n  Task :a1, 2024-01-01, 30d\n",
+            100
+        )
+        .is_none());
+        assert!(render("erDiagram\n  A ||--o{ B : has\n", 100).is_none());
         assert!(render("flowchart TB\n  A --> B\n  style A fill:#f9f\n", 100).is_none());
+        // Control flow in a sequence diagram is drawn as nested frames;
+        // without them the messages inside would read as though they
+        // always happen, which is a different diagram.
+        assert!(render(
+            "sequenceDiagram\n  loop every minute\n  A->>B: hi\n  end\n",
+            100
+        )
+        .is_none());
         // And a chart too wide for the column it has.
         assert!(render("flowchart LR\n  A[aaaaaaaaaaaa] --> B[bbbbbbbbbbbb]\n", 20).is_none());
     }

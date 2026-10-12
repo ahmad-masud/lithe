@@ -1768,15 +1768,15 @@ mod tests {
 
     #[test]
     fn a_mermaid_fence_it_cannot_draw_stays_a_code_block() {
-        let src = "```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n";
+        let src = "```mermaid\npie title Pets\n  \"Dogs\" : 1\n```\n";
         let out = render(src, 60);
         assert!(
             out.iter().all(|l| l.block != Block::Diagram),
-            "a sequence diagram is not a flowchart"
+            "a pie chart is neither diagram this draws"
         );
         let text: String = out.iter().map(text_of).collect::<Vec<_>>().join("\n");
         assert!(
-            text.contains("sequenceDiagram"),
+            text.contains("pie title"),
             "the source says what was meant: {text}"
         );
     }
