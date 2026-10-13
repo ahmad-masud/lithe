@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use crate::keys;
 use crate::settings::PreviewKind;
 
 /// What a menu entry does when chosen.
@@ -85,6 +86,43 @@ impl Where {
             Where::Declaration => "no declaration found",
             Where::TypeDefinition => "no type definition found",
             Where::Implementation => "no implementation found",
+        }
+    }
+}
+
+/// Which of the four "go to" questions are worth offering.
+///
+/// A running server says which requests it answers, and this one is
+/// commonly missing: in Go and Rust a thing is declared where it is
+/// defined, so neither `gopls` nor `rust-analyzer` implements
+/// `textDocument/declaration` at all. Asking returns nothing, which reads
+/// as "there is no declaration" rather than as "this server does not do
+/// that" — so the entry is not offered, which is the rule the rest of
+/// this menu is built on.
+#[derive(Clone, Copy, Debug)]
+pub struct GoesTo {
+    pub definition: bool,
+    pub declaration: bool,
+    pub type_definition: bool,
+    pub implementation: bool,
+}
+
+impl GoesTo {
+    /// All four — what to offer before a server has said otherwise,
+    /// since asking is also what starts one.
+    pub const ALL: Self = Self {
+        definition: true,
+        declaration: true,
+        type_definition: true,
+        implementation: true,
+    };
+
+    pub fn has(self, which: Where) -> bool {
+        match which {
+            Where::Definition => self.definition,
+            Where::Declaration => self.declaration,
+            Where::TypeDefinition => self.type_definition,
+            Where::Implementation => self.implementation,
         }
     }
 }
@@ -170,7 +208,7 @@ impl ContextMenu {
         if target.is_some() {
             entries.extend([
                 Entry::separator(),
-                Entry::item("Reveal in Finder", "", Action::RevealInFinder),
+                Entry::item(keys::REVEAL, "", Action::RevealInFinder),
                 Entry::item("Open in Default App", "", Action::OpenInDefaultApp),
                 Entry::item("Open in Terminal", "", Action::OpenInTerminal),
                 Entry::separator(),
@@ -186,7 +224,7 @@ impl ContextMenu {
             if !is_dir && previewable {
                 entries.insert(
                     3,
-                    Entry::item("Open Preview", "cmd shift V", Action::TogglePreview),
+                    Entry::item("Open Preview", key!(" shift V"), Action::TogglePreview),
                 );
             }
         }
@@ -233,32 +271,29 @@ impl ContextMenu {
         // None when this file has no preview; otherwise whether it is
         // showing, so the entry can say which way it goes.
         preview: Option<bool>,
+        goes_to: GoesTo,
     ) -> Self {
-        let mut entries = vec![
-            Entry::item(
-                "Go to Definition",
-                "cmd click",
-                Action::GoTo(Where::Definition),
-            ),
-            Entry::item("Go to Declaration", "", Action::GoTo(Where::Declaration)),
-            Entry::item(
-                "Go to Type Definition",
-                "",
-                Action::GoTo(Where::TypeDefinition),
-            ),
-            Entry::item(
-                "Go to Implementation",
-                "",
-                Action::GoTo(Where::Implementation),
-            ),
-            Entry::separator(),
+        let mut entries: Vec<Entry> = [
+            (Where::Definition, "Go to Definition", key!(" click")),
+            (Where::Declaration, "Go to Declaration", ""),
+            (Where::TypeDefinition, "Go to Type Definition", ""),
+            (Where::Implementation, "Go to Implementation", ""),
+        ]
+        .into_iter()
+        .filter(|(which, _, _)| goes_to.has(*which))
+        .map(|(which, label, hint)| Entry::item(label, hint, Action::GoTo(which)))
+        .collect();
+        if !entries.is_empty() {
+            entries.push(Entry::separator());
+        }
+        entries.extend([
             Entry::item("Find All References", "", Action::FindReferences),
             Entry::item("Show Incoming Calls", "", Action::Calls { incoming: true }),
             Entry::item("Show Outgoing Calls", "", Action::Calls { incoming: false }),
             Entry::separator(),
             Entry::item("Rename Symbol", "", Action::RenameSymbol),
             Entry::item("Format Buffer", "", Action::FormatBuffer),
-        ];
+        ]);
         if has_selection {
             entries.push(Entry::item(
                 "Format Selections",
@@ -270,19 +305,19 @@ impl ContextMenu {
         entries.push(Entry::separator());
 
         if has_selection {
-            entries.push(Entry::item("Cut", "cmd X", Action::Cut));
-            entries.push(Entry::item("Copy", "cmd C", Action::Copy));
+            entries.push(Entry::item("Cut", key!(" X"), Action::Cut));
+            entries.push(Entry::item("Copy", key!(" C"), Action::Copy));
             // Copies the selection with its common indentation removed,
             // which is what you want when lifting a block out of a
             // nested function and into a message.
             entries.push(Entry::item("Copy and Trim", "", Action::CopyAndTrim));
         }
-        entries.push(Entry::item("Paste", "cmd V", Action::Paste));
+        entries.push(Entry::item("Paste", key!(" V"), Action::Paste));
 
         if in_repo {
             entries.extend([
                 Entry::separator(),
-                Entry::item("Toggle Line Blame", "cmd shift B", Action::BlameLine),
+                Entry::item("Toggle Line Blame", key!(" shift B"), Action::BlameLine),
                 Entry::item("View File History", "", Action::FileHistory),
                 Entry::item("Copy Permalink to Line", "", Action::CopyPermalink),
             ]);
@@ -296,12 +331,12 @@ impl ContextMenu {
                     } else {
                         "Open Preview"
                     },
-                    "cmd shift V",
+                    key!(" shift V"),
                     Action::TogglePreview,
                 ));
             }
             entries.extend([
-                Entry::item("Reveal in Finder", "", Action::RevealInFinder),
+                Entry::item(keys::REVEAL, "", Action::RevealInFinder),
                 Entry::item("Open in Terminal", "", Action::OpenInTerminal),
             ]);
         }
@@ -395,10 +430,51 @@ mod tests {
         assert!(has(&file));
     }
 
+    /// What a server does not do is not offered. Neither `gopls` nor
+    /// `rust-analyzer` answers `textDocument/declaration`, and an entry
+    /// that can only ever report "no declaration found" is worse than no
+    /// entry at all.
+    #[test]
+    fn a_question_the_server_does_not_answer_is_not_offered() {
+        let only_definitions = GoesTo {
+            definition: true,
+            declaration: false,
+            type_definition: false,
+            implementation: true,
+        };
+        let menu = ContextMenu::for_editor((0.0, 0.0), None, false, false, None, only_definitions);
+        let labels: Vec<&str> = menu.entries.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"Go to Definition"), "{labels:?}");
+        assert!(labels.contains(&"Go to Implementation"), "{labels:?}");
+        assert!(!labels.contains(&"Go to Declaration"), "{labels:?}");
+        assert!(!labels.contains(&"Go to Type Definition"), "{labels:?}");
+        // The rest of the menu is still there, and still starts on
+        // something choosable.
+        assert!(labels.contains(&"Find All References"), "{labels:?}");
+        assert!(!menu.entries[menu.selected].is_separator());
+    }
+
+    /// And with none of them, the menu does not open on a separator.
+    #[test]
+    fn a_server_that_goes_nowhere_leaves_the_rest_of_the_menu_intact() {
+        let none = GoesTo {
+            definition: false,
+            declaration: false,
+            type_definition: false,
+            implementation: false,
+        };
+        let menu = ContextMenu::for_editor((0.0, 0.0), None, false, false, None, none);
+        assert!(!menu.entries[menu.selected].is_separator());
+        assert_eq!(
+            menu.entries.first().map(|e| e.label.as_str()),
+            Some("Find All References")
+        );
+    }
+
     #[test]
     fn cut_and_copy_appear_only_with_a_selection() {
-        let without = ContextMenu::for_editor((0.0, 0.0), None, false, false, None);
-        let with = ContextMenu::for_editor((0.0, 0.0), None, true, false, None);
+        let without = ContextMenu::for_editor((0.0, 0.0), None, false, false, None, GoesTo::ALL);
+        let with = ContextMenu::for_editor((0.0, 0.0), None, true, false, None, GoesTo::ALL);
         let has = |m: &ContextMenu, a: Action| m.entries.iter().any(|e| e.action == Some(a));
         assert!(!has(&without, Action::Cut));
         assert!(has(&with, Action::Cut));
@@ -407,8 +483,8 @@ mod tests {
 
     #[test]
     fn git_entries_appear_only_inside_a_repository() {
-        let outside = ContextMenu::for_editor((0.0, 0.0), None, false, false, None);
-        let inside = ContextMenu::for_editor((0.0, 0.0), None, false, true, None);
+        let outside = ContextMenu::for_editor((0.0, 0.0), None, false, false, None, GoesTo::ALL);
+        let inside = ContextMenu::for_editor((0.0, 0.0), None, false, true, None, GoesTo::ALL);
         let has = |m: &ContextMenu, a: Action| m.entries.iter().any(|e| e.action == Some(a));
         assert!(!has(&outside, Action::BlameLine));
         assert!(has(&inside, Action::BlameLine));
@@ -416,14 +492,14 @@ mod tests {
 
     #[test]
     fn the_highlight_starts_on_something_choosable() {
-        let menu = ContextMenu::for_editor((0.0, 0.0), None, false, false, None);
+        let menu = ContextMenu::for_editor((0.0, 0.0), None, false, false, None, GoesTo::ALL);
         assert!(!menu.entries[menu.selected].is_separator());
         assert!(menu.chosen().is_some());
     }
 
     #[test]
     fn moving_the_highlight_steps_over_separators_and_wraps() {
-        let mut menu = ContextMenu::for_editor((0.0, 0.0), None, true, true, None);
+        let mut menu = ContextMenu::for_editor((0.0, 0.0), None, true, true, None, GoesTo::ALL);
         for _ in 0..menu.entries.len() * 2 {
             menu.move_selection(1);
             assert!(
@@ -447,6 +523,7 @@ mod tests {
             true,
             true,
             Some(false),
+            GoesTo::ALL,
         );
         let labels: Vec<&str> = menu.entries.iter().map(|e| e.label.as_str()).collect();
         for wanted in [
@@ -465,7 +542,7 @@ mod tests {
             "Copy",
             "Copy and Trim",
             "Paste",
-            "Reveal in Finder",
+            keys::REVEAL,
             "Open Preview",
             "Open in Terminal",
             "Copy Permalink to Line",
@@ -494,7 +571,7 @@ mod tests {
         for wanted in [
             "New File",
             "New Folder",
-            "Reveal in Finder",
+            keys::REVEAL,
             "Open in Default App",
             "Open in Terminal",
             "Cut",

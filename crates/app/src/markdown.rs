@@ -1,15 +1,16 @@
-//! A small Markdown renderer for the preview pane.
+//! The Markdown preview: a document, laid out on the editor's grid.
 //!
-//! Deliberately not a conforming CommonMark implementation: it handles the
-//! constructs people actually put in a README and leaves the rest as plain
-//! text. A half-correct parser that silently mangles input would be worse
-//! than one with an honest boundary.
+//! Parsing is pulldown-cmark's, because CommonMark is a standard with a
+//! long tail — reference links defined after their use, lazy
+//! continuation, what counts as emphasis inside a word — and none of that
+//! tail is this editor's product. What is ours is everything after the
+//! events: which runs are bold, how a table fits in a column of
+//! characters, where a heading earns a second row.
 //!
 //! Output is a flat list of laid-out lines, so the preview scrolls and
 //! draws much as the editor does — a line is one scroll step, and a
 //! heading is a line that happens to be two grid rows tall.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,10 +38,90 @@ pub enum Style {
     Divider,
 }
 
+impl Style {
+    /// Which face this run is set in.
+    ///
+    /// Prose for anything that is read as language, the grid's own face
+    /// for anything whose meaning is in its alignment: code, a table's
+    /// frame, a drawn diagram. The one decision that makes the preview a
+    /// document rather than a terminal, and the reason emphasis can be
+    /// slanted rather than merely coloured.
+    pub fn family(self) -> lithe_gpu::Family {
+        match self {
+            // A bullet, a checkbox and a table's rule are furniture
+            // rather than language: they line up with each other, and
+            // with the indents measured in cells around them.
+            Self::Code | Self::Syntax(_) | Self::Divider | Self::Bullet => lithe_gpu::Family::Mono,
+            _ => lithe_gpu::Family::Prose,
+        }
+    }
+
+    /// The glyph size a run is drawn at, given the line's scale.
+    pub fn size(scale: Scale) -> lithe_gpu::Size {
+        match scale {
+            Scale::Body => lithe_gpu::Size::Body,
+            Scale::Large => lithe_gpu::Size::Large,
+            Scale::Huge => lithe_gpu::Size::Huge,
+        }
+    }
+
+    pub fn face(self) -> lithe_gpu::Face {
+        match self {
+            Self::Bold | Self::Heading(_) => lithe_gpu::Face::Bold,
+            Self::Emphasis => lithe_gpu::Face::Italic,
+            Self::BoldEmphasis => lithe_gpu::Face::BoldItalic,
+            _ => lithe_gpu::Face::Regular,
+        }
+    }
+}
+
+/// How wide a run of text is, in body cells.
+///
+/// The layout is in cells because the editor is, but prose is
+/// proportional — `iii` is not `MMM` — so it asks rather than counts, and
+/// what answers is backed by the same glyph advances the renderer draws
+/// with. Without that agreement a line wraps in one place and is drawn in
+/// another.
+pub trait Measure {
+    /// `scale` is the line's, because a heading is drawn larger than the
+    /// run inside it says on its own.
+    fn width(&mut self, text: &str, style: Style, scale: Scale) -> f32;
+}
+
+/// A measure for a grid: one cell per character, whatever the style.
+///
+/// What a document is laid out in before there is a window to draw it in,
+/// and what the tests below use, so they can go on counting columns.
+pub struct Cells;
+
+impl Measure for Cells {
+    fn width(&mut self, text: &str, _style: Style, scale: Scale) -> f32 {
+        text.chars().count() as f32 * scale.width()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Span {
     pub text: String,
     pub style: Style,
+    /// Where this run goes when it is clicked, for the runs that go
+    /// anywhere: a link's text, a bare url, an image's name.
+    ///
+    /// Per run rather than per line, because a paragraph holds several
+    /// and a wrap puts them on different lines; an `Arc` because that
+    /// wrap copies the target onto every run it splits the phrase into.
+    pub href: Option<Arc<str>>,
+}
+
+impl Span {
+    /// A run that goes nowhere, which is most of them.
+    pub fn plain(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            href: None,
+        }
+    }
 }
 
 /// Decoration drawn behind or beside a line, which spans cannot express.
@@ -58,6 +139,8 @@ pub enum Block {
     HeadingRule,
     /// A table's header: tinted, inside the table's own border.
     TableHead,
+    /// The rest of a table — its body rows and its frame.
+    Table,
     /// A row of a rendered Mermaid diagram. Tinted like code, because it
     /// came from a fence and is copied back out as its source.
     Diagram,
@@ -92,7 +175,7 @@ impl Scale {
     /// face measures at that size, which only the renderer knows. These
     /// have to agree with `lithe_gpu::Size`, and being a shade generous
     /// costs an early wrap rather than a heading running off the column.
-    fn width(self) -> f32 {
+    pub fn width(self) -> f32 {
         match self {
             Self::Body => 1.0,
             Self::Large => 1.45,
@@ -132,6 +215,18 @@ impl Line {
     /// Grid rows this line occupies.
     pub fn rows(&self) -> usize {
         self.scale.rows()
+    }
+
+    /// Whether this line is set on the grid rather than as prose.
+    ///
+    /// Code, a drawn diagram and a table all mean what they mean because
+    /// of where their characters sit; set proportionally, a box-drawing
+    /// frame comes apart and a column of numbers stops being one.
+    pub fn is_grid(&self) -> bool {
+        matches!(
+            self.block,
+            Block::Code | Block::Diagram | Block::Table | Block::TableHead
+        )
     }
 }
 
@@ -207,10 +302,7 @@ fn runs(text: &str, start: usize, kind_at: &[Option<lithe_syntax::Kind>]) -> Vec
         let style = kind.map_or(Style::Code, Style::Syntax);
         match out.last_mut() {
             Some(last) if last.style == style => last.text.push(ch),
-            _ => out.push(Span {
-                text: ch.to_string(),
-                style,
-            }),
+            _ => out.push(Span::plain(ch.to_string(), style)),
         }
     }
     out
@@ -298,10 +390,11 @@ fn bullet(depth: usize) -> char {
 /// unequal height around it; naming it keeps the one-line-per-row model
 /// and still tells you what is there, which for the badges at the top of
 /// a README is all there was to say.
-fn picture(alt: &str) -> Span {
+fn picture(alt: &str, href: Option<Arc<str>>) -> Span {
     Span {
         text: format!("▣ {alt}"),
         style: Style::Link,
+        href,
     }
 }
 
@@ -315,11 +408,11 @@ pub enum Align {
 }
 
 impl Align {
-    /// Reads one cell of a `|:---|:--:|---:|` delimiter row.
-    fn of(cell: &str) -> Self {
-        match (cell.starts_with(':'), cell.ends_with(':')) {
-            (true, true) => Self::Centre,
-            (false, true) => Self::Right,
+    /// What the parser read out of the `|:---|:--:|---:|` row.
+    fn of(alignment: &pulldown_cmark::Alignment) -> Self {
+        match alignment {
+            pulldown_cmark::Alignment::Center => Self::Centre,
+            pulldown_cmark::Alignment::Right => Self::Right,
             _ => Self::Left,
         }
     }
@@ -430,12 +523,9 @@ impl Table {
             }
             text.push(right);
             Line {
-                spans: vec![Span {
-                    text,
-                    style: Style::Divider,
-                }],
+                spans: vec![Span::plain(text, Style::Divider)],
                 indent,
-                block: Block::Plain,
+                block: Block::Table,
                 scale: Scale::Body,
                 code: None,
             }
@@ -451,22 +541,15 @@ impl Table {
         while let Some((row, heading)) = rows.next() {
             let mut spans: Vec<Span> = Vec::new();
             for (i, width) in widths.iter().enumerate() {
-                spans.push(Span {
-                    text: if i == 0 {
-                        "│ ".into()
-                    } else {
-                        " │ ".into()
-                    },
-                    style: Style::Divider,
-                });
+                spans.push(Span::plain(
+                    if i == 0 { "│ " } else { " │ " },
+                    Style::Divider,
+                ));
                 let cell = row.get(i).cloned().unwrap_or_default();
                 let used = width_of(&cell).min(*width);
                 let (before, after) = aligns[i].pad(used, *width);
                 if before > 0 {
-                    spans.push(Span {
-                        text: " ".repeat(before),
-                        style: Style::Body,
-                    });
+                    spans.push(Span::plain(" ".repeat(before), Style::Body));
                 }
                 for mut span in clip(cell, *width) {
                     if heading && span.style == Style::Body {
@@ -475,23 +558,17 @@ impl Table {
                     spans.push(span);
                 }
                 if after > 0 {
-                    spans.push(Span {
-                        text: " ".repeat(after),
-                        style: Style::Body,
-                    });
+                    spans.push(Span::plain(" ".repeat(after), Style::Body));
                 }
             }
-            spans.push(Span {
-                text: " │".into(),
-                style: Style::Divider,
-            });
+            spans.push(Span::plain(" │", Style::Divider));
             out.push(Line {
                 spans,
                 indent,
                 block: if heading {
                     Block::TableHead
                 } else {
-                    Block::Plain
+                    Block::Table
                 },
                 scale: Scale::Body,
                 code: None,
@@ -533,310 +610,671 @@ fn clip(spans: Vec<Span>, width: usize) -> Vec<Span> {
         out.push(Span { text, ..span });
         break;
     }
-    out.push(Span {
-        text: "…".into(),
-        style: Style::Body,
-    });
+    out.push(Span::plain("…", Style::Body));
     out
 }
 
-/// A row of a pipe table, split on unescaped `|`.
-fn table_cells(line: &str) -> Vec<String> {
-    let trimmed = line.trim();
-    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
-    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
-
-    let mut cells = vec![String::new()];
-    let mut escaped = false;
-    for ch in trimmed.chars() {
-        match ch {
-            '\\' if !escaped => escaped = true,
-            '|' if !escaped => cells.push(String::new()),
-            _ => {
-                if escaped && ch != '|' {
-                    if let Some(last) = cells.last_mut() {
-                        last.push('\\');
-                    }
-                }
-                escaped = false;
-                if let Some(last) = cells.last_mut() {
-                    last.push(ch);
-                }
-            }
-        }
-    }
-    cells.into_iter().map(|c| c.trim().to_string()).collect()
+/// Renders Markdown as a page `columns` cells wide, measuring runs with
+/// the face they will be drawn in.
+///
+/// The parsing is pulldown-cmark's: CommonMark, plus the tables, task
+/// lists, strikethrough, footnotes and front matter a README actually
+/// contains. The layout is ours — events become styled runs, runs become
+/// the lines below — and that is the half that decides what a document
+/// looks like on a character grid.
+///
+/// `columns` is the pane, not the column: the margins and the measure
+/// come out of it here, so that whatever draws the result can work them
+/// out again and arrive at the same numbers.
+pub fn render_with(source: &str, columns: usize, measure: &mut dyn Measure) -> Vec<Line> {
+    let room = columns.max(20);
+    let column = column(room, measure);
+    Preview::new(column, figures(room), measure).lines(source)
 }
 
-/// Whether `line` is a table's `|---|:--:|` delimiter row.
-fn is_table_rule(line: &str) -> bool {
-    let trimmed = line.trim();
-    if !trimmed.contains('-') || !trimmed.contains('|') {
-        return false;
-    }
-    table_cells(trimmed).iter().all(|cell| {
-        !cell.is_empty()
-            && cell.starts_with([':', '-'])
-            && cell.ends_with([':', '-'])
-            && cell.chars().all(|c| c == '-' || c == ':')
-    })
-}
-
-/// Renders Markdown into lines wrapped to `columns`.
+/// As [`render_with`], on the grid, where a character is one cell.
+#[cfg(test)]
 pub fn render(source: &str, columns: usize) -> Vec<Line> {
-    let columns = columns.max(20);
-    let mut out = Vec::new();
-    let lines: Vec<&str> = source.lines().collect();
+    render_with(source, columns, &mut Cells)
+}
 
-    // Front matter is metadata for whatever publishes the file, not part
-    // of the document, so it is hidden the way a renderer hides it rather
-    // than shown as a rule and a list of keys.
-    let mut i = if lines.first().is_some_and(|l| l.trim_end() == "---") {
-        lines
+/// Renders Markdown wrapped to exactly `columns`, with no page around it.
+///
+/// What a tooltip wants. A popup is a box of that many cells and draws
+/// its own padding, so the margins a document keeps would be a second set
+/// of them, and the text inside would stop short of its own frame.
+pub fn render_boxed(source: &str, columns: usize) -> Vec<Line> {
+    let columns = columns.max(20) as f32;
+    Preview::new(columns, columns, &mut Cells).lines(source)
+}
+
+/// How wide the document's column is, in cells, given the pane it sits in.
+///
+/// The pane, less a margin on each side, and only then capped: a margin
+/// is what makes a page, and a cap is what keeps a line readable. The
+/// margin is a share of the pane rather than a fixed inset, so a preview
+/// beside the code it documents does not spend a tenth of itself on air
+/// at one size and half of itself at another.
+///
+/// The cap is measured in alphabets, which is how type is measured: the
+/// lowercase a–z of a face set solid is about thirteen ems, and four of
+/// them is a hundred-odd characters. Wider than a book's measure, because
+/// a window is read at arm's length rather than held — and lifted again
+/// on a pane too wide for it, because a column of that measure centred in
+/// a maximised window spends more of the window on air than on the
+/// document, which is the complaint this answers.
+///
+/// Everything in the document shares it. Code set wider than the prose
+/// beside it reads as a different page.
+pub fn column(columns: usize, measure: &mut dyn Measure) -> f32 {
+    const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
+    const ALPHABETS: f32 = 4.3;
+    /// How much of a wide pane the document may use, once a measure of
+    /// its own is no longer what is holding it back.
+    const SHARE: f32 = 0.72;
+    let room = columns as f32;
+    let measured = measure.width(ALPHABET, Style::Body, Scale::Body) * ALPHABETS;
+    let widest = measured.max(room * SHARE);
+    let margin = margin(columns);
+    // Never so narrow that a table has nowhere to go, even when that
+    // costs the margin.
+    (room - 2.0 * margin).min(widest).max(room.min(24.0))
+}
+
+/// The margin each side of the document, in cells.
+///
+/// A share of the pane, so the page looks like a page at any width, and
+/// bounded, so a wide window is not mostly margin. Taken out by
+/// [`column`] and used again when the preview is drawn, because a figure
+/// wider than the column still starts at the margin.
+pub fn margin(columns: usize) -> f32 {
+    (columns as f32 / 12.0).clamp(2.0, 10.0)
+}
+
+/// How wide a figure may be, in cells: the page inside its margins.
+///
+/// Wider than [`column`], which is capped at what prose reads well at. A
+/// drawn diagram is not read line by line, and one refused for want of
+/// room is shown as its own source instead, which is the worse outcome.
+pub fn figures(columns: usize) -> f32 {
+    (columns as f32 - 2.0 * margin(columns)).max(8.0)
+}
+
+/// The row a `#fragment` link lands on: the heading with that anchor.
+///
+/// Matched on the slug rather than on the text, because the slug is what
+/// the link carries and what every other renderer of the same file
+/// agrees on.
+pub fn anchor(lines: &[Line], fragment: &str) -> Option<usize> {
+    let want = slug(fragment);
+    if want.is_empty() {
+        return None;
+    }
+    let heading = |line: &Line| {
+        line.spans
             .iter()
-            .skip(1)
-            .position(|l| matches!(l.trim_end(), "---" | "..."))
-            .map(|at| at + 2)
-            .unwrap_or(0)
-    } else {
-        0
+            .any(|s| matches!(s.style, Style::Heading(_)))
     };
+    let mut at = 0;
+    while at < lines.len() {
+        if !heading(&lines[at]) {
+            at += 1;
+            continue;
+        }
+        // A long heading wrapped onto a second line is still one
+        // heading, and its anchor is made out of the whole of it.
+        let end = (at..lines.len())
+            .take_while(|i| heading(&lines[*i]))
+            .last()
+            .unwrap_or(at)
+            + 1;
+        let text: String = lines[at..end]
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        if slug(&text) == want {
+            return Some(at);
+        }
+        at = end;
+    }
+    None
+}
 
-    let refs = reference_labels(&lines);
-    // Paragraph being accumulated, and the indent it belongs at — a
-    // continuation line inside a list item keeps the item's indent.
-    let mut paragraph: Vec<Span> = Vec::new();
-    let mut paragraph_indent = 0usize;
-    let mut list_pad: Option<usize> = None;
+/// A heading's anchor, as every Markdown renderer makes one: lowercase,
+/// spaces hyphenated, and everything that is not a letter, a digit, a
+/// hyphen or an underscore dropped.
+fn slug(text: &str) -> String {
+    text.trim()
+        .to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            '-' | '_' => Some(c),
+            c if c.is_alphanumeric() => Some(c),
+            _ => None,
+        })
+        .collect()
+}
 
-    while i < lines.len() {
-        let raw = lines[i];
-        i += 1;
-        // Two trailing spaces or a trailing backslash is a hard break, so
-        // whether the line had them is read before anything trims.
-        let hard_break = raw.ends_with("  ") || raw.ends_with('\\');
-        let trimmed = raw.trim_end();
-        let bare = trimmed.trim();
+/// What the event stream is being turned into, while it is being turned.
+///
+/// A pull parser hands over a document as a flat sequence of starts and
+/// ends, so everything that is "where am I" lives here: which inline
+/// styles are open, how deep the lists are, whether a table or a fence is
+/// being collected.
+struct Preview<'a> {
+    columns: usize,
+    /// How wide a figure may be, in cells. Wider than the column: prose
+    /// is capped at what it reads well at, a diagram only by the page.
+    room: usize,
+    /// Where prose wraps, which is narrower than the column.
+    prose: f32,
+    measure: &'a mut dyn Measure,
+    out: Vec<Line>,
+    /// The inline runs of the block being read.
+    spans: Vec<Span>,
+    /// Inline styles, innermost last, folded together by [`merge`].
+    styles: Vec<Style>,
+    /// Open lists, innermost last. `Some(n)` numbers the next item.
+    lists: Vec<Option<u64>>,
+    /// How many block quotes deep, for the bar and the indent.
+    quote: usize,
+    /// Set while a footnote's definition is being read.
+    footnote: bool,
+    /// Set while an image's alt text is being collected: an image is
+    /// named rather than drawn, and the name is all of it we keep.
+    alt: Option<String>,
+    /// Open link targets, innermost last: a link, an `<a href>`, or the
+    /// image being read. Empty for the text that is only text.
+    hrefs: Vec<Arc<str>>,
+    /// A code block's language, and the text inside it.
+    code: Option<(String, String)>,
+    table: Option<Table>,
+    /// Set while front matter is being skipped.
+    metadata: bool,
+}
 
-        // Fenced code wins over everything: inside a fence, nothing is
-        // markup.
-        if let Some(fence) = fence_open(bare) {
-            flush(&mut paragraph, paragraph_indent, columns, &mut out);
-            let mut code: Vec<&str> = Vec::new();
-            while i < lines.len() {
-                let line = lines[i];
-                i += 1;
-                if fence_closes(line.trim(), fence.0) {
-                    break;
+impl<'a> Preview<'a> {
+    /// `column` is where prose wraps and `room` is how wide a figure may
+    /// be; a tooltip passes the same number for both.
+    fn new(column: f32, room: f32, measure: &'a mut dyn Measure) -> Self {
+        Self {
+            columns: column as usize,
+            room: room as usize,
+            prose: column,
+            measure,
+            out: Vec::new(),
+            spans: Vec::new(),
+            styles: Vec::new(),
+            lists: Vec::new(),
+            quote: 0,
+            footnote: false,
+            alt: None,
+            hrefs: Vec::new(),
+            code: None,
+            table: None,
+            metadata: false,
+        }
+    }
+
+    fn lines(mut self, source: &str) -> Vec<Line> {
+        use pulldown_cmark::{Event, Options, Parser};
+
+        // Only what the layout below can draw. Anything else — maths,
+        // definition lists, wikilinks — would arrive as events nothing
+        // here knows how to put on the grid, which is worse than leaving
+        // it as the text it was written as.
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_TABLES);
+        options.insert(Options::ENABLE_STRIKETHROUGH);
+        options.insert(Options::ENABLE_TASKLISTS);
+        options.insert(Options::ENABLE_FOOTNOTES);
+        options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+        options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
+
+        for event in Parser::new_ext(source, options) {
+            match event {
+                Event::Start(tag) => self.open(tag),
+                Event::End(tag) => self.close(tag),
+                Event::Text(text) => self.content(&text),
+                Event::Code(text) => {
+                    let style = merge(self.style(), Style::Code);
+                    self.push(&text, style);
                 }
-                code.push(line);
-            }
-            // The source as written, which is what a copy hands back and
-            // what a diagram is drawn from.
-            let source: Arc<str> = Arc::from(code.join("\n"));
-            out.extend(match diagram(&fence.1, &source, columns) {
-                Some(drawn) => drawn,
-                None => code_block(fence.1, &code, columns),
-            });
-            for line in out.iter_mut().rev() {
-                if !matches!(line.block, Block::Code | Block::Diagram) {
-                    break;
+                // Raw HTML inside a paragraph is part of it.
+                Event::InlineHtml(raw) => self.html(&raw),
+                // A block of it is a block: `<summary>x</summary>` and
+                // the paragraph under it are two things, and run
+                // together they read as one word.
+                Event::Html(raw) => {
+                    self.flush(Scale::Body);
+                    self.html(&raw);
+                    self.flush(Scale::Body);
                 }
-                line.code = Some(source.clone());
-            }
-            list_pad = None;
-            continue;
-        }
-
-        // A table is recognised by its delimiter row, which is the only
-        // thing that tells a row of pipes from a sentence with pipes in it.
-        if bare.contains('|') && lines.get(i).is_some_and(|next| is_table_rule(next)) {
-            flush(&mut paragraph, paragraph_indent, columns, &mut out);
-            let mut table = Table {
-                // The delimiter row is where the alignment is written.
-                aligns: lines
-                    .get(i)
-                    .map(|rule| table_cells(rule).iter().map(|c| Align::of(c)).collect())
-                    .unwrap_or_default(),
-                ..Table::default()
-            };
-            table.row();
-            table.heading_row();
-            for cell in table_cells(bare) {
-                table.cell(inline(&cell, &refs));
-            }
-            i += 1; // the delimiter row
-            while let Some(next) = lines.get(i) {
-                if !next.contains('|') || next.trim().is_empty() {
-                    break;
+                // A line break in the source is a word break here: the
+                // column is ours to wrap to, not the author's.
+                Event::SoftBreak => self.push(" ", Style::Body),
+                // A hard break ends the line without ending the block.
+                Event::HardBreak => self.flush(Scale::Body),
+                Event::Rule => {
+                    self.blank();
+                    self.out.push(Line::default().decorated(Block::Rule));
+                    self.blank();
                 }
-                i += 1;
-                table.row();
-                for cell in table_cells(next) {
-                    table.cell(inline(&cell, &refs));
+                Event::TaskListMarker(done) => {
+                    let glyph = if done { '☑' } else { '☐' };
+                    self.push(&format!("{glyph} "), Style::Bullet);
+                }
+                // Both ends of a footnote: the mark in the text, and the
+                // marker on its definition below.
+                Event::FootnoteReference(label) => {
+                    self.push(&format!("[{label}]"), Style::Link);
+                }
+                Event::InlineMath(text) | Event::DisplayMath(text) => {
+                    let style = merge(self.style(), Style::Code);
+                    self.push(&text, style);
                 }
             }
-            out.extend(table.lay_out(columns, 0));
-            out.push(Line::default());
-            list_pad = None;
-            continue;
+        }
+        self.flush(Scale::Body);
+        while self.out.last().is_some_and(Line::is_blank) {
+            self.out.pop();
+        }
+        self.out
+    }
+
+    fn open(&mut self, tag: pulldown_cmark::Tag<'_>) {
+        use pulldown_cmark::{CodeBlockKind, Tag};
+
+        // A block opening inside a list item ends that item's own text:
+        // the nested list in `- one` / `  - two` starts before the outer
+        // item does, and without this the two run together on one line.
+        // Not a paragraph, though — in a loose list that *is* the item's
+        // text, and the marker in front of it is waiting for it.
+        if matches!(
+            tag,
+            Tag::List(_)
+                | Tag::BlockQuote(_)
+                | Tag::CodeBlock(_)
+                | Tag::Table(_)
+                | Tag::FootnoteDefinition(_)
+        ) {
+            self.flush(Scale::Body);
         }
 
-        if bare.is_empty() {
-            flush(&mut paragraph, paragraph_indent, columns, &mut out);
-            list_pad = None;
-            // Never two blanks in a row: a heading already leaves one, and
-            // the source usually leaves another.
-            if out.last().is_some_and(|l| !l.is_blank()) {
-                out.push(Line::default());
+        match tag {
+            Tag::Paragraph | Tag::Heading { .. } => {}
+            Tag::BlockQuote(_) => self.quote += 1,
+            Tag::CodeBlock(kind) => {
+                let language = match kind {
+                    // The language is the first word: `rust,no_run` is
+                    // one tag, and the rest is for whoever runs it.
+                    CodeBlockKind::Fenced(info) => info
+                        .split([' ', ',', ';', '{'])
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                self.code = Some((language, String::new()));
             }
-            continue;
+            Tag::List(first) => self.lists.push(first),
+            Tag::Item => {
+                let depth = self.lists.len();
+                let marker = match self.lists.last_mut() {
+                    // An ordered list counts from where it said to.
+                    Some(Some(number)) => {
+                        let marker = format!("{number}. ");
+                        *number += 1;
+                        marker
+                    }
+                    _ => format!("{} ", bullet(depth)),
+                };
+                self.push(&marker, Style::Bullet);
+            }
+            Tag::FootnoteDefinition(label) => {
+                self.footnote = true;
+                self.push(&format!("[{label}] "), Style::Bullet);
+            }
+            Tag::Table(aligns) => {
+                self.table = Some(Table {
+                    aligns: aligns.iter().map(Align::of).collect(),
+                    ..Table::default()
+                });
+            }
+            Tag::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.row();
+                    table.heading_row();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.row();
+                }
+            }
+            Tag::TableCell => {}
+            Tag::Emphasis => self.styles.push(Style::Emphasis),
+            Tag::Strong => self.styles.push(Style::Bold),
+            Tag::Strikethrough => self.styles.push(Style::Strike),
+            // The text is what was written; the target is what the run
+            // is for, and rides on the spans so that a click can follow
+            // it.
+            Tag::Link { dest_url, .. } => {
+                self.styles.push(Style::Link);
+                self.hrefs.push(Arc::from(&*dest_url));
+            }
+            Tag::Image { dest_url, .. } => {
+                self.alt = Some(String::new());
+                self.hrefs.push(Arc::from(&*dest_url));
+            }
+            // Front matter is metadata for whatever publishes the file,
+            // not part of the document, so it is hidden the way a
+            // renderer hides it rather than shown as a list of keys.
+            Tag::MetadataBlock(_) => self.metadata = true,
+            _ => {}
         }
+    }
 
-        // A reference definition is machinery, not text.
-        if reference_definition(bare).is_some() {
-            continue;
+    fn close(&mut self, tag: pulldown_cmark::TagEnd) {
+        use pulldown_cmark::TagEnd;
+
+        match tag {
+            TagEnd::Paragraph => {
+                self.flush(Scale::Body);
+                self.blank();
+            }
+            TagEnd::Heading(level) => {
+                let spans = std::mem::take(&mut self.spans);
+                push_heading(&mut self.out, spans, level as u8, self.prose, self.measure);
+                self.blank();
+            }
+            TagEnd::BlockQuote(_) => {
+                self.quote = self.quote.saturating_sub(1);
+                self.blank();
+            }
+            TagEnd::CodeBlock => self.end_code(),
+            TagEnd::List(_) => {
+                self.lists.pop();
+                self.blank();
+            }
+            // A tight list's items hold text rather than paragraphs, so
+            // this is where they are emitted — and without the blank line
+            // between blocks, which is what makes a list a list.
+            TagEnd::Item => self.flush(Scale::Body),
+            TagEnd::FootnoteDefinition => {
+                self.flush(Scale::Body);
+                self.footnote = false;
+                self.blank();
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.out.extend(table.lay_out(self.columns, 0));
+                    self.blank();
+                }
+            }
+            TagEnd::TableCell => {
+                let spans = std::mem::take(&mut self.spans);
+                if let Some(table) = self.table.as_mut() {
+                    table.cell(spans);
+                }
+            }
+            TagEnd::TableHead | TagEnd::TableRow => {}
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                self.styles.pop();
+            }
+            TagEnd::Link => {
+                self.styles.pop();
+                self.hrefs.pop();
+            }
+            TagEnd::Image => {
+                let alt = self.alt.take().unwrap_or_default();
+                let src = self.hrefs.pop();
+                // A badge is an image inside a link, and clicking it
+                // means the link: the picture is what it is wearing.
+                let href = self.href().or(src);
+                self.spans.push(picture(alt.trim(), href));
+            }
+            TagEnd::MetadataBlock(_) => self.metadata = false,
+            _ => {}
         }
+    }
 
-        // Setext heading: the underline belongs to the paragraph above it,
-        // and is checked before the horizontal rule because `---` under a
-        // paragraph is an underline rather than a break. Not over a list
-        // item, though: a rule after a bullet is a rule.
-        if !paragraph.is_empty()
-            && list_pad.is_none()
-            && bare.len() >= 2
-            && (bare.chars().all(|c| c == '=') || bare.chars().all(|c| c == '-'))
-        {
-            let level = if bare.starts_with('=') { 1 } else { 2 };
-            let spans = std::mem::take(&mut paragraph);
-            push_heading(&mut out, spans, level, columns);
-            continue;
+    /// Text, wherever it lands: a fence's contents, an image's name, or a
+    /// run in the paragraph being read.
+    fn content(&mut self, text: &str) {
+        if self.metadata {
+            return;
         }
-
-        // Horizontal rule. Checked before emphasis so `***` is a rule.
-        if bare.len() >= 3
-            && bare
-                .chars()
-                .all(|c| c == '-' || c == '*' || c == '_' || c.is_whitespace())
-            && bare.chars().filter(|c| !c.is_whitespace()).count() >= 3
-        {
-            flush(&mut paragraph, paragraph_indent, columns, &mut out);
-            out.push(Line::default());
-            out.push(Line::default().decorated(Block::Rule));
-            out.push(Line::default());
-            list_pad = None;
-            continue;
+        if let Some((_, code)) = self.code.as_mut() {
+            code.push_str(text);
+            return;
         }
-
-        // ATX heading, with any closing run of hashes dropped.
-        if let Some(rest) = bare.strip_prefix('#') {
-            let extra = rest.chars().take_while(|c| *c == '#').count();
-            let level = (1 + extra).min(6) as u8;
-            let text = rest[extra..].trim_start().trim_end_matches(['#', ' ']);
-            if !rest[extra..].is_empty() || extra > 0 {
-                flush(&mut paragraph, paragraph_indent, columns, &mut out);
-                push_heading(&mut out, inline(text, &refs), level, columns);
-                list_pad = None;
+        if let Some(alt) = self.alt.as_mut() {
+            alt.push_str(text);
+            return;
+        }
+        let style = self.style();
+        // CommonMark leaves a bare URL as text; every renderer links it,
+        // and a README is mostly bare URLs.
+        if style == Style::Link || !text.contains("http") {
+            self.push(text, style);
+            return;
+        }
+        let mut rest = text;
+        while let Some(at) = rest.find("http") {
+            let (before, from) = rest.split_at(at);
+            self.push(before, style);
+            if !(from.starts_with("http://") || from.starts_with("https://")) {
+                let (head, tail) = from.split_at("http".len());
+                self.push(head, style);
+                rest = tail;
                 continue;
             }
+            let end = from
+                .char_indices()
+                .take_while(|(_, c)| !c.is_whitespace() && !matches!(c, '<' | '>' | ')' | '"'))
+                .map(|(at, c)| at + c.len_utf8())
+                .last()
+                .unwrap_or(0);
+            // Trailing punctuation belongs to the sentence, not the link.
+            let url = from[..end].trim_end_matches(['.', ',', ';', ':', '!']);
+            self.push_to(url, merge(style, Style::Link), Some(Arc::from(url)));
+            rest = &from[url.len()..];
         }
+        self.push(rest, style);
+    }
 
-        // Blockquote, however deeply nested.
-        if bare.starts_with('>') {
-            flush(&mut paragraph, paragraph_indent, columns, &mut out);
-            let mut depth = 0;
-            let mut rest = bare;
-            while let Some(after) = rest.strip_prefix('>') {
-                depth += 1;
-                rest = after.trim_start();
+    /// Raw HTML, which Markdown passes through and this reads.
+    ///
+    /// A reader that showed the tags as text would be showing something
+    /// the document never said. Known tags become the style they mean;
+    /// unknown ones stay exactly as written, because `Vec<T>` in prose is
+    /// commoner in a code editor's README than hand-written HTML.
+    fn html(&mut self, raw: &str) {
+        let mut rest = raw;
+        while let Some(at) = rest.find('<') {
+            let (before, from) = rest.split_at(at);
+            self.loose_html_text(before);
+            let Some(close) = from.find('>') else {
+                self.loose_html_text(from);
+                return;
+            };
+            self.tag(&from[..=close]);
+            rest = &from[close + 1..];
+        }
+        self.loose_html_text(rest);
+    }
+
+    /// Text between tags in an HTML block, where the newlines are the
+    /// author's formatting rather than anything to draw.
+    fn loose_html_text(&mut self, text: &str) {
+        if text.contains('\n') {
+            let flattened = text.replace('\n', " ");
+            let trimmed = flattened.trim();
+            if !trimmed.is_empty() {
+                self.content(trimmed);
             }
-            let mut spans = inline(rest, &refs);
+            return;
+        }
+        self.content(text);
+    }
+
+    fn tag(&mut self, raw: &str) {
+        let inner = raw.trim_start_matches('<').trim_end_matches('>');
+        let closing = inner.starts_with('/');
+        let name = inner
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        // An `<img>` written in the middle of a paragraph is still an
+        // image, and the one void tag worth naming.
+        if name == "img" && !closing {
+            let alt = attribute(raw, "alt")
+                .filter(|alt| !alt.trim().is_empty())
+                .or_else(|| attribute(raw, "src"))
+                .unwrap_or_else(|| "image".to_string());
+            // The link it is wrapped in first, as for a badge written in
+            // Markdown; its own source otherwise.
+            let href = self
+                .href()
+                .or_else(|| attribute(raw, "src").map(|src| Arc::from(src.as_str())));
+            self.spans.push(picture(&alt, href));
+            return;
+        }
+        match inline_tag(&name) {
+            Some(Some(style)) if !closing => {
+                // Pushed even when the tag carries no target, so that
+                // the closing tag has its own to take back off.
+                if name == "a" {
+                    let href = attribute(raw, "href").unwrap_or_default();
+                    self.hrefs.push(Arc::from(href.as_str()));
+                }
+                self.styles.push(style);
+            }
+            Some(Some(style)) => {
+                if name == "a" {
+                    self.hrefs.pop();
+                }
+                if let Some(at) = self.styles.iter().rposition(|open| *open == style) {
+                    self.styles.remove(at);
+                }
+            }
+            // Known, but carrying no style of its own.
+            Some(None) => {}
+            None => self.push(raw, self.style()),
+        }
+    }
+
+    /// The style a run takes here: every open one, folded together.
+    fn style(&self) -> Style {
+        self.styles
+            .iter()
+            .fold(Style::Body, |outer, inner| merge(outer, *inner))
+    }
+
+    /// The innermost open link target, if the run being read is inside
+    /// one. An `<a>` without an `href` is not a link, and neither is the
+    /// empty string it pushed to keep the stack balanced.
+    fn href(&self) -> Option<Arc<str>> {
+        self.hrefs
+            .iter()
+            .rev()
+            .find(|href| !href.trim().is_empty())
+            .cloned()
+    }
+
+    fn push(&mut self, text: &str, style: Style) {
+        let href = self.href();
+        self.push_to(text, style, href);
+    }
+
+    /// As [`Self::push`], for a run whose target is not the one the
+    /// document has open: a bare url, which is its own.
+    fn push_to(&mut self, text: &str, style: Style, href: Option<Arc<str>>) {
+        if text.is_empty() {
+            return;
+        }
+        push_run(&mut self.spans, text, style, href);
+    }
+
+    /// Where the block being read starts, in cells.
+    fn indent(&self) -> usize {
+        self.quote * 3 + self.lists.len() * 2 + usize::from(self.footnote) * 2
+    }
+
+    /// Wraps what has been read into lines and puts them out.
+    fn flush(&mut self, scale: Scale) {
+        if self.spans.is_empty() {
+            return;
+        }
+        let mut spans = std::mem::take(&mut self.spans);
+        let quoted = self.quote > 0;
+        if quoted {
             for span in &mut spans {
                 if span.style == Style::Body {
                     span.style = Style::Quote;
                 }
             }
-            out.extend(
-                wrap(spans, depth * 3, columns, Scale::Body)
-                    .into_iter()
-                    .map(|l| l.decorated(Block::Quote)),
-            );
-            list_pad = None;
-            continue;
         }
+        let lines = wrap(spans, self.indent(), self.prose, scale, self.measure);
+        self.out.extend(lines.into_iter().map(|line| {
+            if quoted {
+                line.decorated(Block::Quote)
+            } else {
+                line
+            }
+        }));
+    }
 
-        // List item, bulleted or numbered, at whatever depth its indent
-        // puts it. Two source spaces is one level, which is what every
-        // editor's list continuation produces.
-        let source_indent = raw.len() - raw.trim_start().len();
-        let bullet_text = bare
-            .strip_prefix("- ")
-            .or_else(|| bare.strip_prefix("* "))
-            .or_else(|| bare.strip_prefix("+ "));
-        let numbered = bare
-            .split_once(". ")
-            .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
-
-        if let Some(item) = bullet_text.or(numbered.map(|(_, rest)| rest)) {
-            flush(&mut paragraph, paragraph_indent, columns, &mut out);
-            let depth = source_indent / 2 + 1;
-            let marker = match numbered {
-                Some((n, _)) if bullet_text.is_none() => format!("{n}. "),
-                _ => format!("{} ", bullet(depth)),
-            };
-            let pad = 2 + source_indent;
-            let mut spans = vec![Span {
-                text: marker.clone(),
-                style: Style::Bullet,
-            }];
-            // A task list is a checkbox, not a literal pair of brackets.
-            let item = match task_box(item) {
-                Some((box_glyph, rest)) => {
-                    spans.push(Span {
-                        text: format!("{box_glyph} "),
-                        style: Style::Bullet,
-                    });
-                    rest
-                }
-                None => item,
-            };
-            spans.extend(inline(item, &refs));
-            paragraph = spans;
-            paragraph_indent = pad;
-            list_pad = Some(pad + marker.chars().count());
-            continue;
-        }
-
-        // Otherwise it joins the current paragraph, with a space: a line
-        // break in the source is a word break, and `wrap` no longer
-        // supplies one of its own, since a run boundary inside a word is
-        // the commoner case.
-        if paragraph.is_empty() {
-            paragraph_indent = list_pad.filter(|_| source_indent > 0).unwrap_or(0);
-        } else {
-            paragraph.push(Span {
-                text: " ".into(),
-                style: Style::Body,
-            });
-        }
-        paragraph.extend(inline(bare, &refs));
-
-        // A hard break ends the line without ending the paragraph.
-        if hard_break {
-            flush(&mut paragraph, paragraph_indent, columns, &mut out);
+    /// A blank line between blocks, and never two in a row: a heading
+    /// already leaves one, and the source usually leaves another.
+    fn blank(&mut self) {
+        if self.out.last().is_some_and(|line| !line.is_blank()) {
+            self.out.push(Line::default());
         }
     }
 
-    flush(&mut paragraph, paragraph_indent, columns, &mut out);
-    while out.last().is_some_and(Line::is_blank) {
-        out.pop();
+    /// Emits the fenced or indented block that has just ended.
+    fn end_code(&mut self) {
+        let Some((language, text)) = self.code.take() else {
+            return;
+        };
+        // The source as written, which is what a copy hands back and what
+        // a diagram is drawn from.
+        let source: Arc<str> = Arc::from(text.trim_end_matches('\n'));
+        let at = self.out.len();
+        match diagram(&language, &source, self.room) {
+            Some(drawn) => self.out.extend(drawn),
+            None => {
+                let code: Vec<&str> = source.lines().collect();
+                self.out.extend(code_block(language, &code, self.columns));
+            }
+        }
+        // Carried on every row of the block rather than only its first,
+        // so a click anywhere in it can copy it.
+        for line in &mut self.out[at..] {
+            if matches!(line.block, Block::Code | Block::Diagram) {
+                line.code = Some(Arc::clone(&source));
+            }
+        }
+        self.blank();
     }
-    out
 }
 
 /// Emits a heading, with the air above and the rule below a browser gives
 /// it.
-fn push_heading(out: &mut Vec<Line>, spans: Vec<Span>, level: u8, columns: usize) {
+fn push_heading(
+    out: &mut Vec<Line>,
+    spans: Vec<Span>,
+    level: u8,
+    columns: f32,
+    measure: &mut dyn Measure,
+) {
     if out.last().is_some_and(|l| !l.is_blank()) {
         out.push(Line::default());
     }
@@ -849,58 +1287,48 @@ fn push_heading(out: &mut Vec<Line>, spans: Vec<Span>, level: u8, columns: usize
             span.style = Style::Heading(level);
         }
     }
-    out.extend(wrap(spans, 0, columns, scale));
+    out.extend(wrap(spans, 0, columns, scale, measure));
     // The top two levels get a rule, as they do in a browser.
     if level <= 2 {
         out.push(Line::default().decorated(Block::HeadingRule));
     }
 }
 
-/// A fence's marker character and the language written after it.
-fn fence_open(bare: &str) -> Option<(char, String)> {
-    for marker in ['`', '~'] {
-        let run = bare.chars().take_while(|c| *c == marker).count();
-        if run >= 3 {
-            let info = bare[run..].trim();
-            // The language is the first word; `rust,no_run` is one tag.
-            let language = info
-                .split([' ', ',', ';', '{'])
-                .next()
-                .unwrap_or("")
-                .to_string();
-            return Some((marker, language));
-        }
-    }
-    None
-}
-
-fn fence_closes(bare: &str, marker: char) -> bool {
-    bare.chars().take_while(|c| *c == marker).count() >= 3
-        && bare.chars().all(|c| c == marker || c.is_whitespace())
-}
-
 /// A `mermaid` fence drawn as a diagram, when it is one this can draw.
+///
+/// `room` is the page rather than the prose column: a diagram is a
+/// figure, and one refused for want of a few cells is shown as its own
+/// source, which is worse than a figure wider than the text above it.
 ///
 /// `None` for every other fence, and for a Mermaid diagram the reader
 /// will not lay out — the preview then shows the source, which says
 /// what was meant even when the picture cannot be drawn.
-fn diagram(language: &str, source: &str, columns: usize) -> Option<Vec<Line>> {
+fn diagram(language: &str, source: &str, room: usize) -> Option<Vec<Line>> {
     if !language.trim().eq_ignore_ascii_case("mermaid") {
         return None;
     }
-    let drawn = crate::mermaid::render(source, columns.saturating_sub(4))?;
-    let mut out = vec![Line::default().decorated(Block::Diagram)];
-    out.extend(drawn.into_iter().map(|text| Line {
-        spans: vec![Span {
-            text,
-            style: Style::Body,
-        }],
-        indent: 2,
-        block: Block::Diagram,
-        scale: Scale::Body,
-        code: None,
-    }));
-    out.push(Line::default().decorated(Block::Diagram));
+    // Two cells of indent and two of margin, which is what the tint
+    // behind the block takes up on either side of it.
+    let drawn = crate::mermaid::render(source, room.saturating_sub(4))?;
+    // Every row padded to the widest, the blank ones above and below
+    // included: the tint is sized from the row it is drawn on, and a
+    // ragged one would stair-step down the page.
+    let width = drawn.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+    let row = |text: String| {
+        let short = width.saturating_sub(text.chars().count());
+        let mut text = text;
+        text.extend(std::iter::repeat_n(' ', short));
+        Line {
+            spans: vec![Span::plain(text, Style::Body)],
+            indent: 2,
+            block: Block::Diagram,
+            scale: Scale::Body,
+            code: None,
+        }
+    };
+    let mut out = vec![row(String::new())];
+    out.extend(drawn.into_iter().map(&row));
+    out.push(row(String::new()));
     Some(out)
 }
 
@@ -917,12 +1345,7 @@ fn code_block(language: String, code: &[&str], columns: usize) -> Vec<Line> {
         let spans = highlighted
             .as_ref()
             .and_then(|lines| lines.get(index).cloned())
-            .unwrap_or_else(|| {
-                vec![Span {
-                    text: trimmed.to_string(),
-                    style: Style::Code,
-                }]
-            });
+            .unwrap_or_else(|| vec![Span::plain(trimmed, Style::Code)]);
         // Hard-wrapped rather than clipped. Code must not be re-flowed at
         // word boundaries — that changes what it says — but silently
         // cutting the end off is worse than a wrap.
@@ -954,10 +1377,7 @@ fn hard_wrap(spans: Vec<Span>, room: usize) -> Vec<Vec<Span>> {
             let take = room - used;
             let text: String = chars.by_ref().take(take).collect();
             used += text.chars().count();
-            current.push(Span {
-                text,
-                style: span.style,
-            });
+            current.push(Span::plain(text, span.style));
             if used == room {
                 out.push(std::mem::take(&mut current));
                 used = 0;
@@ -970,60 +1390,20 @@ fn hard_wrap(spans: Vec<Span>, room: usize) -> Vec<Vec<Span>> {
     out
 }
 
-/// A task list's checkbox, and the text after it.
-fn task_box(item: &str) -> Option<(char, &str)> {
-    let rest = item.strip_prefix('[')?;
-    let mark = rest.chars().next()?;
-    let rest = rest.get(1..)?.strip_prefix(']')?;
-    let glyph = match mark {
-        ' ' => '☐',
-        'x' | 'X' | '✓' => '☑',
-        _ => return None,
-    };
-    Some((glyph, rest.trim_start()))
-}
-
-/// The labels of every `[label]: url` definition in the document.
-///
-/// Collected in a pass of its own because a reference may be defined
-/// after it is used, and a link that renders as literal brackets on the
-/// first read and as a link on the second would be worse than either.
-fn reference_labels(lines: &[&str]) -> HashMap<String, ()> {
-    lines
-        .iter()
-        .filter_map(|line| reference_definition(line.trim()))
-        .map(|label| (label, ()))
-        .collect()
-}
-
-/// The label of a `[label]: url` definition line.
-fn reference_definition(bare: &str) -> Option<String> {
-    let rest = bare.strip_prefix('[')?;
-    let close = rest.find("]:")?;
-    let label = &rest[..close];
-    let target = rest[close + 2..].trim();
-    (!label.is_empty() && !target.is_empty() && !target.contains(char::is_whitespace))
-        .then(|| label.to_ascii_lowercase())
-}
-
-fn flush(paragraph: &mut Vec<Span>, indent: usize, columns: usize, out: &mut Vec<Line>) {
-    if paragraph.is_empty() {
-        return;
-    }
-    out.extend(wrap(
-        std::mem::take(paragraph),
-        indent,
-        columns,
-        Scale::Body,
-    ));
-}
-
 /// Breaks spans into lines at word boundaries, keeping each span's style.
 ///
 /// `scale` is passed because a heading's glyphs are wider than a body
 /// cell, so the same number of characters needs more of the column.
-fn wrap(spans: Vec<Span>, indent: usize, columns: usize, scale: Scale) -> Vec<Line> {
-    let room = ((columns.saturating_sub(indent) as f32 / scale.width()) as usize).max(8);
+fn wrap(
+    spans: Vec<Span>,
+    indent: usize,
+    columns: f32,
+    scale: Scale,
+    measure: &mut dyn Measure,
+) -> Vec<Line> {
+    // No dividing by the scale: a heading's glyphs are wider, and the
+    // measure below already says by how much.
+    let room = (columns - indent as f32).max(8.0);
 
     // Tokenise into words that may be built from several runs. A run
     // boundary is not a word boundary: `**bold**s` is one word in two
@@ -1052,10 +1432,13 @@ fn wrap(spans: Vec<Span>, indent: usize, columns: usize, scale: Scale) -> Vec<Li
                 .last_mut()
                 .expect("a word is open or was just started");
             match word.last_mut() {
-                Some(last) if last.style == span.style => last.text.push_str(piece),
+                Some(last) if last.style == span.style && last.href == span.href => {
+                    last.text.push_str(piece)
+                }
                 _ => word.push(Span {
                     text: piece.to_string(),
                     style: span.style,
+                    href: span.href.clone(),
                 }),
             }
             open = true;
@@ -1064,10 +1447,14 @@ fn wrap(spans: Vec<Span>, indent: usize, columns: usize, scale: Scale) -> Vec<Li
 
     let mut lines = Vec::new();
     let mut current: Vec<Span> = Vec::new();
-    let mut used = 0usize;
+    let mut used = 0.0f32;
+    let mut space = 0.0f32;
     for word in words {
-        let len: usize = word.iter().map(|s| s.text.chars().count()).sum();
-        if used > 0 && used + len + 1 > room {
+        let len: f32 = word
+            .iter()
+            .map(|span| measure.width(&span.text, span.style, scale))
+            .sum();
+        if used > 0.0 && used + len + space > room {
             lines.push(Line {
                 spans: std::mem::take(&mut current),
                 indent,
@@ -1075,25 +1462,34 @@ fn wrap(spans: Vec<Span>, indent: usize, columns: usize, scale: Scale) -> Vec<Li
                 scale,
                 code: None,
             });
-            used = 0;
+            used = 0.0;
         }
-        if used > 0 {
+        if used > 0.0 {
             // The separator joins the two runs it sits between when they
             // agree, so a link's underline and a strikethrough run through
             // the spaces inside the phrase and stop at its edges.
-            let before = current.last().map(|s: &Span| s.style);
-            let after = word.first().map(|s| s.style);
-            let style = match (before, after) {
-                (Some(a), Some(b)) if a == b => a,
-                _ => Style::Body,
+            let before = current.last();
+            let after = word.first();
+            let (style, href) = match (before, after) {
+                (Some(a), Some(b)) if a.style == b.style && a.href == b.href => {
+                    (a.style, a.href.clone())
+                }
+                // The gap after a marker is a cell rather than a
+                // proportional space, so a checkbox does not sit against
+                // the first word of its item.
+                (Some(a), _) if a.style == Style::Bullet => (Style::Bullet, None),
+                _ => (Style::Body, None),
             };
-            push_run(&mut current, " ", style);
-            used += 1;
+            used += measure.width(" ", style, scale);
+            push_run(&mut current, " ", style, href);
         }
         for piece in word {
-            used += piece.text.chars().count();
-            push_run(&mut current, &piece.text, piece.style);
+            let Span { text, style, href } = piece;
+            used += measure.width(&text, style, scale);
+            push_run(&mut current, &text, style, href);
         }
+        // What the next word will cost to separate from this one.
+        space = measure.width(" ", Style::Body, scale);
     }
     if !current.is_empty() {
         lines.push(Line {
@@ -1108,13 +1504,15 @@ fn wrap(spans: Vec<Span>, indent: usize, columns: usize, scale: Scale) -> Vec<Li
 }
 
 /// Appends text to a line, joining it to the previous run when the style
-/// matches so a wrapped line is a handful of runs rather than one per word.
-fn push_run(line: &mut Vec<Span>, text: &str, style: Style) {
+/// and the target match, so a wrapped line is a handful of runs rather
+/// than one per word.
+fn push_run(line: &mut Vec<Span>, text: &str, style: Style, href: Option<Arc<str>>) {
     match line.last_mut() {
-        Some(last) if last.style == style => last.text.push_str(text),
+        Some(last) if last.style == style && last.href == href => last.text.push_str(text),
         _ => line.push(Span {
             text: text.to_string(),
             style,
+            href,
         }),
     }
 }
@@ -1153,298 +1551,6 @@ fn merge(outer: Style, inner: Style) -> Style {
         (Style::Body, inner) => inner,
         (outer, Style::Body) => outer,
         (_, inner) => inner,
-    }
-}
-
-/// Splits one line into styled runs.
-///
-/// Handles `**bold**`, `*em*`, `***both***`, `` `code` ``, `~~struck~~`,
-/// `[text](url)`, `[text][ref]`, `![alt](src)`, `<https://autolink>`,
-/// bare URLs, backslash escapes, and the inline HTML above. Anything
-/// unbalanced is left as written rather than eaten.
-fn inline(text: &str, refs: &HashMap<String, ()>) -> Vec<Span> {
-    let mut out = Vec::new();
-    scan(text, Style::Body, refs, &mut out);
-    if out.is_empty() {
-        out.push(Span {
-            text: String::new(),
-            style: Style::Body,
-        });
-    }
-    out
-}
-
-fn scan(text: &str, base: Style, refs: &HashMap<String, ()>, out: &mut Vec<Span>) {
-    let chars: Vec<char> = text.chars().collect();
-    let mut plain = String::new();
-    // Styles opened by an inline HTML tag, innermost last.
-    let mut tags: Vec<Style> = Vec::new();
-    let mut i = 0;
-
-    macro_rules! flush_plain {
-        () => {
-            if !plain.is_empty() {
-                let style = tags.iter().fold(base, |acc, s| merge(acc, *s));
-                push(out, std::mem::take(&mut plain), style);
-            }
-        };
-    }
-
-    while i < chars.len() {
-        let here = &text[char_byte(&chars, i)..];
-
-        // An escape is the one thing that outranks everything else.
-        if chars[i] == '\\' {
-            if let Some(next) = chars.get(i + 1).filter(|c| c.is_ascii_punctuation()) {
-                plain.push(*next);
-                i += 2;
-                continue;
-            }
-        }
-
-        // Code first: inside a span, no other marker is markup.
-        if chars[i] == '`' {
-            let ticks = chars[i..].iter().take_while(|c| **c == '`').count();
-            let marker: String = "`".repeat(ticks);
-            if let Some(end) = find_from(&chars, i + ticks, &marker) {
-                flush_plain!();
-                let body: String = chars[i + ticks..end].iter().collect();
-                // A code span's one piece of trim: `` ` `` holds a
-                // backtick, and the padding spaces are not content.
-                let body = body.trim_matches(' ');
-                push(out, body.to_string(), Style::Code);
-                i = end + ticks;
-                continue;
-            }
-        }
-
-        // Image before link: the `!` belongs to the construct.
-        if chars[i] == '!' && chars.get(i + 1) == Some(&'[') {
-            if let Some((label, consumed)) = bracketed(&chars[i + 1..], refs) {
-                flush_plain!();
-                let alt = if label.is_empty() { "image" } else { &label };
-                out.push(picture(alt));
-                i += consumed + 1;
-                continue;
-            }
-        }
-        if chars[i] == '[' {
-            if let Some((label, consumed)) = bracketed(&chars[i..], refs) {
-                flush_plain!();
-                let mut inner = Vec::new();
-                scan(&label, merge(base, Style::Link), refs, &mut inner);
-                // The label's own markup still applies, but a plain label
-                // is a link, not body text.
-                for mut span in inner {
-                    if span.style == Style::Body || span.style == merge(base, Style::Link) {
-                        span.style = Style::Link;
-                    }
-                    out.push(span);
-                }
-                i += consumed;
-                continue;
-            }
-        }
-
-        // Emphasis markers, longest first so `***` is not read as `**`
-        // and then left with a stray marker.
-        let mut matched = false;
-        for (marker, style) in [
-            ("***", Style::BoldEmphasis),
-            ("___", Style::BoldEmphasis),
-            ("**", Style::Bold),
-            ("__", Style::Bold),
-            ("~~", Style::Strike),
-        ] {
-            if !here.starts_with(marker) {
-                continue;
-            }
-            let len = marker.chars().count();
-            // No partner on this line: it is punctuation, not a marker,
-            // and falls through to be emitted as written.
-            let Some(end) = find_from(&chars, i + len, marker) else {
-                continue;
-            };
-            let body: String = chars[i + len..end].iter().collect();
-            if body.trim().is_empty() {
-                continue;
-            }
-            flush_plain!();
-            scan(&body, merge(base, style), refs, out);
-            i = end + len;
-            matched = true;
-            break;
-        }
-        if matched {
-            continue;
-        }
-
-        // Single-character emphasis. `_` only between non-word characters,
-        // so `snake_case_name` is a name rather than emphasis.
-        if chars[i] == '*' || (chars[i] == '_' && word_boundary(&chars, i)) {
-            let marker = chars[i].to_string();
-            if let Some(end) = find_from(&chars, i + 1, &marker) {
-                let body: String = chars[i + 1..end].iter().collect();
-                if !body.trim().is_empty() && !body.contains('\n') {
-                    flush_plain!();
-                    scan(&body, merge(base, Style::Emphasis), refs, out);
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-
-        // An autolink, or a tag.
-        if chars[i] == '<' {
-            if let Some(end) = find_from(&chars, i + 1, ">") {
-                let raw: String = chars[i + 1..end].iter().collect();
-                if raw.starts_with("http://") || raw.starts_with("https://") {
-                    flush_plain!();
-                    push(out, raw, Style::Link);
-                    i = end + 1;
-                    continue;
-                }
-                let closing = raw.starts_with('/');
-                let name = raw
-                    .trim_start_matches('/')
-                    .split(|c: char| c.is_whitespace() || c == '/')
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                // An `<img>` written inline in Markdown is still an
-                // image, and the one void tag worth naming.
-                if name == "img" && !closing {
-                    flush_plain!();
-                    let alt = attribute(&raw, "alt")
-                        .filter(|alt| !alt.trim().is_empty())
-                        .or_else(|| attribute(&raw, "src"))
-                        .unwrap_or_else(|| "image".to_string());
-                    out.push(picture(&alt));
-                    i = end + 1;
-                    continue;
-                }
-                if let Some(style) = inline_tag(&name) {
-                    flush_plain!();
-                    match (closing, style) {
-                        (false, Some(style)) => tags.push(style),
-                        (true, Some(_)) => {
-                            tags.pop();
-                        }
-                        _ => {}
-                    }
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-
-        // A bare URL, which every renderer links and this one should too.
-        if here.starts_with("http://") || here.starts_with("https://") {
-            let len = chars[i..]
-                .iter()
-                .take_while(|c| !c.is_whitespace() && !matches!(c, '<' | '>' | ')' | '"'))
-                .count();
-            let url: String = chars[i..i + len].iter().collect();
-            // Trailing punctuation belongs to the sentence, not the link.
-            let url = url.trim_end_matches(['.', ',', ';', ':', '!']);
-            flush_plain!();
-            push(out, url.to_string(), Style::Link);
-            i += url.chars().count();
-            continue;
-        }
-
-        plain.push(chars[i]);
-        i += 1;
-    }
-    flush_plain!();
-}
-
-/// Appends a run, joining it to the previous one when the style matches.
-fn push(out: &mut Vec<Span>, text: String, style: Style) {
-    if text.is_empty() {
-        return;
-    }
-    match out.last_mut() {
-        Some(last) if last.style == style => last.text.push_str(&text),
-        _ => out.push(Span { text, style }),
-    }
-}
-
-fn char_byte(chars: &[char], index: usize) -> usize {
-    chars[..index].iter().map(|c| c.len_utf8()).sum()
-}
-
-/// The index of the next occurrence of `needle` at or after `from`.
-fn find_from(chars: &[char], from: usize, needle: &str) -> Option<usize> {
-    let needle: Vec<char> = needle.chars().collect();
-    if from >= chars.len() || needle.is_empty() {
-        return None;
-    }
-    (from..=chars.len().saturating_sub(needle.len())).find(|&at| {
-        chars[at..at + needle.len()] == needle[..]
-            // A marker escaped with a backslash is not a marker.
-            && (at == 0 || chars[at - 1] != '\\')
-    })
-}
-
-/// Whether `_` at `index` sits at a word boundary, which is the only place
-/// it means emphasis rather than part of an identifier.
-fn word_boundary(chars: &[char], index: usize) -> bool {
-    let before = index
-        .checked_sub(1)
-        .and_then(|i| chars.get(i))
-        .copied()
-        .unwrap_or(' ');
-    !before.is_alphanumeric()
-}
-
-/// A `[label](target)`, `[label][ref]` or `[label]` shortcut.
-///
-/// Returns the label and how many characters the whole construct took, or
-/// `None` when it is not a link — a bare `[TODO]` in prose stays as it was
-/// written.
-fn bracketed(chars: &[char], refs: &HashMap<String, ()>) -> Option<(String, usize)> {
-    if chars.first() != Some(&'[') {
-        return None;
-    }
-    // Nesting, so `[![badge](img)](link)` finds the outer bracket.
-    let mut depth = 0usize;
-    let mut close = None;
-    for (i, ch) in chars.iter().enumerate() {
-        match ch {
-            '[' if i == 0 || chars[i - 1] != '\\' => depth += 1,
-            ']' if chars[i - 1] != '\\' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = close?;
-    let label: String = chars[1..close].iter().collect();
-
-    match chars.get(close + 1) {
-        Some('(') => {
-            let end = find_from(chars, close + 2, ")")?;
-            Some((label, end + 1))
-        }
-        Some('[') => {
-            let end = find_from(chars, close + 2, "]")?;
-            let reference: String = chars[close + 2..end].iter().collect();
-            let key = if reference.is_empty() {
-                label.to_ascii_lowercase()
-            } else {
-                reference.to_ascii_lowercase()
-            };
-            refs.contains_key(&key).then_some((label, end + 1))
-        }
-        // A shortcut reference links only when something defines it.
-        _ => refs
-            .contains_key(&label.to_ascii_lowercase())
-            .then_some((label, close + 1)),
     }
 }
 
@@ -1937,9 +2043,343 @@ mod tests {
         assert_eq!(code.text, "**not bold**");
     }
 
+    /// Four spaces is a code block in CommonMark, and this used to be
+    /// wrapped as prose — which is what every `cargo run` line in our own
+    /// README was being drawn as.
+    #[test]
+    fn an_indented_block_is_code_rather_than_prose() {
+        let out = render(
+            "text:\n\n    cargo run -- a b\n    second line\n\nafter\n",
+            60,
+        );
+        let code: Vec<String> = out
+            .iter()
+            .filter(|l| l.block == Block::Code)
+            .map(text_of)
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert_eq!(code, vec!["cargo run -- a b", "second line"]);
+        // And it is copyable, like any other block of code.
+        assert!(out.iter().any(|l| l.code.is_some()));
+    }
+
+    #[test]
+    fn a_footnote_is_a_mark_in_the_text_and_a_block_below() {
+        let out = render("A claim[^1] stands.\n\n[^1]: Because it does.\n", 60);
+        let joined: String = out.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("[1] stands"),
+            "the mark reads inline: {joined:?}"
+        );
+        assert!(joined.contains("Because it does."), "and the note is kept");
+        assert!(
+            !joined.contains("[^1]"),
+            "the marker is markup, not text: {joined:?}"
+        );
+    }
+
+    /// A tight list is a list; a loose one is a sequence of paragraphs
+    /// that happen to be bulleted, and reads like one.
+    #[test]
+    fn a_loose_list_is_spaced_and_a_tight_one_is_not() {
+        let tight = render("- one\n- two\n", 60);
+        assert!(
+            tight.iter().all(|l| !l.is_blank()),
+            "nothing between the items of a tight list"
+        );
+
+        let loose = render("- one\n\n- two\n", 60);
+        assert!(
+            loose.iter().any(Line::is_blank),
+            "a loose list keeps the air its author put there"
+        );
+    }
+
+    /// `<summary>` and the paragraph under it are two blocks. Run
+    /// together they came out as one word with no space in it.
+    #[test]
+    fn an_html_block_is_a_block_of_its_own() {
+        let out = render(
+            "<details>\n<summary>Heading</summary>\n\nBody text.\n\n</details>\n",
+            60,
+        );
+        let rows: Vec<String> = out.iter().map(text_of).filter(|t| !t.is_empty()).collect();
+        assert_eq!(rows, vec!["Heading", "Body text."], "got {rows:#?}");
+    }
+
+    /// The definition may come after the use, which is why this used to
+    /// need a pass of its own over the document.
+    #[test]
+    fn a_reference_defined_later_is_still_a_link() {
+        let out = render("see [the docs][d] here\n\n[d]: https://example.com\n", 60);
+        assert_eq!(text_of(&out[0]), "see the docs here");
+        assert!(styles(&out[0]).contains(&Style::Link));
+    }
+
+    #[test]
+    fn an_entity_becomes_the_character_it_names() {
+        let out = render("a &amp; b &lt;c&gt; d\n", 60);
+        assert_eq!(text_of(&out[0]), "a & b <c> d");
+    }
+
+    /// Emphasis inside emphasis is both at once, which is a rule about
+    /// delimiter runs rather than about the characters.
+    #[test]
+    fn emphasis_inside_emphasis_is_both_at_once() {
+        let out = render("**bold with *more* inside**\n", 60);
+        let styles = styles(&out[0]);
+        assert!(styles.contains(&Style::Bold), "got {styles:?}");
+        assert!(styles.contains(&Style::BoldEmphasis), "got {styles:?}");
+        assert_eq!(text_of(&out[0]), "bold with more inside");
+    }
+
+    /// Prose is set in a proportional face and everything whose meaning
+    /// is its alignment is not. Set a table's frame proportionally and it
+    /// comes apart; set a diagram's box characters proportionally and it
+    /// stops being a picture.
+    #[test]
+    fn what_is_set_on_the_grid_and_what_is_set_as_prose() {
+        use lithe_gpu::{Face, Family};
+
+        assert_eq!(Style::Body.family(), Family::Prose);
+        assert_eq!(Style::Heading(1).family(), Family::Prose);
+        assert_eq!(Style::Code.family(), Family::Mono);
+        assert_eq!(Style::Divider.family(), Family::Mono);
+        // A marker lines up with the indents measured in cells around it.
+        assert_eq!(Style::Bullet.family(), Family::Mono);
+
+        // Weight and slant carry what they carry in a document.
+        assert_eq!(Style::Emphasis.face(), Face::Italic);
+        assert_eq!(Style::Bold.face(), Face::Bold);
+        assert_eq!(Style::BoldEmphasis.face(), Face::BoldItalic);
+        assert_eq!(Style::Heading(3).face(), Face::Bold);
+
+        // And every row of a table or a diagram is drawn on the grid,
+        // whatever the styles inside it say.
+        let out = render("| a | b |\n|---|---|\n| 1 | 2 |\n", 60);
+        assert!(
+            out.iter().filter(|l| !l.is_blank()).all(Line::is_grid),
+            "every row of a table is grid, got {:?}",
+            out.iter().map(|l| l.block).collect::<Vec<_>>()
+        );
+    }
+
+    /// A line of prose is as long as what is in it, not as long as the
+    /// characters it happens to be spelled with.
+    #[test]
+    fn a_measured_column_wraps_on_what_it_measures() {
+        /// Half a cell per character, as a proportional face is.
+        struct Narrow;
+        impl Measure for Narrow {
+            fn width(&mut self, text: &str, _style: Style, scale: Scale) -> f32 {
+                text.chars().count() as f32 * 0.5 * scale.width()
+            }
+        }
+
+        let source = "word ".repeat(40);
+        let wide = render_with(&source, 40, &mut Narrow);
+        let grid = render(&source, 40);
+        assert!(
+            wide.len() < grid.len(),
+            "narrower glyphs fit more words in a line: {} vs {}",
+            wide.len(),
+            grid.len()
+        );
+    }
+
     #[test]
     fn consecutive_lines_join_into_one_paragraph() {
         let out = render("one\ntwo\n\nthree\n", 80);
         assert_eq!(text_of(&out[0]), "one two", "got {:?}", text_of(&out[0]));
+    }
+
+    /// Where the run holding `text` goes, if anywhere.
+    fn target(out: &[Line], text: &str) -> Option<String> {
+        out.iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.text.contains(text))
+            .and_then(|s| s.href.as_deref().map(str::to_string))
+    }
+
+    #[test]
+    fn the_margins_are_margins_rather_than_half_the_page() {
+        // The complaint this answers: a column measured for a book left
+        // more air on either side of it than it used itself.
+        let room = 117;
+        let column = column(room, &mut Cells);
+        let margin = (room as f32 - column) / 2.0;
+        assert!(margin >= 2.0, "there is still a margin: {margin}");
+        assert!(
+            margin <= column / 4.0,
+            "and it is a margin, not the page: {margin} either side of {column}"
+        );
+    }
+
+    #[test]
+    fn the_page_keeps_its_margins_at_every_width() {
+        for room in [30usize, 60, 90, 117, 160, 225, 400] {
+            let column = column(room, &mut Cells);
+            let air = room as f32 - column;
+            assert!(air >= 3.0, "{room}: a page has margins, got {air}");
+            assert!(
+                air <= room as f32 * 0.32,
+                "{room}: and is not mostly margin: {air} of it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_figure_may_be_wider_than_the_prose_beside_it() {
+        // Six nodes into one, which needs more cells than prose is set
+        // to. Refusing it would have shown the fence as its own source.
+        let source = "```mermaid\nflowchart TD\n    \
+             one[the first step] --> hub[the one below]\n    \
+             two[the second step] --> hub\n    \
+             three[the third step] --> hub\n    \
+             four[the fourth step] --> hub\n    \
+             five[the fifth step] --> hub\n    \
+             six[the sixth step] --> hub\n```\n";
+        let out = render(source, 160);
+        let widest = out
+            .iter()
+            .filter(|l| l.block == Block::Diagram)
+            .map(|l| {
+                l.indent
+                    + l.spans
+                        .iter()
+                        .map(|s| s.text.chars().count())
+                        .sum::<usize>()
+            })
+            .max()
+            .expect("a drawn figure, not a fence");
+        assert!(
+            widest as f32 > column(160, &mut Cells),
+            "the figure used the page: {widest}"
+        );
+        assert!(
+            widest as f32 <= figures(160),
+            "and stayed inside it: {widest}"
+        );
+    }
+
+    #[test]
+    fn a_figures_rows_are_all_one_width() {
+        // The tint behind a figure is sized from the row it is drawn on,
+        // so a ragged figure would stair-step down the page.
+        let out = render("```mermaid\nflowchart TD\n    a[one] --> b[two]\n```\n", 80);
+        let widths: Vec<usize> = out
+            .iter()
+            .filter(|l| l.block == Block::Diagram)
+            .map(|l| l.spans.iter().map(|s| s.text.chars().count()).sum())
+            .collect();
+        assert!(widths.len() > 2, "a drawn figure: {widths:?}");
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
+    }
+
+    #[test]
+    fn a_link_carries_where_it_goes() {
+        let out = render(
+            "see [the docs](https://example.com/a?b=1&c=2) for more\n",
+            80,
+        );
+        assert_eq!(
+            target(&out, "the docs").as_deref(),
+            Some("https://example.com/a?b=1&c=2")
+        );
+        // And the prose around it goes nowhere.
+        let prose = out
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.text.contains("for more"))
+            .expect("the words after the link");
+        assert!(prose.href.is_none(), "{prose:?}");
+    }
+
+    #[test]
+    fn a_bare_url_is_its_own_target() {
+        let out = render("read https://example.com/x today\n", 80);
+        assert_eq!(
+            target(&out, "https://example.com/x").as_deref(),
+            Some("https://example.com/x")
+        );
+    }
+
+    #[test]
+    fn a_badge_goes_where_its_link_goes() {
+        // An image inside a link, which is how every README begins. The
+        // picture is what it is wearing; the click means the link.
+        let out = render(
+            "[![build](https://img.example/b.svg)](https://ci.example/job)\n",
+            80,
+        );
+        assert_eq!(
+            target(&out, "build").as_deref(),
+            Some("https://ci.example/job")
+        );
+    }
+
+    #[test]
+    fn a_picture_on_its_own_points_at_itself() {
+        let out = render("![a diagram](docs/diagram.png)\n", 80);
+        assert_eq!(
+            target(&out, "a diagram").as_deref(),
+            Some("docs/diagram.png")
+        );
+        // Written as HTML, which a README does when it wants a width.
+        let out = render(
+            "<img src=\"docs/d.png\" alt=\"a picture\" width=\"40\">\n",
+            80,
+        );
+        assert_eq!(target(&out, "a picture").as_deref(), Some("docs/d.png"));
+    }
+
+    #[test]
+    fn a_wrapped_link_keeps_its_target_on_every_line() {
+        let out = render(
+            "[a link whose text is long enough to need two lines of a narrow column](x.md)\n",
+            24,
+        );
+        let runs: Vec<&Span> = out
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style == Style::Link)
+            .collect();
+        assert!(runs.len() > 1, "it wrapped: {runs:?}");
+        assert!(
+            runs.iter().all(|s| s.href.as_deref() == Some("x.md")),
+            "{runs:?}"
+        );
+    }
+
+    #[test]
+    fn an_html_anchor_carries_its_href() {
+        let out = render("<a href=\"https://example.com\">home</a>\n", 80);
+        assert_eq!(target(&out, "home").as_deref(), Some("https://example.com"));
+        // One without a target is not a link, and its closing tag takes
+        // back what it pushed rather than the one around it.
+        let out = render("<a name=\"top\">here</a> and [there](t.md)\n", 80);
+        assert_eq!(target(&out, "here"), None);
+        assert_eq!(target(&out, "there").as_deref(), Some("t.md"));
+    }
+
+    #[test]
+    fn a_relative_target_is_kept_as_written() {
+        let out = render("[the guide](docs/guide.md#writing)\n", 80);
+        assert_eq!(
+            target(&out, "the guide").as_deref(),
+            Some("docs/guide.md#writing")
+        );
+    }
+
+    #[test]
+    fn an_anchor_finds_the_heading_it_names() {
+        let out = render("# Top\n\nwords\n\n## The Second Part!\n\nmore\n", 80);
+        let at = anchor(&out, "the-second-part").expect("the heading");
+        assert!(
+            text_of(&out[at]).contains("The Second Part"),
+            "landed on {:?}",
+            text_of(&out[at])
+        );
+        assert_eq!(anchor(&out, "nowhere"), None);
     }
 }

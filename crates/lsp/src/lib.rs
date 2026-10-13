@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 // Re-exported so callers need not depend on lsp-types directly.
 pub use lsp_types::{CompletionItem, DiagnosticSeverity, Location};
 pub use lsp_types::{Diagnostic, Position, Range, Uri};
-pub use servers::{config_for, widen_search_path, ServerConfig};
+pub use servers::{config_for, which, widen_search_path, ServerConfig};
 
 /// What a server told us, delivered to the event loop.
 #[derive(Debug)]
@@ -101,6 +101,12 @@ pub struct Client {
     /// which characters mean "a member follows" is a fact about the
     /// language, not about the editor.
     completion_triggers: Vec<String>,
+    /// What the server said it can answer, from its `initialize` reply.
+    /// Empty until that arrives.
+    capabilities: Value,
+    /// The binary that is running, for saying which server it is that
+    /// does not do something.
+    command: &'static str,
     /// Documents we have sent `didOpen` for, and their version counters.
     open: HashMap<PathBuf, i32>,
     /// Notifications made before the handshake finished, in order.
@@ -128,10 +134,12 @@ impl Client {
         // happily and then exits. Without this the editor would report a
         // server it does not have.
         let mut child = None;
+        let mut command = "";
         for argv in config.live_commands() {
             match spawn_server(argv, root) {
                 Some(running) => {
                     child = Some(running);
+                    command = argv[0];
                     break;
                 }
                 None => log::info!("{language}: {} did not stay running", argv[0]),
@@ -149,7 +157,14 @@ impl Client {
 
         let (to_server, outgoing) = channel::<String>();
         spawn_writer(stdin, outgoing);
-        spawn_reader(stdout, events, wake, language, Arc::clone(&stop));
+        spawn_reader(
+            stdout,
+            events,
+            wake,
+            language,
+            Arc::clone(&stop),
+            to_server.clone(),
+        );
         spawn_logger(stderr, language);
 
         let mut client = Self {
@@ -161,6 +176,8 @@ impl Client {
             pending: HashMap::new(),
             ready: false,
             completion_triggers: Vec::new(),
+            capabilities: Value::Null,
+            command,
             open: HashMap::new(),
             deferred: Vec::new(),
             stop,
@@ -309,6 +326,7 @@ impl Client {
     pub fn on_initialized(&mut self, result: &Value) {
         self.ready = true;
         self.completion_triggers = completion_triggers(result);
+        self.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
         self.notify(
             "initialized",
             serde_json::to_value(InitializedParams {}).unwrap_or(Value::Null),
@@ -317,6 +335,37 @@ impl Client {
         // that it is allowed to hear it.
         for message in std::mem::take(&mut self.deferred) {
             self.send(message);
+        }
+    }
+
+    /// The binary this client is talking to.
+    pub fn command(&self) -> &'static str {
+        self.command
+    }
+
+    /// Whether the server said it answers this request.
+    ///
+    /// A server announces what it does and does not do, and the ones it
+    /// does not are worth knowing about before asking: `gopls` and
+    /// `rust-analyzer` have no `textDocument/declaration` — in Go and
+    /// Rust a thing is declared where it is defined — so asking returns
+    /// null, which is indistinguishable from "nothing here". Only
+    /// `clangd` has a real answer, because C does make the distinction.
+    ///
+    /// True while the capabilities are unknown: before the handshake, the
+    /// honest answer is "ask and see".
+    pub fn provides(&self, method: &str) -> bool {
+        let Some(key) = capability_for(method) else {
+            return true;
+        };
+        let Some(capabilities) = self.capabilities.as_object() else {
+            return true;
+        };
+        match capabilities.get(key) {
+            // Announced as `true`, or as an object of options.
+            Some(Value::Bool(answers)) => *answers,
+            Some(Value::Null) | None => false,
+            Some(_) => true,
         }
     }
 
@@ -556,6 +605,22 @@ impl Drop for Client {
     }
 }
 
+/// Keeps a child process from opening a console window of its own.
+///
+/// A language server is a console program, and Windows gives one a console
+/// unless told not to — so a windowed application that starts three of them
+/// flashes three black boxes over the editor. Its output is read through
+/// pipes either way.
+#[cfg(windows)]
+fn no_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn no_console(_command: &mut Command) {}
+
 /// Starts a candidate and gives it a moment to fall over.
 ///
 /// A real server blocks on stdin and lives; a broken shim prints to stderr
@@ -563,14 +628,17 @@ impl Drop for Client {
 /// enough to tell the two apart and short enough not to be felt, and this
 /// happens once per language per session.
 fn spawn_server(argv: &'static [&'static str], root: &Path) -> Option<Child> {
-    let mut child = Command::new(argv[0])
+    // The resolved file rather than the name: see `servers::which`.
+    let program = servers::which(argv[0]).unwrap_or_else(|| PathBuf::from(argv[0]));
+    let mut command = Command::new(program);
+    command
         .args(&argv[1..])
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    no_console(&mut command);
+    let mut child = command.spawn().ok()?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
     while std::time::Instant::now() < deadline {
@@ -607,6 +675,7 @@ fn spawn_reader(
     wake: Arc<dyn Fn() + Send + Sync>,
     language: &'static str,
     stop: Arc<AtomicBool>,
+    to_server: Sender<String>,
 ) {
     std::thread::Builder::new()
         .name("lsp-read".into())
@@ -618,6 +687,15 @@ fn spawn_reader(
                 }
                 match read_message(&mut reader) {
                     Ok(Some(message)) => {
+                        // A question from the server is answered here
+                        // rather than passed on: the answer is
+                        // mechanical, and a server that asked one is
+                        // waiting on it.
+                        if let Some(reply) = reply_to(&message) {
+                            if to_server.send(reply).is_err() {
+                                return;
+                            }
+                        }
                         if let Some(event) = classify(message) {
                             if events.send(event).is_err() {
                                 return;
@@ -672,6 +750,76 @@ fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
     Ok(serde_json::from_slice(&body).ok())
 }
 
+/// The capability a request is announced under, for the requests the
+/// editor makes.
+///
+/// Spelled out rather than derived from the method name: most are the
+/// last word with `Provider` on the end, but not all of them are, and a
+/// derivation that is right nine times out of ten silently hides the
+/// tenth feature.
+fn capability_for(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "textDocument/hover" => "hoverProvider",
+        "textDocument/definition" => "definitionProvider",
+        "textDocument/declaration" => "declarationProvider",
+        "textDocument/typeDefinition" => "typeDefinitionProvider",
+        "textDocument/implementation" => "implementationProvider",
+        "textDocument/references" => "referencesProvider",
+        "textDocument/prepareCallHierarchy" => "callHierarchyProvider",
+        "textDocument/rename" => "renameProvider",
+        "textDocument/formatting" => "documentFormattingProvider",
+        "textDocument/rangeFormatting" => "documentRangeFormattingProvider",
+        "textDocument/codeAction" => "codeActionProvider",
+        "textDocument/completion" => "completionProvider",
+        _ => return None,
+    })
+}
+
+/// The answer to a request the server made of us, framed and ready to
+/// send, or `None` when the message was not a request.
+///
+/// Answering at all is the point. The protocol says every request gets a
+/// response, and a server that is kept waiting for one can simply stop:
+/// gopls asks to create a progress indicator before it will say anything
+/// else, so an unanswered request means no diagnostics, no hover and no
+/// go-to-definition for the rest of the session — in silence, which is
+/// the worst way for it to fail.
+///
+/// A request is a message with both an `id` and a `method`; a response to
+/// one of ours has an `id` and no method, and a notification has a method
+/// and no id. The id is echoed exactly as it arrived, because the
+/// protocol allows a string there as well as a number.
+fn reply_to(message: &Value) -> Option<String> {
+    let method = message.get("method").and_then(Value::as_str)?;
+    let id = message.get("id")?;
+    if id.is_null() {
+        return None;
+    }
+    let result = match method {
+        // One settings object per item asked about. The editor holds no
+        // settings for any server, so each item is answered with null and
+        // the server keeps its own defaults — but the shape has to match,
+        // or the server treats the reply as an error.
+        "workspace/configuration" => {
+            let items = message
+                .get("params")
+                .and_then(|params| params.get("items"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            Value::Array(vec![Value::Null; items])
+        }
+        // An edit the server would like applied. The editor applies the
+        // edits it asked for; one it did not ask for is declined rather
+        // than quietly let into the buffer.
+        "workspace/applyEdit" => json!({ "applied": false }),
+        // Progress indicators, dynamic registration, and whatever else a
+        // server announces: "go ahead" is all they are waiting for.
+        _ => Value::Null,
+    };
+    log::debug!("answering {method}");
+    serde_json::to_string(&json!({ "jsonrpc": "2.0", "id": id, "result": result })).ok()
+}
+
 /// Turns a message into an [`Event`], or `None` when it needs no action.
 /// Reads a `$/progress` notification into something worth showing.
 ///
@@ -710,10 +858,10 @@ fn classify(message: Value) -> Option<Event> {
     let id = message.get("id").and_then(Value::as_i64);
 
     if let Some(method) = message.get("method").and_then(Value::as_str) {
-        // A request from the server. We answer nothing useful, but we must
-        // not leave it waiting: several servers block their own progress on
-        // a reply.
+        // A request from the server, already answered by the reader —
+        // see `reply_for`. There is nothing here to act on.
         if id.is_some() {
+            log::debug!("server asked: {method}");
             return None;
         }
         if method == "textDocument/publishDiagnostics" {
@@ -837,11 +985,35 @@ pub fn path_to_uri(path: &Path) -> Result<Uri> {
         &absolute
     };
     let text = path.to_string_lossy();
+    // A Windows path is not a URI path: the separator is a backslash, the
+    // root is a drive rather than `/`, and `\\?\` is a Win32 prefix that
+    // means nothing to a server. `C:\a b\x.rs` has to leave here as
+    // `file:///C:/a%20b/x.rs`.
+    #[cfg(windows)]
+    let text = {
+        let bare = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        match bare.strip_prefix(r"\\") {
+            // A UNC path names a host, and `file://` is already followed
+            // by one: `\\box\share\x` is `file://box/share/x`.
+            Some(unc) => unc.to_owned(),
+            // A drive path is rooted at the drive, so the URI's own root
+            // goes back in front of it.
+            None => format!("/{bare}"),
+        }
+    };
     let mut encoded = String::with_capacity(text.len() + 8);
     encoded.push_str("file://");
     for byte in text.bytes() {
         match byte {
             b'/' | b'-' | b'.' | b'_' | b'~' => encoded.push(byte as char),
+            // The separator, and the drive's colon — which is legal in a
+            // URI path. Escaped as `%3A` it survives only a parser that
+            // undoes the escape and then recognises a drive; left alone it
+            // is read the same way by both kinds.
+            #[cfg(windows)]
+            b'\\' => encoded.push('/'),
+            #[cfg(windows)]
+            b':' => encoded.push(':'),
             b if b.is_ascii_alphanumeric() => encoded.push(b as char),
             b => encoded.push_str(&format!("%{b:02X}")),
         }
@@ -866,7 +1038,33 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
         out.push(bytes[i]);
         i += 1;
     }
-    Some(PathBuf::from(String::from_utf8(out).ok()?))
+    let decoded = String::from_utf8(out).ok()?;
+    Some(PathBuf::from(from_uri_path(&decoded)))
+}
+
+/// The decoded path part of a `file:` URI, as this platform spells a path.
+#[cfg(not(windows))]
+fn from_uri_path(decoded: &str) -> String {
+    decoded.to_owned()
+}
+
+/// Undoes what [`path_to_uri`] did: `/C:/a b/x.rs` is `C:\a b\x.rs`, and
+/// `box/share/x` — a URI that had a host — is `\\box\share\x`.
+#[cfg(windows)]
+fn from_uri_path(decoded: &str) -> String {
+    let starts_with_drive = |rest: &str| {
+        let mut chars = rest.chars();
+        matches!(chars.next(), Some(letter) if letter.is_ascii_alphabetic())
+            && chars.next() == Some(':')
+    };
+    match decoded.strip_prefix('/') {
+        Some(rest) if starts_with_drive(rest) => rest.replace('/', "\\"),
+        // No root of its own, so the first segment was the host.
+        None => format!(r"\\{}", decoded.replace('/', "\\")),
+        // Rooted but driveless — a server echoing a Unix-shaped path back.
+        // Left as it came rather than guessed a drive for.
+        Some(_) => decoded.replace('/', "\\"),
+    }
 }
 
 #[cfg(test)]
@@ -968,9 +1166,22 @@ mod tests {
 
     #[test]
     fn uris_round_trip_including_spaces() {
-        let path = Path::new("/Users/someone/my projects/main.rs");
+        let native = if cfg!(windows) {
+            r"C:\Users\someone\my projects\main.rs"
+        } else {
+            "/Users/someone/my projects/main.rs"
+        };
+        let path = Path::new(native);
         let uri = path_to_uri(path).expect("encodes");
         assert!(uri.as_str().contains("%20"), "a space must be escaped");
+        assert!(
+            uri.as_str().starts_with("file:///"),
+            "a path is rooted and has no host: {uri:?}"
+        );
+        assert!(
+            !uri.as_str().contains('\\'),
+            "a separator is a slash in a uri: {uri:?}"
+        );
         assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
     }
 
@@ -1010,6 +1221,85 @@ mod tests {
 
         let progress = json!({"jsonrpc":"2.0","method":"$/progress","params":{}});
         assert!(classify(progress).is_none());
+    }
+
+    /// A server that asks us something and is never answered can simply
+    /// stop: gopls will not say another word until the progress
+    /// indicator it asked to create has been acknowledged.
+    #[test]
+    fn a_question_from_the_server_is_answered() {
+        let asked = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "window/workDoneProgress/create",
+            "params": { "token": "x" }
+        });
+        let reply: Value = serde_json::from_str(&reply_to(&asked).expect("an answer")).unwrap();
+        assert_eq!(reply["id"], json!(1));
+        assert_eq!(reply["result"], Value::Null);
+
+        // One settings object per item asked about, or the server reads
+        // the reply as an error.
+        let configuration = json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "method": "workspace/configuration",
+            "params": { "items": [{ "section": "gopls" }, { "section": "go" }] }
+        });
+        let reply: Value =
+            serde_json::from_str(&reply_to(&configuration).expect("an answer")).unwrap();
+        assert_eq!(reply["id"], json!("2"), "a string id is echoed as it came");
+        assert_eq!(reply["result"], json!([null, null]));
+
+        // Replies and notifications are not questions.
+        assert!(reply_to(&json!({"jsonrpc":"2.0","id":3,"result":{}})).is_none());
+        assert!(reply_to(&json!({"jsonrpc":"2.0","method":"$/progress","params":{}})).is_none());
+    }
+
+    /// What a server says it does decides what the editor offers. The
+    /// three shapes a capability arrives in are "true", "an object of
+    /// options", and "absent".
+    #[test]
+    fn a_capability_is_read_from_what_the_server_announced() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut client = Client {
+            child: std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("a process that exits"),
+            to_server: tx,
+            next_id: 1,
+            language: "go",
+            language_id: "go",
+            pending: HashMap::new(),
+            ready: false,
+            completion_triggers: Vec::new(),
+            capabilities: Value::Null,
+            command: "gopls",
+            open: HashMap::new(),
+            deferred: Vec::new(),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        // Before the handshake nothing is known, so nothing is ruled out.
+        assert!(client.provides("textDocument/declaration"));
+
+        client.capabilities = json!({
+            "hoverProvider": true,
+            "definitionProvider": { "workDoneProgress": true },
+            "renameProvider": false,
+        });
+        assert!(client.provides("textDocument/hover"));
+        assert!(client.provides("textDocument/definition"));
+        assert!(
+            !client.provides("textDocument/rename"),
+            "announced as false"
+        );
+        assert!(
+            !client.provides("textDocument/declaration"),
+            "not announced at all"
+        );
+        // A request with no capability of its own is always worth making.
+        assert!(client.provides("textDocument/didOpen"));
     }
 
     #[test]

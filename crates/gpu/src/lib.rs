@@ -9,7 +9,7 @@
 mod atlas;
 mod renderer;
 
-pub use atlas::{CellMetrics, Face, Size};
+pub use atlas::{CellMetrics, Face, Family, Size};
 pub use renderer::{Frame, Image, Renderer};
 
 /// A colour, as the surface wants it.

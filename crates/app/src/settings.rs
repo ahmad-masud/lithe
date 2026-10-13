@@ -196,16 +196,36 @@ impl Settings {
 }
 
 fn store_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("settings.toml"))
+}
+
+/// Where lithe keeps the two files it owns, following each platform's
+/// convention.
+///
+/// Both of them live here: the settings and the recent-projects list are
+/// one directory's worth of state, and there is nothing else.
+#[cfg(target_os = "windows")]
+pub fn config_dir() -> Option<PathBuf> {
+    // `%APPDATA%` is where a Windows application's own settings go, and it
+    // is set for a process launched from Explorer — where `HOME` is not.
+    let roaming = std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+        std::env::var_os("USERPROFILE")
+            .map(|home| PathBuf::from(home).join("AppData").join("Roaming"))
+    })?;
+    Some(roaming.join("lithe"))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn config_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let dir = if cfg!(target_os = "macos") {
+    Some(if cfg!(target_os = "macos") {
         home.join("Library/Application Support/lithe")
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"))
             .join("lithe")
-    };
-    Some(dir.join("settings.toml"))
+    })
 }
 
 #[cfg(test)]

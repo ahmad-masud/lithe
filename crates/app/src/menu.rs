@@ -1,18 +1,28 @@
 //! The native menu bar.
 //!
-//! On macOS this is the real system menu at the top of the screen, not
-//! something drawn inside the window — which is what the platform expects
-//! and what makes the standard shortcuts discoverable.
+//! On macOS this is the real system menu at the top of the screen; on
+//! Windows it is the row under each window's title bar. Either way it is
+//! the platform's own menu rather than something drawn inside the window,
+//! which is what makes the standard shortcuts discoverable.
+//!
+//! The two platforms get different menus, because the same menu would be
+//! wrong on one of them. macOS wants an application menu named after the
+//! app, holding Settings and Quit; Windows wants Settings and Exit at the
+//! bottom of File, and About under Help. The entries in between are the
+//! same.
 //!
 //! Note the deliberate avoidance of muda's predefined Undo/Cut/Copy/Paste
 //! items: on macOS those send NSResponder actions aimed at an NSTextView,
 //! and this editor has no NSTextView to receive them. They would appear in
 //! the menu and silently do nothing. Every item we act on ourselves is a
-//! plain item with an id we route.
+//! plain item with an id we route. The same rule rules out Hide Others,
+//! Show All and Toggle Full Screen on Windows, where muda has nothing to
+//! implement them with.
 
 use muda::accelerator::Accelerator;
 use muda::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
+use crate::keys;
 use crate::picker::Command;
 
 /// Pairs a menu id with the command it runs.
@@ -85,6 +95,28 @@ fn item(id: &str, label: &str, accelerator: Option<&str>) -> MenuItem {
     MenuItem::with_id(id, label, true, accelerator)
 }
 
+/// What this build's About box says about itself.
+fn about() -> PredefinedMenuItem {
+    // macOS reads the bundle's `Info.plist` and wants nothing from here.
+    #[cfg(target_os = "macos")]
+    let metadata = None;
+    // Windows has nowhere else to read it from, and an About entry with
+    // nothing behind it opens nothing at all.
+    #[cfg(not(target_os = "macos"))]
+    let metadata = Some(muda::AboutMetadata {
+        name: Some("lithe".into()),
+        version: Some(env!("CARGO_PKG_VERSION").into()),
+        comments: Some(
+            "A bare-bones code editor in Rust. Local only: no account, \
+             no telemetry, no network, no LLM."
+                .into(),
+        ),
+        license: Some("MIT".into()),
+        ..Default::default()
+    });
+    PredefinedMenuItem::about(Some("About lithe"), metadata)
+}
+
 /// Builds the menu bar and installs it.
 ///
 /// The returned `Menu` must be kept alive for as long as the application is;
@@ -92,11 +124,15 @@ fn item(id: &str, label: &str, accelerator: Option<&str>) -> MenuItem {
 pub fn build() -> muda::Result<Menu> {
     let menu = Menu::new();
 
+    // The application menu, which exists only on macOS: it is the one
+    // named after the app, and the platform expects Settings, Hide and
+    // Quit to live in it rather than under File.
+    #[cfg(target_os = "macos")]
     let app = Submenu::with_items(
         "lithe",
         true,
         &[
-            &PredefinedMenuItem::about(Some("About lithe"), None),
+            &about(),
             &PredefinedMenuItem::separator(),
             &item("app.settings", "Settings…", Some("CmdOrCtrl+,")),
             &PredefinedMenuItem::separator(),
@@ -130,6 +166,15 @@ pub fn build() -> muda::Result<Menu> {
             &item("file.autosave", "Toggle Autosave", None),
         ],
     )?;
+
+    // Where the rest of the world puts them.
+    #[cfg(not(target_os = "macos"))]
+    file.append_items(&[
+        &PredefinedMenuItem::separator(),
+        &item("app.settings", "Settings…", Some("CmdOrCtrl+,")),
+        &PredefinedMenuItem::separator(),
+        &PredefinedMenuItem::quit(None),
+    ])?;
 
     let edit = Submenu::with_items(
         "Edit",
@@ -214,7 +259,7 @@ pub fn build() -> muda::Result<Menu> {
         &[
             &item(
                 "code.definition",
-                "Go to Definition  (or cmd-click)",
+                &format!("Go to Definition  (or {}-click)", keys::MOD),
                 Some("F12"),
             ),
             &item("code.hover", "Show Hover", Some("CmdOrCtrl+I")),
@@ -246,18 +291,93 @@ pub fn build() -> muda::Result<Menu> {
                 Some("CmdOrCtrl+Shift+V"),
             ),
             &PredefinedMenuItem::separator(),
-            &PredefinedMenuItem::fullscreen(None),
-            &PredefinedMenuItem::minimize(None),
-            &PredefinedMenuItem::zoom(None),
         ],
     )?;
+    // Full Screen and Zoom are AppKit's own; on Windows muda has nothing
+    // behind them, and Minimize and Maximize are the pair that works.
+    #[cfg(target_os = "macos")]
+    view.append_items(&[
+        &PredefinedMenuItem::fullscreen(None),
+        &PredefinedMenuItem::minimize(None),
+        &PredefinedMenuItem::zoom(None),
+    ])?;
+    #[cfg(not(target_os = "macos"))]
+    view.append_items(&[
+        &PredefinedMenuItem::minimize(None),
+        &PredefinedMenuItem::maximize(None),
+    ])?;
 
+    #[cfg(target_os = "macos")]
     menu.append_items(&[&app, &file, &edit, &go, &code, &git, &view])?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let help = Submenu::with_items("Help", true, &[&about()])?;
+        menu.append_items(&[&file, &edit, &go, &code, &git, &view, &help])?;
+    }
 
     #[cfg(target_os = "macos")]
     menu.init_for_nsapp();
 
     Ok(menu)
+}
+
+/// Whether the platform's menu runs the shortcuts itself.
+///
+/// AppKit consumes a key that matches an accelerator before the window
+/// sees it, so the keyboard handler must not run those shortcuts a second
+/// time. A Win32 menu bar does not: accelerators there only fire if the
+/// message loop translates them, and winit's does not, so the keyboard
+/// handler stays in charge and the menu is for reading and clicking.
+pub fn owns_shortcuts() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Puts the menu bar on a window.
+///
+/// macOS has one menu bar for the whole application, installed by
+/// [`build`]. Windows gives every window its own, so each one has to be
+/// told — including the second and third, which would otherwise have a
+/// bare title bar.
+pub fn attach(menu: &Menu, window: &winit::window::Window) {
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd) = hwnd_of(window) {
+        // Dark, to match the editor rather than the system: the theme here
+        // is this editor's own, and a white strip above a dark window
+        // looks like a window with something else stuck to the top of it.
+        // SAFETY: the handle belongs to a live window this pane owns, and
+        // `detach` is called before the window is dropped.
+        let installed = unsafe { menu.init_for_hwnd_with_theme(hwnd, muda::MenuTheme::Dark) };
+        if let Err(e) = installed {
+            log::warn!("could not put the menu bar on the window: {e}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (menu, window);
+}
+
+/// Takes the menu bar off a window that is about to go away.
+///
+/// muda keeps its own table of which window holds which menu, and Windows
+/// hands out window handles again after they are destroyed — so a closed
+/// window that stayed in that table would be a stale entry a later window
+/// could collide with.
+pub fn detach(menu: &Menu, window: &winit::window::Window) {
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd) = hwnd_of(window) {
+        // SAFETY: called while the window is still alive.
+        let _ = unsafe { menu.remove_for_hwnd(hwnd) };
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (menu, window);
+}
+
+#[cfg(target_os = "windows")]
+fn hwnd_of(window: &winit::window::Window) -> Option<isize> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
+    }
 }
 
 /// Routes menu clicks onto the event loop.

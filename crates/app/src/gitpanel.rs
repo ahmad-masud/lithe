@@ -163,7 +163,7 @@ impl GitPanel {
         }
         if self.has_staged() {
             rows.push(Row::Blank);
-            rows.push(Row::Empty("cmd shift C to commit"));
+            rows.push(Row::Empty(key!(" shift C to commit")));
         }
         rows
     }

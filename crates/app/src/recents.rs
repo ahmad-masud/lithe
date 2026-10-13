@@ -94,18 +94,10 @@ impl Recents {
     }
 }
 
-/// Where the list lives, following each platform's convention.
+/// Where the list lives: beside the settings, in the one directory lithe
+/// keeps anything in.
 fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let dir = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/lithe")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"))
-            .join("lithe")
-    };
-    Some(dir.join("recent-projects"))
+    Some(crate::settings::config_dir()?.join("recent-projects"))
 }
 
 #[cfg(test)]

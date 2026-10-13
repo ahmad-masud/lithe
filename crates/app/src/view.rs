@@ -34,6 +34,11 @@ pub const SIDEBAR_MIN: f32 = 14.0;
 pub const SIDEBAR_MAX: f32 = 70.0;
 /// Grab area for the divider, in physical pixels either side.
 const DIVIDER_GRAB: f32 = 4.0;
+/// How much of a history row, after the hash, the author's name may take,
+/// and the most columns it gets however wide the sidebar is. A name is
+/// read at a glance; a summary is read.
+const AUTHOR_SHARE: f32 = 0.45;
+const AUTHOR_COLS: f32 = 14.0;
 /// Most results the picker will draw, regardless of window height.
 const PICKER_ROWS: usize = 14;
 /// Cells reserved at the right of a tab for its close box.
@@ -295,28 +300,28 @@ fn landing_rows<'a>(recents: &[&'a Path]) -> Vec<LandingRow<'a>> {
         LandingRow {
             row: Row::Action {
                 label: "New buffer",
-                hint: "cmd N",
+                hint: key!(" N"),
             },
             action: Some(LandingAction::NewFile),
         },
         LandingRow {
             row: Row::Action {
                 label: "Open file…",
-                hint: "cmd O",
+                hint: key!(" O"),
             },
             action: Some(LandingAction::OpenFile),
         },
         LandingRow {
             row: Row::Action {
                 label: "Open folder…",
-                hint: "cmd shift O",
+                hint: key!(" shift O"),
             },
             action: Some(LandingAction::OpenFolder),
         },
         LandingRow {
             row: Row::Action {
                 label: "New window",
-                hint: "cmd shift N",
+                hint: key!(" shift N"),
             },
             action: Some(LandingAction::NewWindow),
         },
@@ -344,7 +349,7 @@ fn landing_rows<'a>(recents: &[&'a Path]) -> Vec<LandingRow<'a>> {
         action: None,
     });
     rows.push(LandingRow {
-        row: Row::Footer("cmd shift P  for every command"),
+        row: Row::Footer(key!(" shift P  for every command")),
         action: None,
     });
     rows
@@ -447,6 +452,15 @@ pub struct Layout {
     pub rows: usize,
 }
 
+impl Layout {
+    /// How many whole columns of text fit, with the scrollbar's own
+    /// column kept out of it. What the editor scrolls sideways within.
+    pub fn cols(&self) -> usize {
+        let room = self.width - SCROLLBAR_W - self.text_x;
+        ((room / self.cell.advance).floor() as usize).max(1)
+    }
+}
+
 /// Which pieces of chrome are showing, for layout.
 #[derive(Clone, Copy, Default)]
 pub struct Chrome {
@@ -541,28 +555,32 @@ fn char_col_at_visual(line: RopeSlice<'_>, target: usize, tab: usize, nearest_ed
 // ---- hit testing --------------------------------------------------------
 
 /// Maps a point in physical pixels to a position in the document.
+#[allow(clippy::too_many_arguments)]
 pub fn point_to_char(
     l: &Layout,
     doc: &TextBuffer,
     scroll: f32,
+    scroll_x: f32,
     x: f32,
     y: f32,
     tab: usize,
 ) -> usize {
-    point_to_char_with(l, doc, scroll, x, y, tab, true)
+    point_to_char_with(l, doc, scroll, scroll_x, x, y, tab, true)
 }
 
 /// The character under the pointer, rather than the nearest caret
 /// boundary. What a double click should ask about.
+#[allow(clippy::too_many_arguments)]
 pub fn point_to_char_under(
     l: &Layout,
     doc: &TextBuffer,
     scroll: f32,
+    scroll_x: f32,
     x: f32,
     y: f32,
     tab: usize,
 ) -> usize {
-    point_to_char_with(l, doc, scroll, x, y, tab, false)
+    point_to_char_with(l, doc, scroll, scroll_x, x, y, tab, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -570,6 +588,7 @@ fn point_to_char_with(
     l: &Layout,
     doc: &TextBuffer,
     scroll: f32,
+    scroll_x: f32,
     x: f32,
     y: f32,
     tab: usize,
@@ -579,7 +598,10 @@ fn point_to_char_with(
     // the hit row is found in continuous coordinates and floored once.
     let row = ((y - l.text_y) / l.cell.line_height + scroll.max(0.0)).floor();
     let line = (row.max(0.0) as usize).min(doc.len_lines().saturating_sub(1));
-    let target_col = ((x - l.text_x) / l.cell.advance).round().max(0.0) as usize;
+    // Plus whatever is scrolled off to the left: the column under the
+    // pointer is not the column it would be at rest.
+    let target_col =
+        (((x - l.text_x) / l.cell.advance).round() + scroll_x.max(0.0).round()).max(0.0) as usize;
     let char_col = match doc.line(line) {
         Some(slice) => char_col_at_visual(slice, target_col, tab, nearest_edge),
         None => 0,
@@ -599,6 +621,8 @@ pub enum Hit {
     Status(StatusButton),
     /// The scrollbar track, at a y position.
     Scrollbar(f32),
+    /// The horizontal scrollbar track, at an x position.
+    ScrollbarX(f32),
     /// The draggable edge of the sidebar.
     SidebarDivider,
     /// A fenced block in the preview, by its line index. Clicking one
@@ -689,6 +713,15 @@ pub fn hit_test(l: &Layout, panels: &Panels<'_>, x: f32, y: f32) -> Hit {
     // The scrollbar sits over the right edge of the text area.
     if x >= l.width - SCROLLBAR_W && y >= l.text_y {
         return Hit::Scrollbar(y);
+    }
+    // And the horizontal one over the bottom edge of it, when there is
+    // one — it is drawn only where a line runs off the right.
+    if y >= l.text_y + l.text_h - SCROLLBAR_W
+        && y < l.text_y + l.text_h
+        && x >= l.text_x
+        && h_scrollbar_band(l, panels)
+    {
+        return Hit::ScrollbarX(x);
     }
     if l.tab_h > 0.0 && y < l.tab_h && x >= l.tree_w {
         let labels = workspace.labels();
@@ -989,11 +1022,33 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                         &commit.short,
                         theme.syntax.function,
                     );
+                    // Who made it, between the hash and what they said: a
+                    // history is read for both, and the name is the
+                    // shorter of the two. It takes a share of what is
+                    // left rather than a fixed column, and steps aside
+                    // entirely when the sidebar is too narrow to hold a
+                    // name and a summary at once — the divider is
+                    // draggable, and this is one of the things to drag
+                    // it for.
+                    let columns = l.tree_w / l.cell.advance;
+                    let mut column = 9.0;
+                    let for_author = ((columns - column) * AUTHOR_SHARE).min(AUTHOR_COLS) as usize;
+                    if for_author >= 5 {
+                        scratch.text.clear();
+                        shorten_name(&mut scratch.text, &commit.author, for_author);
+                        f.text(
+                            l.cell.advance * column,
+                            baseline,
+                            &scratch.text,
+                            theme.status_fg,
+                        );
+                        column += for_author as f32 + 1.0;
+                    }
                     scratch.text.clear();
-                    let room = (l.tree_w / l.cell.advance - 10.0).max(6.0) as usize;
+                    let room = (columns - column - 1.0).max(6.0) as usize;
                     truncate_tail(&mut scratch.text, &commit.summary, room);
                     f.text(
-                        l.cell.advance * 9.0,
+                        l.cell.advance * column,
                         baseline,
                         &scratch.text,
                         theme.tree_file,
@@ -1079,7 +1134,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
             None => {
                 // A project is open but no file is: the tree is the
                 // affordance, so this only needs to point at it.
-                let hint = "cmd+P  open a file        cmd+shift+P  commands";
+                let hint = key!("+P  open a file        ", "+shift+P  commands");
                 let x = l
                     .text_x
                     .max((l.width - hint.chars().count() as f32 * l.cell.advance) / 2.0);
@@ -1108,16 +1163,22 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
             // A provisional tab is drawn dimmer even when it is active,
             // so "this will be replaced by the next click" is visible
             // without having to remember how it was opened.
-            let preview = scene
-                .workspace
-                .tabs
-                .get(index)
+            let tab = scene.workspace.tabs.get(index);
+            let preview = tab
                 .and_then(crate::workspace::Tab::editor)
                 .is_some_and(|b| b.preview);
-            let colour = match (active, preview) {
-                (true, false) => theme.fg,
-                (true, true) => theme.status_fg,
-                (false, _) => theme.tree_file,
+            // A diff is the same file in another mode, so its tab is the
+            // file's tab in another colour — the one the gutter marks a
+            // modified line with. The `±` in the label says the same
+            // thing, but a tab is read at a glance and a colour is what
+            // reaches a glance.
+            let diff = tab.is_some_and(|t| t.diff().is_some());
+            let colour = match (active, preview, diff) {
+                (_, _, true) if active => theme.vcs_modified,
+                (_, _, true) => theme.vcs_modified.alpha(0.7),
+                (true, false, _) => theme.fg,
+                (true, true, _) => theme.status_fg,
+                (false, _, _) => theme.tree_file,
             };
             f.text(
                 x0 + 1.0 * l.cell.advance,
@@ -1286,7 +1347,7 @@ pub fn caret_point(l: &Layout, editor: &Editor, tab_width: usize) -> (f32, f32) 
     let line = editor.doc.char_to_line(head);
     let col = head - editor.doc.line_to_char(line);
     let caret_x = match editor.doc.line(line) {
-        Some(slice) => visual_col(slice, col, tab_width) as f32,
+        Some(slice) => visual_col(slice, col, tab_width) as f32 - editor.scroll_x.max(0.0),
         None => 0.0,
     };
     let row = line.saturating_sub(editor.top_line()) as f32;
@@ -1321,10 +1382,12 @@ fn draw_completion(
     }
     let col = head - editor.doc.line_to_char(line);
     let caret_x = match editor.doc.line(line) {
-        Some(slice) => visual_col(slice, col, scene.tab_width) as f32,
+        Some(slice) => visual_col(slice, col, scene.tab_width) as f32 - editor.scroll_x.max(0.0),
         None => 0.0,
     };
-    let x = (l.text_x + caret_x * l.cell.advance).min(l.width - 24.0 * l.cell.advance);
+    let x = (l.text_x + caret_x * l.cell.advance)
+        .max(l.text_x)
+        .min(l.width - 24.0 * l.cell.advance);
     let row = (line - editor.top_line()) as f32;
 
     let widest = completion
@@ -1418,12 +1481,72 @@ pub fn scrollbar_scroll_at(l: &Layout, total_lines: usize, y: f32) -> f32 {
     (offset / travel) * max_scroll
 }
 
-/// How many columns the preview lays out to.
+/// The horizontal scrollbar's track, which is as wide as the text area.
+fn h_track(l: &Layout) -> (f32, f32) {
+    let x = l.text_x;
+    (x, (l.width - SCROLLBAR_W - x).max(0.0))
+}
+
+/// Where the horizontal thumb sits, or `None` when the widest line in
+/// view already fits.
+///
+/// Measured against what is on screen rather than the whole file, for the
+/// same reason the scrolling is: the longest line in a three-million-line
+/// file is not a thing this editor is allowed to go looking for.
+pub fn h_scrollbar_extent(l: &Layout, widest_cols: usize, scroll_x: f32) -> Option<(f32, f32)> {
+    let cols = l.cols() as f32;
+    let total = widest_cols as f32;
+    let (track_x, track_w) = h_track(l);
+    if total <= cols || track_w <= 0.0 {
+        return None;
+    }
+    let fraction = (cols / total).clamp(0.0, 1.0);
+    let width = (track_w * fraction).max(24.0).min(track_w);
+    let max_scroll = (total - cols).max(1.0);
+    let travel = track_w - width;
+    let left = track_x + travel * (scroll_x.max(0.0) / max_scroll).clamp(0.0, 1.0);
+    Some((left, width))
+}
+
+/// Turns an x position on the horizontal scrollbar into a column offset.
+pub fn h_scrollbar_scroll_at(l: &Layout, widest_cols: usize, x: f32) -> f32 {
+    let cols = l.cols() as f32;
+    let total = widest_cols as f32;
+    let max_scroll = (total - cols).max(0.0);
+    let Some((_, width)) = h_scrollbar_extent(l, widest_cols, 0.0) else {
+        return 0.0;
+    };
+    let (track_x, track_w) = h_track(l);
+    let travel = (track_w - width).max(1.0);
+    // By the middle of the thumb, as the vertical one is.
+    let offset = (x - track_x - width / 2.0).clamp(0.0, travel);
+    (offset / travel) * max_scroll
+}
+
+/// Whether the horizontal scrollbar is showing.
+///
+/// The band it occupies floats over the last row of text, so it is only
+/// in the way when there is something to scroll to — and only when the
+/// text area is showing a buffer at all. A preview wraps and a diff has
+/// its own columns; a click along the bottom of either of those is a
+/// click on what is drawn there.
+fn h_scrollbar_band(l: &Layout, panels: &Panels<'_>) -> bool {
+    if panels.preview_open || panels.workspace.diff().is_some() {
+        return false;
+    }
+    let Some(editor) = panels.workspace.active() else {
+        return false;
+    };
+    h_scrollbar_extent(l, editor.widest_visible(l.rows, l.cols()), editor.scroll_x).is_some()
+}
+
+/// How many columns the preview lays out to: the pane it is drawn in.
+///
+/// The document's margins and the cap on its measure come out of this in
+/// [`markdown::column`], which is also what draws it, so the width the
+/// text was wrapped to and the width it is drawn at are one number.
 pub fn preview_columns(l: &Layout) -> usize {
-    // Capped rather than filling the window: a line of prose a hundred and
-    // ten characters wide is hard to track back from the end of.
-    (((l.width - l.text_x - SCROLLBAR_W - 4.0 * l.cell.advance) / l.cell.advance) as usize)
-        .clamp(24, 88)
+    (((l.width - l.tree_w - SCROLLBAR_W) / l.cell.advance) as usize).max(24)
 }
 
 fn draw_context_menu(
@@ -2008,8 +2131,11 @@ fn draw_hover(f: &mut lithe_gpu::Frame<'_>, l: &Layout, hover: &Hover, theme: &T
         };
         let mut pen = left + line.indent as f32 * l.cell.advance;
         for span in &line.spans {
-            let (colour, face) = span_style(span.style, theme);
-            pen = f.text_sized(pen, baseline, &span.text, colour, face, scale);
+            let (colour, face, mut family) = span_style(span.style, theme);
+            if line.is_grid() {
+                family = lithe_gpu::Family::Mono;
+            }
+            pen = f.text_run(pen, baseline, &span.text, colour, face, scale, family);
         }
         row_y += height;
     }
@@ -2022,22 +2148,162 @@ fn draw_hover(f: &mut lithe_gpu::Frame<'_>, l: &Layout, hover: &Hover, theme: &T
 /// like. Structure is carried by weight, colour and — for the top two
 /// heading levels — size; everything else is one size, because a uniform
 /// grid is what makes the rest of the editor cheap.
-fn span_style(style: MdStyle, theme: &Theme) -> (Rgba, lithe_gpu::Face) {
-    use lithe_gpu::Face;
-    match style {
-        MdStyle::Heading(1 | 2) => (theme.fg, Face::Bold),
-        MdStyle::Heading(_) => (theme.syntax.function, Face::Bold),
-        MdStyle::Bold => (theme.fg, Face::Bold),
-        MdStyle::Emphasis => (theme.syntax.keyword, Face::Regular),
-        MdStyle::BoldEmphasis => (theme.syntax.keyword, Face::Bold),
-        MdStyle::Code => (theme.syntax.string, Face::Regular),
-        MdStyle::Quote => (theme.status_fg, Face::Regular),
-        MdStyle::Link => (theme.cursor, Face::Regular),
-        MdStyle::Bullet => (theme.gutter_fg, Face::Regular),
-        MdStyle::Strike => (theme.status_fg, Face::Regular),
-        MdStyle::Divider => (theme.gutter_fg, Face::Regular),
-        MdStyle::Syntax(kind) => (theme.colour(Some(kind)), Face::Regular),
-        MdStyle::Body => (theme.fg, Face::Regular),
+/// What a run of the preview is drawn in: a colour, and the face and
+/// family the layout already measured it with.
+///
+/// Weight and slant carry what they carry in a document, so colour is
+/// free to do less of the work: emphasis is italic rather than violet,
+/// and bold is the one that is brighter. Only the things that are not
+/// prose — code, a link, a table's frame — keep a colour of their own.
+fn span_style(style: MdStyle, theme: &Theme) -> (Rgba, lithe_gpu::Face, lithe_gpu::Family) {
+    let colour = match style {
+        MdStyle::Heading(1 | 2) => theme.fg,
+        MdStyle::Heading(_) => theme.fg,
+        MdStyle::Bold | MdStyle::BoldEmphasis => theme.fg,
+        MdStyle::Emphasis => theme.fg,
+        MdStyle::Code => theme.syntax.string,
+        MdStyle::Quote => theme.status_fg,
+        MdStyle::Link => theme.cursor,
+        MdStyle::Bullet => theme.gutter_fg_active,
+        MdStyle::Strike => theme.status_fg,
+        MdStyle::Divider => theme.gutter_fg,
+        MdStyle::Syntax(kind) => theme.colour(Some(kind)),
+        // A shade quieter than the editor's own text: a page of prose at
+        // full contrast is a page nobody finishes.
+        MdStyle::Body => theme.preview_fg,
+    };
+    (colour, style.face(), style.family())
+}
+
+/// A [`markdown::Measure`] over the frame being drawn, so the column the
+/// preview is laid out in and the column it is drawn in are one number.
+struct Measured<'a, 'f> {
+    frame: &'a lithe_gpu::Frame<'f>,
+}
+
+impl crate::markdown::Measure for Measured<'_, '_> {
+    fn width(&mut self, text: &str, style: MdStyle, scale: MdScale) -> f32 {
+        let cell = self.frame.cell().advance;
+        if cell <= 0.0 {
+            return text.chars().count() as f32;
+        }
+        self.frame.measure(
+            text,
+            style.face(),
+            crate::markdown::Style::size(scale),
+            style.family(),
+        ) / cell
+    }
+}
+
+/// Where the preview's page sits in the window.
+///
+/// One place decides it, because the text was wrapped to these numbers
+/// and a click has to land on the glyph that was drawn.
+struct Page {
+    /// Left edge of the text column, and its width in cells.
+    left: f32,
+    columns: f32,
+    /// Left edge of the page itself, which is where a figure too wide for
+    /// the column starts.
+    margin: f32,
+}
+
+impl Page {
+    /// Where a line's cells begin.
+    ///
+    /// A drawn diagram may be wider than the measure prose is set to; it
+    /// starts at the margin rather than hanging off the right of the
+    /// column.
+    fn origin(&self, line: &MdLine) -> f32 {
+        if line.is_grid() && line_cells(line) > self.columns {
+            self.margin
+        } else {
+            self.left
+        }
+    }
+}
+
+/// The document's column, measured exactly as the layout measured it, and
+/// centred in what is left of the window.
+///
+/// A page of prose with its margins is what the eye reads as a document;
+/// the same words pressed into the corner of a window are a terminal.
+fn preview_page(l: &Layout, measure: &mut dyn crate::markdown::Measure) -> Page {
+    let room = preview_columns(l);
+    let columns = crate::markdown::column(room, measure);
+    // Centred in the window rather than in the text area: the gutter the
+    // editor keeps for line numbers means nothing to a document, and
+    // measuring from it put the page off to one side.
+    let available = l.width - l.tree_w - SCROLLBAR_W;
+    let gutter = ((available - columns * l.cell.advance) / 2.0).max(2.0 * l.cell.advance);
+    Page {
+        left: l.tree_w + gutter,
+        columns,
+        margin: l.tree_w + crate::markdown::margin(room) * l.cell.advance,
+    }
+}
+
+/// How many cells of grid content a line holds, its indent included.
+fn line_cells(line: &MdLine) -> f32 {
+    let text: usize = line.spans.iter().map(|s| s.text.chars().count()).sum();
+    (line.indent + text) as f32
+}
+
+/// Which link, if any, is under a point in the preview.
+///
+/// Measured rather than counted, and measured with the same page and the
+/// same advances the drawing uses: a proportional line has no column to
+/// divide by, so the only honest answer walks the runs.
+pub fn preview_link_at(
+    l: &Layout,
+    lines: &[MdLine],
+    scroll: f32,
+    x: f32,
+    y: f32,
+    measure: &mut dyn crate::markdown::Measure,
+) -> Option<std::sync::Arc<str>> {
+    if x < l.tree_w || y < l.text_y {
+        return None;
+    }
+    let page = preview_page(l, measure);
+    let top = scroll.max(0.0) as usize;
+    let slip = (scroll.max(0.0).fract() * l.cell.line_height).round();
+    let mut row_y = l.text_y + l.cell.line_height - slip;
+    for line in lines.iter().skip(top) {
+        if row_y > l.text_y + l.text_h {
+            break;
+        }
+        let height = line.rows() as f32 * l.cell.line_height;
+        if y >= row_y && y < row_y + height {
+            let mut at = page.origin(line) + line.indent as f32 * l.cell.advance;
+            for span in &line.spans {
+                let width = run_cells(line, span, measure) * l.cell.advance;
+                if x >= at && x < at + width {
+                    return span.href.clone();
+                }
+                at += width;
+            }
+            return None;
+        }
+        row_y += height;
+    }
+    None
+}
+
+/// How wide one run is, in cells.
+///
+/// A line that is set on the grid is drawn in the grid's own face, one
+/// cell per character, whatever the run's style would otherwise measure.
+fn run_cells(
+    line: &MdLine,
+    span: &crate::markdown::Span,
+    measure: &mut dyn crate::markdown::Measure,
+) -> f32 {
+    if line.is_grid() {
+        span.text.chars().count() as f32 * line.scale.width()
+    } else {
+        measure.width(&span.text, span.style, line.scale)
     }
 }
 
@@ -2051,17 +2317,11 @@ fn draw_preview(
     use lithe_gpu::Size;
 
     let top = scroll.max(0.0) as usize;
-    // A margin either side, and above: prose pressed into the corner of a
-    // window is the main thing that made this not look like a document.
-    // Centred, but with a ceiling on the margin: on a wide window the
-    // text was being squeezed into a narrow ribbon with half the screen
-    // empty either side.
-    const MAX_MARGIN_COLS: f32 = 6.0;
-    let columns = preview_columns(l) as f32;
-    let available = l.width - l.text_x - SCROLLBAR_W;
-    let gutter = ((available - columns * l.cell.advance) / 2.0)
-        .clamp(2.0 * l.cell.advance, MAX_MARGIN_COLS * l.cell.advance);
-    let left = l.text_x + gutter;
+    let page = {
+        let mut measure = Measured { frame: f };
+        preview_page(l, &mut measure)
+    };
+    let (left, columns) = (page.left, page.columns);
     let right = left + columns * l.cell.advance;
     let top_margin = l.cell.line_height;
 
@@ -2086,13 +2346,17 @@ fn draw_preview(
         // A heading sits on the lower of its two rows, so the extra row
         // becomes air above it rather than a gap underneath.
         let baseline = y + height - (l.cell.line_height - l.cell.ascent);
+        // Where this line starts, and how far whatever is drawn behind it
+        // runs: the column, or the figure when the figure is wider.
+        let origin = page.origin(line);
+        let behind = (line_cells(line) * l.cell.advance).max(right - left);
 
         // Block decoration goes behind the text.
         match line.block {
             MdBlock::Code | MdBlock::Diagram => f.rect(
-                left - 2.0 * l.cell.advance,
+                origin - 2.0 * l.cell.advance,
                 y,
-                right - left + 4.0 * l.cell.advance,
+                behind + 4.0 * l.cell.advance,
                 height,
                 theme.panel_bg,
             ),
@@ -2102,14 +2366,20 @@ fn draw_preview(
             MdBlock::TableHead => {
                 let cells: usize = line.spans.iter().map(|s| s.text.chars().count()).sum();
                 f.rect(
-                    left + line.indent as f32 * l.cell.advance,
+                    origin + line.indent as f32 * l.cell.advance,
                     y,
                     cells as f32 * l.cell.advance,
                     height,
                     theme.panel_bg,
                 )
             }
-            MdBlock::Quote => f.rect(left - 2.0 * l.cell.advance, y, 2.0, height, theme.gutter_fg),
+            MdBlock::Quote => f.rect(
+                origin - 2.0 * l.cell.advance,
+                y,
+                2.0,
+                height,
+                theme.gutter_fg,
+            ),
             MdBlock::Rule => f.rect(
                 left,
                 y + height / 2.0,
@@ -2124,7 +2394,8 @@ fn draw_preview(
                 1.0,
                 theme.panel_active,
             ),
-            MdBlock::Plain => {}
+            // The frame draws itself, in characters.
+            MdBlock::Table | MdBlock::Plain => {}
         }
 
         // `copy` on the first row of a fenced block, so it is discoverable
@@ -2137,17 +2408,22 @@ fn draw_preview(
         if first_of_block {
             const COPY: &str = "copy";
             f.text(
-                right - COPY.len() as f32 * l.cell.advance,
+                origin + behind - COPY.len() as f32 * l.cell.advance,
                 baseline,
                 COPY,
                 theme.gutter_fg,
             );
         }
 
-        let mut x = left + line.indent as f32 * l.cell.advance;
+        let mut x = origin + line.indent as f32 * l.cell.advance;
         for span in &line.spans {
-            let (colour, face) = span_style(span.style, theme);
-            let next = f.text_sized(x, baseline, &span.text, colour, face, scale);
+            let (colour, face, mut family) = span_style(span.style, theme);
+            // A table's cells and a diagram's characters are drawn where
+            // the layout counted cells for them.
+            if line.is_grid() {
+                family = lithe_gpu::Family::Mono;
+            }
+            let next = f.text_run(x, baseline, &span.text, colour, face, scale, family);
             // A line through or under the run, where colour alone is doing
             // too much work in a single-weight preview.
             let rule = match span.style {
@@ -2158,8 +2434,8 @@ fn draw_preview(
                 _ => None,
             };
             if let Some(offset) = rule {
-                let lead = span.text.len() - span.text.trim_start().len();
-                let from = x + lead as f32 * l.cell.advance;
+                let lead = &span.text[..span.text.len() - span.text.trim_start().len()];
+                let from = x + f.measure(lead, face, scale, family);
                 f.rect(from, y + offset, next - from, 1.0, colour);
             }
             x = next;
@@ -2395,6 +2671,25 @@ fn draw_project_search(
     }
 }
 
+/// Copies a person's name, cut to fit at a word boundary where there is
+/// one.
+///
+/// "Ahmad Masud" in eight columns is "Ahmad", not "Ahmad M…": a given name
+/// is a name, where half a surname is a typo. Only when even that will not
+/// fit does it fall back to cutting mid-word.
+fn shorten_name(out: &mut String, name: &str, room: usize) {
+    if name.chars().count() <= room {
+        out.push_str(name);
+        return;
+    }
+    let first = name.split_whitespace().next().unwrap_or(name);
+    if !first.is_empty() && first.chars().count() <= room {
+        out.push_str(first);
+        return;
+    }
+    truncate_tail(out, name, room);
+}
+
 /// Copies `text`, cutting the end off when it will not fit. The opposite of
 /// `truncate_into`: a matching line is most informative at its start.
 fn truncate_tail(out: &mut String, text: &str, room: usize) {
@@ -2507,6 +2802,21 @@ fn draw_editor(
     let text_right = l.width - SCROLLBAR_W;
     let max_cols = (((text_right - l.text_x) / l.cell.advance).ceil() as usize).max(1);
 
+    // Horizontal scroll. Everything in the text area is drawn `scroll_x`
+    // columns to the left, and what that pushes into the gutter is cut off
+    // there rather than drawn over it.
+    let scroll_x = editor.scroll_x.max(0.0);
+    let first_col = scroll_x as usize;
+    let last_col = first_col + max_cols;
+    let col_x = |col: f32| l.text_x + (col - scroll_x) * l.cell.advance;
+    // A rect between two columns, clipped to the text area — `None` when
+    // none of it is in there.
+    let band = |from: f32, to: f32| {
+        let x0 = col_x(from).max(l.text_x);
+        let x1 = col_x(to).min(text_right);
+        (x1 > x0).then_some((x0, x1 - x0))
+    };
+
     let cursor_lines: Vec<usize> = editor
         .sel
         .cursors()
@@ -2559,13 +2869,9 @@ fn draw_editor(
             let x0 = visual_col(slice, from, tab_width) as f32;
             let x1 = visual_col(slice, to.min(line_chars), tab_width) as f32
                 + if to > line_chars { 1.0 } else { 0.0 };
-            f.rect(
-                l.text_x + x0 * l.cell.advance,
-                row_y(line),
-                (x1 - x0).max(0.0) * l.cell.advance,
-                l.cell.line_height,
-                theme.selection,
-            );
+            if let Some((x, width)) = band(x0, x1.max(x0)) {
+                f.rect(x, row_y(line), width, l.cell.line_height, theme.selection);
+            }
         }
     }
 
@@ -2584,13 +2890,9 @@ fn draw_editor(
         let to = (span.end - line_start).min(doc.line_len_chars(line));
         let x0 = visual_col(slice, from, tab_width) as f32;
         let x1 = visual_col(slice, to, tab_width) as f32;
-        f.rect(
-            l.text_x + x0 * l.cell.advance,
-            row_y(line),
-            (x1 - x0).max(1.0) * l.cell.advance,
-            l.cell.line_height,
-            theme.match_bg,
-        );
+        if let Some((x, width)) = band(x0, (x1 - x0).max(1.0) + x0) {
+            f.rect(x, row_y(line), width, l.cell.line_height, theme.match_bg);
+        }
     }
 
     f.rect(l.tree_w, l.text_y, l.gutter_w, l.text_h, theme.gutter_bg);
@@ -2649,42 +2951,61 @@ fn draw_editor(
 
         // Emit one run of text per colour change, so a line costs a handful
         // of draws rather than one per character.
+        //
+        // Columns are counted from the start of the line even while the
+        // view is scrolled sideways, because a tab's width depends on
+        // where it sits — but only the columns inside the viewport are
+        // ever pushed.
         scratch.text.clear();
         let mut col = 0usize;
-        let mut run_col = 0usize;
+        let mut run_col = first_col;
         let mut run_kind: Option<Kind> = None;
 
         for (index, ch) in slice.chars().enumerate() {
-            if col >= max_cols || ch == '\n' || ch == '\r' {
+            if col >= last_col || ch == '\n' || ch == '\r' {
                 break;
+            }
+            let width = if ch == '\t' {
+                tab_width - (col % tab_width)
+            } else {
+                1
+            };
+            // Entirely to the left of the viewport: count it and move on.
+            if col + width <= first_col {
+                col += width;
+                continue;
             }
             let kind = scratch.styles.get(index).copied().flatten();
             if kind != run_kind && !scratch.text.is_empty() {
                 f.text(
-                    l.text_x + run_col as f32 * l.cell.advance,
+                    col_x(run_col as f32),
                     baseline,
                     &scratch.text,
                     theme.colour(run_kind),
                 );
                 scratch.text.clear();
-                run_col = col;
+                run_col = col.max(first_col);
+            }
+            if scratch.text.is_empty() {
+                run_col = col.max(first_col);
             }
             run_kind = kind;
 
             if ch == '\t' {
-                let stop = tab_width - (col % tab_width);
-                for _ in 0..stop.min(max_cols - col) {
+                // Only the part of the tab that is on screen; one
+                // straddling the left edge is cut short by it.
+                let visible = (col + width).min(last_col) - col.max(first_col);
+                for _ in 0..visible {
                     scratch.text.push(' ');
                 }
-                col += stop;
             } else {
                 scratch.text.push(ch);
-                col += 1;
             }
+            col += width;
         }
         if !scratch.text.is_empty() {
             f.text(
-                l.text_x + run_col as f32 * l.cell.advance,
+                col_x(run_col as f32),
                 baseline,
                 &scratch.text,
                 theme.colour(run_kind),
@@ -2708,12 +3029,12 @@ fn draw_editor(
                 // A gap wide enough that it reads as an annotation and
                 // not as more of the line.
                 let col = end + 4;
-                let room = max_cols.saturating_sub(col);
+                let room = last_col.saturating_sub(col.max(first_col));
                 if room >= 8 {
                     scratch.text.clear();
                     truncate_tail(&mut scratch.text, note, room);
                     f.text(
-                        l.text_x + col as f32 * l.cell.advance,
+                        col_x(col.max(first_col) as f32),
                         row_y(line) + l.cell.ascent,
                         &scratch.text,
                         theme.gutter_fg,
@@ -2780,13 +3101,9 @@ fn draw_editor(
         let to = (mark.end - line_start).min(doc.line_len_chars(line));
         let x0 = visual_col(slice, from, tab_width) as f32;
         let x1 = visual_col(slice, to.max(from + 1), tab_width) as f32;
-        f.rect(
-            l.text_x + x0 * l.cell.advance,
-            y + l.cell.line_height - 2.0,
-            (x1 - x0).max(1.0) * l.cell.advance,
-            2.0,
-            colour,
-        );
+        if let Some((x, width)) = band(x0, (x1 - x0).max(1.0) + x0) {
+            f.rect(x, y + l.cell.line_height - 2.0, width, 2.0, colour);
+        }
     }
 
     // Scrollbar. Only when there is something to scroll, so a short file
@@ -2799,6 +3116,24 @@ fn draw_editor(
             top_y,
             SCROLLBAR_W - 4.0,
             height,
+            theme.scrollbar_thumb,
+        );
+    }
+
+    // The horizontal scrollbar, drawn over the last row rather than
+    // taking a row of its own: it comes and goes with the lines in view,
+    // and a window that lost a row whenever one long line scrolled past
+    // would be worse than one the bar floats over.
+    let widest = editor.widest_visible(l.rows, max_cols);
+    if let Some((left, width)) = h_scrollbar_extent(l, widest, scroll_x) {
+        let y = l.text_y + l.text_h - SCROLLBAR_W;
+        let (track_x, track_w) = h_track(l);
+        f.rect(track_x, y, track_w, SCROLLBAR_W, theme.scrollbar_track);
+        f.rect(
+            left + 2.0,
+            y + 2.0,
+            (width - 4.0).max(1.0),
+            SCROLLBAR_W - 4.0,
             theme.scrollbar_thumb,
         );
     }
@@ -2818,7 +3153,12 @@ fn draw_editor(
         if !scene.caret_visible {
             continue;
         }
-        let x = l.text_x + visual_col(slice, col, tab_width) as f32 * l.cell.advance;
+        let x = col_x(visual_col(slice, col, tab_width) as f32);
+        // A caret scrolled out to the left would otherwise be drawn on
+        // the gutter, where it reads as a caret on another line.
+        if x < l.text_x || x > text_right {
+            continue;
+        }
         f.rect(x, row_y(line), caret_w, l.cell.line_height, theme.cursor);
     }
 }
@@ -3271,7 +3611,7 @@ mod tests {
         let line = doc.char_to_line(offset);
         let col = offset - doc.line_to_char(line);
         let slice = doc.line(line).unwrap();
-        let x = l.text_x + visual_col(slice, col, tab) as f32 * l.cell.advance;
+        let x = l.text_x + (visual_col(slice, col, tab) as f32 - editor.scroll_x) * l.cell.advance;
         let y = l.text_y + (line - editor.top_line()) as f32 * l.cell.line_height
             - editor.pixel_offset(l.cell.line_height);
         (x, y)
@@ -3296,31 +3636,106 @@ mod tests {
             },
         );
 
-        // Whole and fractional scroll positions alike.
+        // Whole and fractional scroll positions alike, on both axes: a
+        // line scrolled sideways is the case where the column under the
+        // pointer is not the column it would be at rest.
         for scroll in [0.0_f32, 1.0, 3.5, 7.25, 12.75, 40.5] {
-            editor.scroll = scroll;
-            let top = editor.top_line();
-            for line in top..(top + 4) {
-                let start = editor.doc.line_to_char(line);
-                for col in [0usize, 3, 6, 11] {
-                    let offset = start + col;
-                    let (x, y) = caret_at(&l, &editor, offset, 4);
-                    // Aim at the middle of the cell, as a person would.
-                    let got = point_to_char(
-                        &l,
-                        &editor.doc,
-                        editor.scroll,
-                        x + l.cell.advance * 0.25,
-                        y + l.cell.line_height * 0.5,
-                        4,
-                    );
-                    assert_eq!(
-                        got, offset,
-                        "scroll {scroll}, line {line}, col {col}: clicked the caret and got {got}"
-                    );
+            for scroll_x in [0.0_f32, 4.0, 9.0] {
+                editor.scroll = scroll;
+                editor.scroll_x = scroll_x;
+                let top = editor.top_line();
+                for line in top..(top + 4) {
+                    let start = editor.doc.line_to_char(line);
+                    for col in [0usize, 3, 6, 11] {
+                        let offset = start + col;
+                        let (x, y) = caret_at(&l, &editor, offset, 4);
+                        // Aim at the middle of the cell, as a person would.
+                        let got = point_to_char(
+                            &l,
+                            &editor.doc,
+                            editor.scroll,
+                            editor.scroll_x,
+                            x + l.cell.advance * 0.25,
+                            y + l.cell.line_height * 0.5,
+                            4,
+                        );
+                        assert_eq!(
+                            got, offset,
+                            "scroll {scroll}/{scroll_x}, line {line}, col {col}:                              clicked the caret and got {got}"
+                        );
+                    }
                 }
             }
         }
+        editor.scroll_x = 0.0;
+    }
+
+    /// The whole point of the horizontal scroll: the text moves left by
+    /// the columns asked for, and the caret moves with it rather than
+    /// staying where it was drawn before.
+    #[test]
+    fn scrolling_sideways_carries_the_caret_with_the_text() {
+        const W: u32 = 900;
+        let Ok(mut r) = Renderer::offscreen(W, 300, 1.0, 16.0) else {
+            return;
+        };
+        // Four columns of indent, so where the ink starts says how far
+        // the line has been scrolled.
+        let line = format!("    {}\n", "x".repeat(400));
+        let mut editor = Editor::new(TextBuffer::from_text(&line), None, 4);
+        // A column that is on screen at rest.
+        editor.sel = Selection::single(12);
+
+        // Laid out with the file open, because an open file has a tab
+        // strip and the text starts under it.
+        let mut ws = Workspace::empty(None);
+        ws.push(editor);
+        let l = layout(&r, &ws, Chrome::default());
+        if let Some(editor) = ws.active_mut() {
+            editor.visible_cols = l.cols();
+        }
+
+        let theme = Theme::default();
+        let mut scratch = Scratch::default();
+        // The first row of text, where the caret is: the only thing
+        // drawn in `theme.cursor` there is the caret itself.
+        let rows = (l.text_y as u32 + 1)..((l.text_y + l.cell.line_height) as u32);
+        // Where the caret is, and where the line's first character is.
+        let mut marks = |scroll_x: f32, ws: &mut Workspace, r: &mut Renderer| {
+            if let Some(editor) = ws.active_mut() {
+                editor.scroll_x = scroll_x;
+            }
+            draw(r, &probe_scene(ws, &theme), &mut scratch);
+            let buf = r.read_rgba().expect("readback");
+            let left = |colour| {
+                find(&buf, W, colour, 0..W, rows.clone())
+                    .1
+                    .map(|(lo, _)| lo)
+            };
+            (left(theme.cursor), left(theme.fg))
+        };
+
+        let (rest_caret, rest_ink) = marks(0.0, &mut ws, &mut r);
+        let (moved_caret, moved_ink) = marks(5.0, &mut ws, &mut r);
+        let shift = (rest_caret.expect("a caret") - moved_caret.expect("a caret")) as f32;
+        assert!(
+            (shift - 5.0 * l.cell.advance).abs() <= 1.0,
+            "five columns of scroll should move the caret five columns left, moved {shift}px"
+        );
+        // The text moves with it — by the four columns of indent, which
+        // is as far as it can before being cut off at the left edge.
+        let ink = (rest_ink.expect("ink") - moved_ink.expect("ink")) as f32;
+        assert!(
+            (ink - 4.0 * l.cell.advance).abs() <= 1.0,
+            "the text should move with the caret: {ink}px"
+        );
+
+        // Scrolled past the caret, it is off the left edge — and drawn
+        // there it would sit on the gutter, pointing at nothing.
+        assert!(
+            marks(40.0, &mut ws, &mut r).0.is_none(),
+            "a caret scrolled off the left should not be drawn on the gutter"
+        );
     }
 
     #[test]
@@ -3594,7 +4009,7 @@ mod tests {
         let l = layout(&r, &ws, Chrome::default());
 
         let hover = |at| Hover {
-            lines: crate::markdown::render("a signature\n", Hover::COLUMNS),
+            lines: crate::markdown::render_boxed("a signature\n", Hover::COLUMNS),
             at,
         };
         // Every corner, including well outside the window.
@@ -3628,7 +4043,7 @@ mod tests {
         let l = layout(&r, &ws, Chrome::default());
 
         let hover = Hover {
-            lines: crate::markdown::render("short\n", Hover::COLUMNS),
+            lines: crate::markdown::render_boxed("short\n", Hover::COLUMNS),
             at: (100.0, l.text_y + l.text_h - 20.0),
         };
         let (_, y, _, height) = hover_bounds(&l, &hover);
@@ -3646,7 +4061,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         let hover = Hover {
-            lines: crate::markdown::render(&long, Hover::COLUMNS),
+            lines: crate::markdown::render_boxed(&long, Hover::COLUMNS),
             at: (0.0, 0.0),
         };
         assert!(
@@ -3749,6 +4164,57 @@ mod tests {
         // Past the last button, the status bar is inert again.
         let past = extents.last().unwrap().1 + 10.0 * l.cell.advance;
         assert!(matches!(hit_test(&l, &panels, past, y), Hit::Elsewhere));
+    }
+
+    /// The horizontal bar is furniture a file only grows when it needs
+    /// it, and grabbing it has to land where it is drawn.
+    #[test]
+    fn a_line_that_fits_grows_no_horizontal_scrollbar() {
+        let Ok(r) = Renderer::offscreen(900, 500, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(&r, &ws, Chrome::default());
+        let cols = l.cols();
+
+        assert!(
+            h_scrollbar_extent(&l, cols, 0.0).is_none(),
+            "a line exactly as wide as the window has nothing to scroll to"
+        );
+        let wide = cols * 3;
+        let (left, width) = h_scrollbar_extent(&l, wide, 0.0).expect("a bar");
+        assert!((left - l.text_x).abs() < 0.5, "at rest it is at the left");
+
+        // Dragging the thumb by its middle to the far right asks for the
+        // last column, and asking for the last column puts it back there.
+        let max = (wide - cols) as f32;
+        let far = h_scrollbar_scroll_at(&l, wide, l.width);
+        assert!((far - max).abs() < 1.0, "{far} should be about {max}");
+        let (end, _) = h_scrollbar_extent(&l, wide, max).expect("a bar");
+        let track_end = l.width - SCROLLBAR_W - width;
+        assert!((end - track_end).abs() < 0.5, "and the thumb is at the end");
+    }
+
+    #[test]
+    fn a_name_is_cut_at_a_word_rather_than_mid_surname() {
+        let mut out = String::new();
+        shorten_name(&mut out, "Ahmad Masud", 20);
+        assert_eq!(out, "Ahmad Masud", "it fits, so it is left alone");
+
+        out.clear();
+        shorten_name(&mut out, "Ahmad Masud", 8);
+        assert_eq!(out, "Ahmad", "the given name, not `Ahmad M…`");
+
+        out.clear();
+        shorten_name(&mut out, "ahmad-masud", 8);
+        assert_eq!(
+            out, "ahmad-m…",
+            "one word, so there is no boundary to cut at"
+        );
+
+        out.clear();
+        shorten_name(&mut out, "", 8);
+        assert_eq!(out, "");
     }
 
     #[test]
@@ -3995,5 +4461,83 @@ mod tests {
             span.unwrap().0.abs_diff(want) <= 2,
             "caret missed the tab stop"
         );
+    }
+
+    #[test]
+    fn a_click_in_the_preview_finds_the_link_under_it() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        // Laid out and hit-tested with the same measure, which is the
+        // whole point: the column a run was wrapped to is the column it
+        // is drawn in, so a click lands on the glyph it looks like.
+        let mut measure = crate::markdown::Cells;
+        let lines = crate::markdown::render_with(
+            "go to [the docs](https://example.com) now\n",
+            preview_columns(&l),
+            &mut measure,
+        );
+        let page = preview_page(&l, &mut measure);
+        // The first row of the document: the page leaves one line of air
+        // above it.
+        let y = l.text_y + 1.5 * l.cell.line_height;
+
+        // "go to " is six cells, so the link runs from the seventh.
+        let on_link = page.left + 8.0 * l.cell.advance;
+        assert_eq!(
+            preview_link_at(&l, &lines, 0.0, on_link, y, &mut measure).as_deref(),
+            Some("https://example.com"),
+        );
+
+        // The words on either side of it go nowhere.
+        let on_prose = page.left + 2.0 * l.cell.advance;
+        assert!(preview_link_at(&l, &lines, 0.0, on_prose, y, &mut measure).is_none());
+        let past_the_end = page.left + 60.0 * l.cell.advance;
+        assert!(preview_link_at(&l, &lines, 0.0, past_the_end, y, &mut measure).is_none());
+        // And neither does the row below the one it is on.
+        let next_row = y + l.cell.line_height;
+        assert!(preview_link_at(&l, &lines, 0.0, on_link, next_row, &mut measure).is_none());
+    }
+
+    #[test]
+    fn a_scrolled_preview_hit_tests_the_rows_it_is_showing() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(
+            &r,
+            &ws,
+            Chrome {
+                sidebar_cols: TREE_COLS,
+                ..Default::default()
+            },
+        );
+        let mut measure = crate::markdown::Cells;
+        let source = "a\n\nb\n\nc\n\n[the link](x.md)\n";
+        let lines = crate::markdown::render_with(source, preview_columns(&l), &mut measure);
+        let at = lines
+            .iter()
+            .position(|line| line.spans.iter().any(|s| s.href.is_some()))
+            .expect("the link's line");
+        let page = preview_page(&l, &mut measure);
+        let y = l.text_y + 1.5 * l.cell.line_height;
+        let x = page.left + 2.0 * l.cell.advance;
+        // Scrolled so that the link's line is the top one.
+        assert_eq!(
+            preview_link_at(&l, &lines, at as f32, x, y, &mut measure).as_deref(),
+            Some("x.md"),
+        );
+        // And not when it is scrolled past.
+        assert!(preview_link_at(&l, &lines, at as f32 + 1.0, x, y, &mut measure).is_none());
     }
 }

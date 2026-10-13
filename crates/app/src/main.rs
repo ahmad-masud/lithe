@@ -1,4 +1,15 @@
 //! lithe — a local-only code editor.
+//!
+//! On Windows this is a windowed subsystem binary: a console program that
+//! opens a window leaves a black console box behind the editor for as long
+//! as it runs. Logging and `--snapshot` still reach a terminal that
+//! launched it — see `attach_to_console`.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+// First, so `key!` is defined before the modules that use it: a
+// macro_rules macro is visible only to what comes after it.
+#[macro_use]
+mod keys;
 
 mod context;
 mod editor;
@@ -178,8 +189,13 @@ struct Pane {
     last_input: std::time::Instant,
     /// True while the scrollbar thumb is being dragged.
     scrubbing: bool,
+    /// The same for the horizontal one.
+    scrubbing_x: bool,
     /// True while the sidebar divider is being dragged.
     resizing: bool,
+    /// Where the pointer was when the middle button last moved the view,
+    /// while it is held down. The document follows the pointer.
+    panning: Option<PhysicalPosition<f64>>,
 }
 
 impl Pane {
@@ -299,6 +315,114 @@ impl Pane {
         self.layout().rows
     }
 
+    /// Scrolls whatever the text area is showing, in lines and columns.
+    ///
+    /// One place, because there are three things it can be — a diff, a
+    /// rendered preview, a buffer — and three ways to ask: the wheel, the
+    /// scrollbar and a middle-button drag. Each of those used to know
+    /// about the editor and nothing else, which is why dragging the
+    /// scrollbar over a preview moved a buffer nobody could see.
+    fn scroll_text(&mut self, lines: f32, columns: f32) {
+        let l = self.layout();
+        let (rows, cols) = (l.rows, l.cols());
+        let diff_rows = self.diff_rows();
+        if let Some(diff) = self.ws.diff_mut() {
+            let max = (diff_rows as f32 - rows as f32 + 2.0).max(0.0);
+            diff.scroll = (diff.scroll - lines).clamp(0.0, max);
+        } else if let Some(preview) = self.preview.as_ref() {
+            // Rows, not lines: a top-level heading is two rows tall, so
+            // counting lines stopped short of the end.
+            let max = (view::preview_rows(preview) as f32 - rows as f32 + 2.0).max(0.0);
+            self.preview_scroll = (self.preview_scroll - lines).clamp(0.0, max);
+        } else if let Some(editor) = self.ws.active_mut() {
+            editor.scroll_by(lines, rows);
+            editor.scroll_x_by(-columns, rows, cols);
+        }
+    }
+
+    /// How many rows the open diff scrolls through.
+    ///
+    /// Side by side it is one row per *pair* of lines, which is fewer
+    /// than the lines: scrolling by lines there runs off the end of a
+    /// diff that is only half as tall as it counted.
+    fn diff_rows(&self) -> usize {
+        let Some(diff) = self.ws.diff() else {
+            return 0;
+        };
+        if self.preview_defaults.side_by_side_diff {
+            lithe_vcs::pair_columns(&diff.lines).len()
+        } else {
+            diff.lines.len()
+        }
+    }
+
+    /// Puts the heading a `#fragment` names at the top of the preview.
+    ///
+    /// `false` when this document has no such heading, which is worth
+    /// saying: a link to one that was renamed is a broken link, and
+    /// scrolling nowhere looks like a click that missed.
+    fn scroll_preview_to(&mut self, fragment: &str) -> bool {
+        let Some(row) = self
+            .preview
+            .as_deref()
+            .and_then(|lines| markdown::anchor(lines, fragment))
+        else {
+            return false;
+        };
+        let rows = self.layout().rows;
+        let total = self.preview.as_deref().map_or(0, view::preview_rows);
+        let max = (total as f32 - rows as f32 + 2.0).max(0.0);
+        self.preview_scroll = (row as f32).clamp(0.0, max);
+        true
+    }
+
+    /// Jumps the horizontal scrollbar to an x position on its track.
+    fn scrub_x_to(&mut self, x: f32) {
+        let l = self.layout();
+        let rows = l.rows;
+        let cols = l.cols();
+        if let Some(editor) = self.ws.active_mut() {
+            let widest = editor.widest_visible(rows, cols);
+            editor.scroll_x = view::h_scrollbar_scroll_at(&l, widest, x);
+            editor.clamp_scroll_x(rows, cols);
+        }
+    }
+
+    /// Jumps the scrollbar of whatever the text area is showing to a y
+    /// position on its track.
+    fn scrub_to(&mut self, y: f32) {
+        let l = self.layout();
+        let rows = l.rows;
+        let total = self.diff_rows();
+        if let Some(diff) = self.ws.diff_mut() {
+            let max = (total as f32 - rows as f32 + 2.0).max(0.0);
+            diff.scroll = view::scrollbar_scroll_at(&l, total, y).clamp(0.0, max);
+        } else if let Some(preview) = self.preview.as_ref() {
+            let total = view::preview_rows(preview);
+            let max = (total as f32 - rows as f32 + 2.0).max(0.0);
+            self.preview_scroll = view::scrollbar_scroll_at(&l, total, y).clamp(0.0, max);
+        } else {
+            let total = self.ws.active().map(|e| e.doc.len_lines()).unwrap_or(0);
+            if let Some(editor) = self.ws.active_mut() {
+                editor.scroll = view::scrollbar_scroll_at(&l, total, y);
+                editor.clamp_scroll(rows);
+            }
+        }
+    }
+
+    /// Tells the active editor how wide the window it is being drawn into
+    /// is, so moving the caret can scroll sideways to keep up with it.
+    ///
+    /// Done here because this is the moment the answer is known: the
+    /// width depends on the sidebar, the gutter and the font, none of
+    /// which the editor can see from where it sits.
+    fn note_viewport(&mut self) {
+        let cols = self.layout().cols();
+        if let Some(editor) = self.ws.active_mut() {
+            editor.visible_cols = cols;
+        }
+    }
+
     fn redraw(&self) {
         self.window.request_redraw();
     }
@@ -388,7 +512,7 @@ impl Pane {
     /// Replaces the project. Opening a folder starts fresh rather than
     /// piling a second project's files on top of the first.
     fn open_folder(&mut self, folder: PathBuf) {
-        let root = folder.canonicalize().unwrap_or(folder);
+        let root = real_path(&folder);
         self.repo = lithe_vcs::Repo::discover(&root);
         self.hunks_for = None;
         self.ws = Workspace::empty(Some(root.clone()));
@@ -645,7 +769,12 @@ impl Pane {
             return;
         }
         let source = editor.doc.rope().to_string();
-        self.preview = Some(markdown::render(&source, columns));
+        // Measured with the renderer that will draw it, so a line wraps
+        // where it is actually going to run out of room.
+        let mut measure = Measured {
+            renderer: &self.renderer,
+        };
+        self.preview = Some(markdown::render_with(&source, columns, &mut measure));
         self.preview_for = Some(key);
     }
 
@@ -817,6 +946,7 @@ impl Pane {
     }
 
     fn draw(&mut self, theme: &Theme, recents: &[&Path], autosave: bool) {
+        self.note_viewport();
         self.refresh_highlights();
         self.refresh_find_matches();
         self.refresh_hunks();
@@ -898,6 +1028,45 @@ impl Pane {
             tab_width: TAB_WIDTH,
         };
         view::draw(renderer, &scene, scratch);
+    }
+}
+
+/// A [`markdown::Measure`] backed by the renderer the preview is drawn
+/// with.
+///
+/// Widths come back in body cells, which is the unit the layout is in:
+/// the renderer answers in pixels, and one cell is one cell of the grid
+/// the window is otherwise built on.
+struct Measured<'a> {
+    renderer: &'a Renderer,
+}
+
+impl markdown::Measure for Measured<'_> {
+    fn width(&mut self, text: &str, style: markdown::Style, scale: markdown::Scale) -> f32 {
+        let cell = self.renderer.cell().advance;
+        if cell <= 0.0 {
+            return text.chars().count() as f32;
+        }
+        let pixels = self.renderer.measure(
+            text,
+            style.face(),
+            markdown::Style::size(scale),
+            style.family(),
+        );
+        pixels / cell
+    }
+}
+
+/// Whether the platform's command modifier is held.
+///
+/// macOS puts the editing shortcuts on Command and leaves Control to the
+/// terminal conventions; Windows and Linux put them on Control. One key per
+/// platform, read here so the shortcut table below can be written once.
+fn command_held(modifiers: ModifiersState) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.control_key()
     }
 }
 
@@ -1173,7 +1342,15 @@ impl App {
         if !self.lsp.is_running(language) {
             return;
         }
-        let under = view::point_to_char_under(&l, &editor.doc, editor.scroll, x, y, TAB_WIDTH);
+        let under = view::point_to_char_under(
+            &l,
+            &editor.doc,
+            editor.scroll,
+            editor.scroll_x,
+            x,
+            y,
+            TAB_WIDTH,
+        );
         // Past the end of a line there is no word to ask about.
         if under >= editor.doc.len_chars() {
             return;
@@ -1219,7 +1396,7 @@ impl App {
                 match text {
                     Some(text) => {
                         pane.hover = Some(view::Hover {
-                            lines: markdown::render(&text, view::Hover::COLUMNS),
+                            lines: markdown::render_boxed(&text, view::Hover::COLUMNS),
                             at,
                         })
                     }
@@ -1693,6 +1870,23 @@ impl App {
         let attrs = Window::default_attributes()
             .with_title("lithe")
             .with_inner_size(LogicalSize::new(1200.0, 800.0));
+        // The title bar, Alt-Tab and the taskbar each ask the window for an
+        // icon, and a window that has none is drawn with the generic one
+        // even though the .exe behind it has a perfectly good icon. It is
+        // the same icon: resource 1, put there by `build.rs`.
+        #[cfg(target_os = "windows")]
+        let attrs = {
+            use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+            match winit::window::Icon::from_resource(1, None) {
+                Ok(icon) => attrs
+                    .with_window_icon(Some(icon.clone()))
+                    .with_taskbar_icon(Some(icon)),
+                Err(e) => {
+                    log::warn!("no icon in this build: {e}");
+                    attrs
+                }
+            }
+        };
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -1700,6 +1894,12 @@ impl App {
                 return;
             }
         };
+        // Before the renderer: on Windows the menu bar is part of the
+        // window and takes a row of it, so adding it afterwards would
+        // size the surface to a client area that is about to shrink.
+        if let Some(menu) = self._menu.as_ref() {
+            menu::attach(menu, &window);
+        }
 
         let renderer = match self.panes.values().next() {
             Some(existing) => existing.renderer.new_sharing(window.clone()),
@@ -1719,7 +1919,7 @@ impl App {
         let (ws, tree) = match arg {
             // A directory is a project: show the tree, open nothing yet.
             Some(path) if path.is_dir() => {
-                let root = path.canonicalize().unwrap_or(path);
+                let root = real_path(&path);
                 self.recents.remember(&root);
                 (Workspace::empty(Some(root.clone())), Some(Tree::new(root)))
             }
@@ -1729,7 +1929,8 @@ impl App {
                 let root = path
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
-                    .and_then(|p| p.canonicalize().ok());
+                    .map(real_path)
+                    .filter(|p| p.is_absolute());
                 let mut ws = Workspace::empty(root);
                 match Editor::open(&path, TAB_WIDTH) {
                     Ok(editor) => ws.push(editor),
@@ -1794,7 +1995,9 @@ impl App {
             last_text_click: None,
             last_input: std::time::Instant::now(),
             scrubbing: false,
+            scrubbing_x: false,
             resizing: false,
+            panning: None,
         };
         pane.retitle();
         // Ask for the first frame. Drawing is damage-driven and the loop
@@ -1858,7 +2061,9 @@ impl App {
     /// buffer, which exists only in memory until it is saved.
     fn new_file(&mut self) {
         let Some(pane) = self.pane() else { return };
-        let mut dialog = rfd::FileDialog::new().set_file_name("untitled.txt");
+        let mut dialog = rfd::FileDialog::new()
+            .set_parent(&*pane.window)
+            .set_file_name("untitled.txt");
         if let Some(root) = &pane.ws.root {
             dialog = dialog.set_directory(root);
         }
@@ -1881,7 +2086,7 @@ impl App {
         let Some(editor) = pane.ws.active() else {
             return;
         };
-        let mut dialog = rfd::FileDialog::new();
+        let mut dialog = rfd::FileDialog::new().set_parent(&*pane.window);
         if let Some(directory) = editor
             .path
             .as_deref()
@@ -1921,7 +2126,11 @@ impl App {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "This buffer".to_string());
-            match confirm_discard(&name) {
+            // The dialog is owned by this window, so the platform keeps it
+            // in front of the editor rather than letting it fall behind
+            // one that is not answering while the dialog is up.
+            let window = pane.window.clone();
+            match confirm_discard(&name, &window) {
                 Decision::Cancel => return false,
                 Decision::Save => {
                     if let Some(pane) = self.pane_mut() {
@@ -1984,6 +2193,11 @@ impl App {
                 return false;
             }
         }
+        // While the window is still here to be taken off, which on Windows
+        // is where the menu bar lives.
+        if let (Some(menu), Some(pane)) = (self._menu.as_ref(), self.panes.get(&id)) {
+            menu::detach(menu, &pane.window);
+        }
         self.panes.remove(&id);
         if self.focused == Some(id) {
             self.focused = self.panes.keys().copied().next();
@@ -2000,8 +2214,13 @@ impl App {
 
         match command {
             Command::NewWindow => {
-                let root = self.pane().and_then(|p| p.ws.root.clone());
-                self.open_window(el, root);
+                // Empty, on the landing page. A new window is where you
+                // go to work on something else: opening it on the
+                // project you are already in gives you a second view of
+                // that one, which is the thing you did not ask for — and
+                // the landing page is one click from any project you
+                // have had open, including this one.
+                self.open_window(el, None);
                 return;
             }
             Command::GotoDefinition => {
@@ -2134,7 +2353,7 @@ impl App {
                 pane.retitle();
             }
             Command::OpenFileDialog => {
-                let mut dialog = rfd::FileDialog::new();
+                let mut dialog = rfd::FileDialog::new().set_parent(&*pane.window);
                 if let Some(root) = &pane.ws.root {
                     dialog = dialog.set_directory(root);
                 }
@@ -2143,12 +2362,12 @@ impl App {
                 }
             }
             Command::OpenFolderDialog => {
-                let mut dialog = rfd::FileDialog::new();
+                let mut dialog = rfd::FileDialog::new().set_parent(&*pane.window);
                 if let Some(root) = &pane.ws.root {
                     dialog = dialog.set_directory(root);
                 }
                 if let Some(folder) = dialog.pick_folder() {
-                    let root = folder.canonicalize().unwrap_or(folder);
+                    let root = real_path(&folder);
                     recents.remember(&root);
                     pane.open_folder(root);
                 }
@@ -2383,8 +2602,8 @@ impl App {
             CtxAction::Trash => self.trash(target),
 
             // --- shelling out ---
-            CtxAction::RevealInFinder => self.shell("open", &["-R"], target),
-            CtxAction::OpenInDefaultApp => self.shell("open", &[], target),
+            CtxAction::RevealInFinder => self.reveal(target),
+            CtxAction::OpenInDefaultApp => self.open_in_default_app(target),
             CtxAction::OpenInTerminal => {
                 let dir = target
                     .as_deref()
@@ -2396,7 +2615,7 @@ impl App {
                         }
                     })
                     .or(root);
-                self.shell("open", &["-a", "Terminal"], dir);
+                self.open_in_terminal(dir);
             }
 
             // --- clipboard ---
@@ -2575,7 +2794,12 @@ impl App {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let confirmed = rfd::MessageDialog::new()
+        let window = self.pane().map(|pane| pane.window.clone());
+        let mut dialog = rfd::MessageDialog::new();
+        if let Some(window) = window.as_deref() {
+            dialog = dialog.set_parent(window);
+        }
+        let confirmed = dialog
             .set_level(rfd::MessageLevel::Warning)
             .set_title("Delete")
             .set_description(format!("Delete {name} permanently? This cannot be undone."))
@@ -2610,22 +2834,167 @@ impl App {
         self.put_on_clipboard(text, "trimmed selection");
     }
 
+    /// Shows a file where the system browses files, selected.
+    fn reveal(&mut self, target: Option<PathBuf>) {
+        #[cfg(target_os = "macos")]
+        self.shell("open", &["-R"], target);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        self.shell("xdg-open", &[], target);
+
+        // `/select,<path>` is one argument, not two: Explorer reads the
+        // path as part of the switch. It also exits non-zero having done
+        // exactly what was asked, so only a failure to start it is worth
+        // reporting — which is all `hand_off` reports.
+        #[cfg(target_os = "windows")]
+        {
+            let Some(path) = target else {
+                self.say("nothing to open");
+                return;
+            };
+            let mut select = std::ffi::OsString::from("/select,");
+            select.push(&path);
+            let mut command = spawnable("explorer");
+            command.arg(select);
+            self.hand_off("explorer", command);
+        }
+    }
+
+    /// Opens a file with whatever the system opens it with.
+    fn open_in_default_app(&mut self, target: Option<PathBuf>) {
+        #[cfg(target_os = "macos")]
+        self.shell("open", &[], target);
+        // `start` is a shell builtin rather than a program, and the empty
+        // string is the window title it would otherwise read the path as.
+        #[cfg(target_os = "windows")]
+        self.shell("cmd", &["/c", "start", ""], target);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        self.shell("xdg-open", &[], target);
+    }
+
+    /// Follows a link clicked in the Markdown preview.
+    ///
+    /// Three kinds, because a README holds three kinds. A url goes to
+    /// whatever opens urls. A `#fragment` is a place in this document.
+    /// Anything else is a path beside the file being read, which is how
+    /// a README points at the rest of its own repository — so that one
+    /// opens in the editor rather than in a browser.
+    fn follow_link(&mut self, href: &str) {
+        let target = href.trim();
+        if target.is_empty() {
+            return;
+        }
+        if let Some(fragment) = target.strip_prefix('#') {
+            let found = self
+                .pane_mut()
+                .is_some_and(|pane| pane.scroll_preview_to(fragment));
+            if !found {
+                self.say(&format!("no heading called “{fragment}”"));
+            }
+            if let Some(pane) = self.pane() {
+                pane.redraw();
+            }
+            return;
+        }
+        if is_url(target) {
+            self.hand_off(target, url_opener(target));
+            return;
+        }
+        // `guide.md#writing` is a file and a place in it.
+        let (relative, fragment) = match target.split_once('#') {
+            Some((path, fragment)) => (path, Some(fragment.to_string())),
+            None => (target, None),
+        };
+        let Some(pane) = self.pane_mut() else {
+            return;
+        };
+        // Beside the file the link was written in, as every other
+        // renderer of it resolves one; the project root when the buffer
+        // has no path of its own yet.
+        let base = pane
+            .ws
+            .active()
+            .and_then(|editor| editor.path.as_deref())
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| pane.search_root());
+        let path = base.join(unescape(relative));
+        if !path.exists() {
+            let missing = relative.to_string();
+            self.say(&format!("{missing} is not here"));
+            if let Some(pane) = self.pane() {
+                pane.redraw();
+            }
+            return;
+        }
+        if path.is_dir() {
+            // A folder is not a buffer, and replacing the project
+            // because a link was clicked would be a surprise.
+            self.reveal(Some(real_path(&path)));
+            return;
+        }
+        pane.open_path(real_path(&path));
+        // A document arrived at through a link starts at its own top,
+        // not where the last one was left.
+        pane.preview_scroll = 0.0;
+        if let Some(fragment) = fragment {
+            // The file that just opened has its own preview, and the
+            // fragment is a place in that one.
+            pane.refresh_preview();
+            pane.scroll_preview_to(&fragment);
+        }
+        pane.redraw();
+    }
+
+    /// Opens a terminal in a directory.
+    fn open_in_terminal(&mut self, dir: Option<PathBuf>) {
+        #[cfg(target_os = "macos")]
+        self.shell("open", &["-a", "Terminal"], dir);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        self.shell("x-terminal-emulator", &[], dir);
+
+        // Windows Terminal is what Windows 11 ships and `-d` is how it
+        // takes a directory. A machine that has had it removed still has
+        // `cmd`, which takes the directory as its own instead.
+        #[cfg(target_os = "windows")]
+        {
+            let Some(dir) = dir else {
+                self.say("nothing to open");
+                return;
+            };
+            let mut terminal = spawnable("wt");
+            terminal.arg("-d").arg(&dir);
+            if terminal.status().is_ok() {
+                return;
+            }
+            let mut fallback = spawnable("cmd");
+            fallback.args(["/c", "start", "cmd"]).current_dir(&dir);
+            self.hand_off("a terminal", fallback);
+        }
+    }
+
     /// Runs a command on a path, reporting whatever it says went wrong.
     fn shell(&mut self, program: &str, args: &[&str], target: Option<PathBuf>) {
         let Some(path) = target else {
-            if let Some(pane) = self.pane_mut() {
-                pane.status = Some("nothing to open".into());
-            }
+            self.say("nothing to open");
             return;
         };
-        let result = std::process::Command::new(program)
-            .args(args)
-            .arg(&path)
-            .status();
-        if let Err(e) = result {
-            if let Some(pane) = self.pane_mut() {
-                pane.status = Some(format!("could not run {program}: {e}"));
-            }
+        let mut command = spawnable(program);
+        command.args(args).arg(&path);
+        self.hand_off(program, command);
+    }
+
+    /// Runs something whose job is to hand the path to another program,
+    /// saying so if it could not be started at all.
+    fn hand_off(&mut self, what: &str, mut command: std::process::Command) {
+        if let Err(e) = command.status() {
+            self.say(&format!("could not run {what}: {e}"));
+        }
+    }
+
+    /// Puts one line in the status bar.
+    fn say(&mut self, message: &str) {
+        if let Some(pane) = self.pane_mut() {
+            pane.status = Some(message.to_string());
         }
     }
 
@@ -2698,7 +3067,7 @@ impl App {
                     path: path.clone(),
                     backup,
                 });
-                format!("moved {name} to Trash")
+                format!("moved {name} to {}", keys::TRASH)
             }
             Err(e) => format!("could not trash: {e}"),
         };
@@ -2733,6 +3102,16 @@ impl App {
                 .map(FileOp::label)
                 .unwrap_or("")
                 .into(),
+        };
+        // Before the pane is borrowed, since the answer is the language
+        // server's rather than the pane's.
+        let goes_to = {
+            let language = self
+                .panes
+                .get(&id)
+                .and_then(|pane| pane.ws.active())
+                .and_then(|editor| editor.language_name());
+            self.lsp.goes_to(language)
         };
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
@@ -2783,6 +3162,7 @@ impl App {
                     editor.is_some_and(|e| !e.sel.primary().is_empty()),
                     pane.repo.is_some(),
                     preview,
+                    goes_to,
                 )
             }
             _ => return,
@@ -3105,7 +3485,7 @@ impl App {
     /// every editor does and what stops a search query landing in the file.
     fn on_find_key(&mut self, event: &winit::event::KeyEvent) -> bool {
         let shift = self.modifiers.shift_key();
-        let cmd = self.modifiers.super_key();
+        let cmd = command_held(self.modifiers);
         let Some(pane) = self.pane_mut() else {
             return false;
         };
@@ -3323,9 +3703,30 @@ impl App {
     /// Editor keys. Returns true when a redraw is needed.
     fn on_key(&mut self, el: &ActiveEventLoop, event: &winit::event::KeyEvent) -> bool {
         let shift = self.modifiers.shift_key();
-        let cmd = self.modifiers.super_key();
+        let cmd = command_held(self.modifiers);
         let alt = self.modifiers.alt_key();
         let control = self.modifiers.control_key();
+
+        // The two bindings that are on Control everywhere, including where
+        // Control is also the command modifier — so they are read before
+        // the command layer rather than after it, which is where they used
+        // to sit when only macOS was in question.
+        if control {
+            // Ctrl+Space asks for completions, the near-universal binding.
+            if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Space)) {
+                self.ask_lsp(Awaiting::Completion);
+                return true;
+            }
+            // Ctrl+Tab cycles buffers.
+            if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Tab)) {
+                if let Some(pane) = self.pane_mut() {
+                    pane.ws.cycle(if shift { -1 } else { 1 });
+                    pane.retitle();
+                    pane.apply_preview_default();
+                }
+                return true;
+            }
+        }
 
         // Command layer first, so shortcuts never fall through to text.
         //
@@ -3417,23 +3818,6 @@ impl App {
         if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F12)) {
             self.run_command(el, Command::GotoDefinition);
             return true;
-        }
-        // Ctrl+Space asks for completions, the near-universal binding.
-        if control && matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Space)) {
-            self.ask_lsp(Awaiting::Completion);
-            return true;
-        }
-
-        // Ctrl+Tab cycles buffers.
-        if control {
-            if let Key::Named(NamedKey::Tab) = event.logical_key.as_ref() {
-                if let Some(pane) = self.pane_mut() {
-                    pane.ws.cycle(if shift { -1 } else { 1 });
-                    pane.retitle();
-                    pane.apply_preview_default();
-                }
-                return true;
-            }
         }
 
         let Some(pane) = self.pane_mut() else {
@@ -3544,7 +3928,7 @@ impl App {
     fn on_click(&mut self, el: &ActiveEventLoop) {
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
-        let cmd = self.modifiers.super_key();
+        let cmd = command_held(self.modifiers);
         let live: Vec<PathBuf> = self
             .recents
             .live()
@@ -3556,6 +3940,7 @@ impl App {
         // Chosen inside the pane borrow, acted on after it ends.
         let mut landing = None;
         let mut jump = false;
+        let mut link = None;
         let mut status_click = None;
         let mut setting_click = None;
         let mut context_choice = None;
@@ -3571,6 +3956,16 @@ impl App {
         pane.dismiss_hover();
 
         let hit = view::hit_test(&l, &pane.panels(&live), x, y);
+        // A link in the preview takes the click before the block it sits
+        // in does, so that a link inside a fenced block is still a link.
+        if matches!(hit, Hit::Elsewhere | Hit::PreviewCode(_)) {
+            if let Some(lines) = pane.preview.as_deref() {
+                let mut measure = Measured {
+                    renderer: &pane.renderer,
+                };
+                link = view::preview_link_at(&l, lines, pane.preview_scroll, x, y, &mut measure);
+            }
+        }
         // Any click closes the menu, whether or not it chose something:
         // while one is open `hit_test` answers only about the menu, so a
         // click outside it would otherwise land nowhere and leave it up.
@@ -3578,6 +3973,8 @@ impl App {
         let had_menu = menu_choice.is_some();
 
         match hit {
+            // Handled below, once the pane is no longer borrowed.
+            _ if link.is_some() => {}
             Hit::Status(button) => status_click = Some(button),
             Hit::Landing(action) => landing = Some(action),
             Hit::Tree(row) => {
@@ -3653,7 +4050,15 @@ impl App {
                 let Some(editor) = pane.ws.active_mut() else {
                     return;
                 };
-                let at = view::point_to_char(&l, &editor.doc, editor.scroll, x, y, TAB_WIDTH);
+                let at = view::point_to_char(
+                    &l,
+                    &editor.doc,
+                    editor.scroll,
+                    editor.scroll_x,
+                    x,
+                    y,
+                    TAB_WIDTH,
+                );
 
                 // A run of clicks has to stay in roughly one place; moving
                 // across the file between them is two separate clicks.
@@ -3670,8 +4075,15 @@ impl App {
                 if count > 1 && !alt && !shift {
                     // Double and triple click ask about the character the
                     // pointer is over, not the nearest caret boundary.
-                    let under =
-                        view::point_to_char_under(&l, &editor.doc, editor.scroll, x, y, TAB_WIDTH);
+                    let under = view::point_to_char_under(
+                        &l,
+                        &editor.doc,
+                        editor.scroll,
+                        editor.scroll_x,
+                        x,
+                        y,
+                        TAB_WIDTH,
+                    );
                     let span = if count == 2 {
                         editor.doc.word_at(under)
                     } else {
@@ -3804,17 +4216,19 @@ impl App {
             }
             Hit::SidebarDivider => pane.resizing = true,
             Hit::Scrollbar(y) => {
-                let rows = l.rows;
-                let total = pane.ws.active().map(|e| e.doc.len_lines()).unwrap_or(0);
-                if let Some(editor) = pane.ws.active_mut() {
-                    editor.scroll = view::scrollbar_scroll_at(&l, total, y);
-                    editor.clamp_scroll(rows);
-                }
+                pane.scrub_to(y);
                 pane.scrubbing = true;
+            }
+            Hit::ScrollbarX(x) => {
+                pane.scrub_x_to(x);
+                pane.scrubbing_x = true;
             }
             Hit::Elsewhere => {}
         }
 
+        if let Some(href) = link {
+            self.follow_link(&href);
+        }
         if let Some(action) = landing {
             self.run_landing(el, action);
         }
@@ -3982,9 +4396,24 @@ impl ApplicationHandler<Wake> for App {
             // ask for one — a keystroke, or the pointer arriving. Run
             // from a terminal the pointer was usually already over the
             // window, which is why this looked fixed.
+            // Coming back is also the moment to look at the disk again.
+            //
+            // Anything that changes a project from outside the editor —
+            // a `git pull`, a branch switch, a build — happens while the
+            // window is not the one being typed into, and you find out
+            // by coming back to it. Re-reading here is what a watcher
+            // would be for, without a thread, a dependency, or a queue
+            // of events arriving when nobody is looking: the tree reads
+            // only the directories that are expanded, so this costs what
+            // drawing it costs.
             WindowEvent::Focused(true) => {
                 self.focused = Some(id);
-                if let Some(pane) = self.panes.get(&id) {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.refresh_tree();
+                    // HEAD may be a different commit now, so the gutter's
+                    // answer about this file is about the wrong one.
+                    pane.hunks_for = None;
+                    pane.blame_for = None;
                     pane.redraw();
                 }
             }
@@ -4069,23 +4498,57 @@ impl ApplicationHandler<Wake> for App {
                 }
                 pane.pointer_moved = std::time::Instant::now();
 
-                pane.window.set_cursor(match over {
-                    // The new side of an editable diff is the buffer, so
-                    // it gets the buffer's cursor.
-                    Hit::Text | Hit::DiffText { .. } => winit::window::CursorIcon::Text,
-                    Hit::Landing(_)
-                    | Hit::Tab(_)
-                    | Hit::TabClose(_)
-                    | Hit::Tree(_)
-                    | Hit::GitRow(_)
-                    | Hit::GitStage(_)
-                    | Hit::GitCommit(_)
-                    | Hit::GitMode(_)
-                    | Hit::Status(_) => winit::window::CursorIcon::Pointer,
-                    Hit::SidebarDivider => winit::window::CursorIcon::ColResize,
-                    _ => winit::window::CursorIcon::Default,
+                // A link under the pointer makes it a hand, which is the
+                // only thing that says a drawn document can be clicked.
+                let on_link = match pane.preview.as_deref() {
+                    Some(lines) if matches!(over, Hit::Elsewhere | Hit::PreviewCode(_)) => {
+                        let mut measure = Measured {
+                            renderer: &pane.renderer,
+                        };
+                        view::preview_link_at(&l, lines, pane.preview_scroll, x, y, &mut measure)
+                            .is_some()
+                    }
+                    _ => false,
+                };
+
+                // While the wheel is held the pointer is a pan handle,
+                // whatever it happens to be over.
+                pane.window.set_cursor(if pane.panning.is_some() {
+                    winit::window::CursorIcon::AllScroll
+                } else if on_link {
+                    winit::window::CursorIcon::Pointer
+                } else {
+                    match over {
+                        // The new side of an editable diff is the buffer,
+                        // so it gets the buffer's cursor.
+                        Hit::Text | Hit::DiffText { .. } => winit::window::CursorIcon::Text,
+                        Hit::Landing(_)
+                        | Hit::Tab(_)
+                        | Hit::TabClose(_)
+                        | Hit::Tree(_)
+                        | Hit::GitRow(_)
+                        | Hit::GitStage(_)
+                        | Hit::GitCommit(_)
+                        | Hit::GitMode(_)
+                        | Hit::Status(_) => winit::window::CursorIcon::Pointer,
+                        Hit::SidebarDivider => winit::window::CursorIcon::ColResize,
+                        _ => winit::window::CursorIcon::Default,
+                    }
                 });
 
+                // Panning first: it is a button being held, like the
+                // others below, and it takes the pointer with it.
+                if let Some(from) = pane.panning {
+                    let dx = (position.x - from.x) as f32;
+                    let dy = (position.y - from.y) as f32;
+                    pane.panning = Some(position);
+                    // The document follows the pointer rather than
+                    // running away from it: dragging down pulls the text
+                    // down, the way dragging a sheet of paper does.
+                    pane.scroll_text(dy / l.cell.line_height, dx / l.cell.advance);
+                    pane.redraw();
+                    return;
+                }
                 if pane.resizing {
                     pane.sidebar_cols =
                         (x / l.cell.advance).clamp(view::SIDEBAR_MIN, view::SIDEBAR_MAX);
@@ -4093,12 +4556,12 @@ impl ApplicationHandler<Wake> for App {
                     return;
                 }
                 if pane.scrubbing {
-                    let rows = l.rows;
-                    let total = pane.ws.active().map(|e| e.doc.len_lines()).unwrap_or(0);
-                    if let Some(editor) = pane.ws.active_mut() {
-                        editor.scroll = view::scrollbar_scroll_at(&l, total, y);
-                        editor.clamp_scroll(rows);
-                    }
+                    pane.scrub_to(y);
+                    pane.redraw();
+                    return;
+                }
+                if pane.scrubbing_x {
+                    pane.scrub_x_to(x);
                     pane.redraw();
                     return;
                 }
@@ -4106,9 +4569,37 @@ impl ApplicationHandler<Wake> for App {
                     return;
                 }
                 if let Some(editor) = pane.ws.active_mut() {
-                    let at = view::point_to_char(&l, &editor.doc, editor.scroll, x, y, TAB_WIDTH);
+                    let at = view::point_to_char(
+                        &l,
+                        &editor.doc,
+                        editor.scroll,
+                        editor.scroll_x,
+                        x,
+                        y,
+                        TAB_WIDTH,
+                    );
                     editor.sel.drag_primary_to(at);
                     pane.redraw();
+                }
+            }
+
+            // The wheel pressed down and dragged pans the view, which is
+            // the one way to scroll sideways that needs no keyboard and no
+            // trackpad. Not the auto-scroll that Windows does on the same
+            // button: that keeps moving while the pointer sits still,
+            // which means a clock ticking frames out, and this editor
+            // redraws on damage and nothing else.
+            WindowEvent::MouseInput {
+                button: MouseButton::Middle,
+                state,
+                ..
+            } => {
+                self.focused = Some(id);
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.panning = match state {
+                        ElementState::Pressed => Some(pane.pointer),
+                        ElementState::Released => None,
+                    };
                 }
             }
 
@@ -4149,6 +4640,7 @@ impl ApplicationHandler<Wake> for App {
                         if let Some(pane) = self.panes.get_mut(&id) {
                             pane.dragging = false;
                             pane.scrubbing = false;
+                            pane.scrubbing_x = false;
                             pane.resizing = false;
                         }
                     }
@@ -4162,19 +4654,29 @@ impl ApplicationHandler<Wake> for App {
                 let Some(pane) = self.panes.get_mut(&id) else {
                     return;
                 };
-                let line_height = pane.renderer.cell().line_height;
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * WHEEL_LINES,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / line_height,
+                let cell = pane.renderer.cell();
+                let (line_height, advance) = (cell.line_height, cell.advance);
+                let (mut lines, mut columns) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (y * WHEEL_LINES, x * WHEEL_LINES),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        (p.y as f32 / line_height, p.x as f32 / advance)
+                    }
                 };
+                // A mouse with one wheel scrolls sideways with shift held,
+                // which is the convention everywhere and the only way to
+                // reach a long line without a trackpad. A wheel that
+                // really is horizontal already arrived as one.
+                if self.modifiers.shift_key() && columns == 0.0 {
+                    columns = lines;
+                    lines = 0.0;
+                }
 
                 // Scrolling moves the text out from under the tooltip,
                 // which would otherwise point at whatever arrived there.
                 pane.dismiss_hover();
 
                 // Scroll whichever panel the pointer is over.
-                let layout = pane.layout();
-                let (tree_w, rows) = (layout.tree_w, layout.rows);
+                let tree_w = pane.layout().tree_w;
                 let over_tree = tree_w > 0.0 && (pane.pointer.x as f32) < tree_w;
                 if over_tree {
                     if let Some(tree) = pane.tree.as_mut() {
@@ -4182,16 +4684,8 @@ impl ApplicationHandler<Wake> for App {
                         let next = (tree.scroll as f32 - lines).round();
                         tree.scroll = next.clamp(0.0, max as f32) as usize;
                     }
-                } else if let Some(diff) = pane.ws.diff_mut() {
-                    let max = (diff.lines.len() as f32 - rows as f32 + 2.0).max(0.0);
-                    diff.scroll = (diff.scroll - lines).clamp(0.0, max);
-                } else if let Some(preview) = pane.preview.as_ref() {
-                    // Rows, not lines: a top-level heading is two rows
-                    // tall, so counting lines stopped short of the end.
-                    let max = (view::preview_rows(preview) as f32 - rows as f32 + 2.0).max(0.0);
-                    pane.preview_scroll = (pane.preview_scroll - lines).clamp(0.0, max);
-                } else if let Some(editor) = pane.ws.active_mut() {
-                    editor.scroll_by(lines, rows);
+                } else {
+                    pane.scroll_text(lines, columns);
                 }
                 pane.redraw();
             }
@@ -4209,7 +4703,7 @@ impl ApplicationHandler<Wake> for App {
 
                 // A command-layer shortcut still works while a bar is open,
                 // so cmd+shift+F from the find bar widens to the project.
-                let shortcut = self.modifiers.super_key()
+                let shortcut = command_held(self.modifiers)
                     && !matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Enter));
 
                 // The popup gets first refusal; what it declines falls
@@ -4360,9 +4854,10 @@ enum Decision {
 /// A native dialog rather than something drawn in the window: this is the
 /// one moment where the editor must be sure it has the person's attention,
 /// and the platform already knows how to do that.
-fn confirm_discard(what: &str) -> Decision {
+fn confirm_discard(what: &str, window: &Window) -> Decision {
     use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
     let result = MessageDialog::new()
+        .set_parent(window)
         .set_level(MessageLevel::Warning)
         .set_title("Unsaved changes")
         .set_description(format!("{what} has unsaved changes."))
@@ -4620,20 +5115,180 @@ impl FileOp {
     }
 }
 
-/// Moves a path to the user's Trash and says where it landed.
+/// The absolute path to something, with the symlinks and the `..` taken
+/// out of it — but spelled the way the rest of the system spells it.
 ///
-/// The Trash rather than `remove_file`, because an editor should not make
+/// `canonicalize` on Windows hands back an extended-length path:
+/// `\\?\C:\code\lithe`, which is the same directory with the Win32 path
+/// limit lifted. That prefix would be in the window title, on the landing
+/// page, in the recent-projects file and in front of every path the editor
+/// shows, so it is taken off again. It stays on a UNC path, where it is
+/// load-bearing, and on anything long enough to have needed it.
+fn real_path(path: &Path) -> PathBuf {
+    let canonical = match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => return path.to_path_buf(),
+    };
+    if !cfg!(target_os = "windows") {
+        return canonical;
+    }
+    let text = canonical.to_string_lossy();
+    let Some(bare) = text.strip_prefix(r"\\?\") else {
+        return canonical;
+    };
+    // A drive path only, and only while it is short enough that Windows
+    // itself would accept it without the prefix.
+    let drive = bare.as_bytes();
+    let is_drive = drive.len() > 2 && drive[0].is_ascii_alphabetic() && drive[1] == b':';
+    if is_drive && bare.len() < 260 {
+        PathBuf::from(bare)
+    } else {
+        canonical
+    }
+}
+
+/// Whether a link target is a url rather than a path beside the file.
+///
+/// A scheme and `//`, or one of the schemes that has no authority to
+/// follow it. A single letter is a drive rather than a scheme, and a bare
+/// `www.example.com` has no scheme at all — as far as anything local is
+/// concerned that is a file name, and treating it as a url would open a
+/// browser for a path that merely looks like one.
+fn is_url(target: &str) -> bool {
+    let Some((scheme, rest)) = target.split_once(':') else {
+        return false;
+    };
+    let named = scheme.len() > 1
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    named
+        && (rest.starts_with("//")
+            || matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "mailto" | "tel" | "sms"
+            ))
+}
+
+/// The command that opens a url in whatever the system opens urls with.
+fn url_opener(url: &str) -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = spawnable("open");
+        command.arg(url);
+        command
+    }
+    // Not through `cmd`: a query string holds `&`, which a shell reads
+    // as its own, and this takes the whole of the url as one argument.
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = spawnable("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+        command
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let mut command = spawnable("xdg-open");
+        command.arg(url);
+        command
+    }
+}
+
+/// Percent-decoding, for a link written as `docs/a%20file.md`.
+///
+/// Only what a link in a document actually carries: a run that is not two
+/// hex digits is left as the three characters it is, which is what a file
+/// genuinely called `100%.md` needs.
+fn unescape(target: &str) -> String {
+    let bytes = target.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let decoded = (bytes[at] == b'%' && at + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[at + 1..at + 3]).ok())
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| target.to_string())
+}
+
+/// A command that will not open a console window of its own.
+///
+/// Every program the editor hands a path to — Explorer, `cmd`, a terminal
+/// — is a console program, and Windows gives one a console unless told
+/// otherwise: a black box would flash over the editor every time someone
+/// chose Reveal or Open in Terminal. Elsewhere this is just `Command::new`.
+fn spawnable(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// Moves a path to the trash and says where it landed.
+///
+/// The trash rather than `remove_file`, because an editor should not make
 /// a file unrecoverable on a menu click.
 fn move_to_trash(path: &Path) -> std::io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
-    let trash = home.join(".Trash");
+    let trash = trash_dir()?;
     std::fs::create_dir_all(&trash)?;
     let name = path.file_name().unwrap_or_default();
     let destination = free_name(&trash.join(name));
-    std::fs::rename(path, &destination)?;
-    Ok(destination)
+    match std::fs::rename(path, &destination) {
+        Ok(()) => Ok(destination),
+        // A rename cannot cross a volume, and the trash is on one
+        // particular volume: a file on a second drive has to be copied
+        // over and then removed.
+        Err(_) => {
+            if path.is_dir() {
+                copy_tree(path, &destination)?;
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::copy(path, &destination)?;
+                std::fs::remove_file(path)?;
+            }
+            Ok(destination)
+        }
+    }
+}
+
+/// Where a trashed file goes.
+///
+/// macOS: `~/.Trash`, which is the Finder's own, so what the editor
+/// trashed is in the Trash the person already knows how to empty.
+#[cfg(not(target_os = "windows"))]
+fn trash_dir() -> std::io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    Ok(home.join(".Trash"))
+}
+
+/// Windows: a directory of lithe's own, beside its settings.
+///
+/// Not the Recycle Bin, deliberately. Putting a file there means asking
+/// the shell to do it, and the shell does not say where it put it — while
+/// Undo in the file tree is built on knowing exactly that. A folder that
+/// Undo can reach beats an entry in a bin it cannot.
+#[cfg(target_os = "windows")]
+fn trash_dir() -> std::io::Result<PathBuf> {
+    settings::config_dir()
+        .map(|dir| dir.join("trash"))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no settings directory"))
 }
 
 /// `path` if nothing is there, else the same name with a number on it.
@@ -4810,7 +5465,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
 
     let (mut ws, tree) = match arg {
         Some(path) if path.is_dir() => {
-            let root = path.canonicalize().unwrap_or(path);
+            let root = real_path(&path);
             (Workspace::empty(Some(root.clone())), Some(Tree::new(root)))
         }
         Some(path) => {
@@ -4942,11 +5597,29 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         }
         panel
     });
+    // Laid out exactly as the running editor lays it out: the pane it
+    // has, and the faces it will be drawn in. A snapshot wrapped to a
+    // number picked here would be a picture of a preview nobody sees.
     let md = (overlay == Some("preview"))
         .then(|| {
-            let columns = 86;
             let editor = ws.active()?;
-            Some(markdown::render(&editor.doc.rope().to_string(), columns))
+            let l = view::layout(
+                &renderer,
+                &ws,
+                Chrome {
+                    sidebar: tree.is_some(),
+                    sidebar_cols: view::TREE_COLS,
+                    find: false,
+                },
+            );
+            let mut measure = Measured {
+                renderer: &renderer,
+            };
+            Some(markdown::render_with(
+                &editor.doc.rope().to_string(),
+                view::preview_columns(&l),
+                &mut measure,
+            ))
         })
         .flatten();
 
@@ -4959,7 +5632,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
     let defaults = Settings::default();
 
     let hover = (overlay == Some("hover")).then(|| view::Hover {
-        lines: markdown::render(
+        lines: markdown::render_boxed(
             "```rust\npub fn blame_file(&self, path: &Path) -> Option<FileBlame>\n```\n\n             Who last touched each line of a file.\n\nThe whole file in one `git blame`,              not a subprocess per line: the annotation follows the cursor.",
             view::Hover::COLUMNS,
         ),
@@ -4973,6 +5646,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
             true,
             repo.is_some(),
             Some(false),
+            context::GoesTo::ALL,
         )),
         Some("explorer-menu") => Some(ContextMenu::for_explorer(
             (120.0, 260.0),
@@ -5050,7 +5724,35 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
     Ok(())
 }
 
+/// Puts stdout and stderr back where a terminal can see them.
+///
+/// This is a windowed application on Windows, so it is handed no console of
+/// its own — which is the point: a console program that opens a window
+/// leaves a black box behind the editor. But run from a terminal it should
+/// still log, and `--snapshot` should still print, so it attaches to the
+/// console that launched it when there is one. There is nothing to attach
+/// to when launched from Explorer, and nothing is printed; the shell does
+/// not wait for a windowed process either, so the prompt comes back while
+/// the editor is still running.
+#[cfg(target_os = "windows")]
+fn attach_to_console() {
+    // One function, declared rather than depended on: kernel32 is already
+    // linked into every Windows binary the standard library builds.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // SAFETY: a plain call with no pointers in it. A failure means there
+    // was no console to attach to, which is the Explorer case.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_to_console() {}
+
 fn main() -> Result<()> {
+    attach_to_console();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     // Before anything else, and before any thread exists: macOS gives a
@@ -5101,7 +5803,7 @@ fn main() -> Result<()> {
                 let _ = proxy.send_event(Wake);
             }));
             app._menu = Some(built);
-            app.menu_active = true;
+            app.menu_active = menu::owns_shortcuts();
         }
         // A missing menu bar is a degraded experience, not a dead editor:
         // the keyboard handler picks the shortcuts back up.
@@ -5119,6 +5821,24 @@ fn main() -> Result<()> {
 mod file_tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    /// The project root ends up in the window title, on the landing page
+    /// and in the recent-projects file, so it has to be the path a person
+    /// would recognise — not Windows' extended-length spelling of it.
+    #[test]
+    fn a_real_path_is_absolute_and_plainly_spelled() {
+        let dir = TempDir::new();
+        let nested = dir.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let real = real_path(&nested.join("..").join("src"));
+        assert!(real.is_absolute(), "{real:?}");
+        assert!(real.ends_with("src"), "the `..` should be gone: {real:?}");
+        assert!(
+            !real.to_string_lossy().starts_with(r"\\?\"),
+            "no extended-length prefix: {real:?}"
+        );
+    }
 
     #[test]
     fn a_free_name_steps_past_what_is_there() {
@@ -5535,7 +6255,7 @@ mod hover_tests {
             }
         });
         let text = hover_text(&reply).expect("some text");
-        let lines = markdown::render(&text, view::Hover::COLUMNS);
+        let lines = markdown::render_boxed(&text, view::Hover::COLUMNS);
         assert!(
             lines
                 .iter()
@@ -5555,5 +6275,45 @@ mod hover_tests {
             hover_text(&serde_json::json!({ "contents": { "value": "  \n " } })),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn a_url_is_told_apart_from_a_path_beside_the_file() {
+        for url in [
+            "https://example.com",
+            "http://example.com/a?b=1&c=2",
+            "mailto:someone@example.com",
+            "file:///tmp/x",
+        ] {
+            assert!(is_url(url), "{url} is a url");
+        }
+        // A drive letter has a colon in it, and a hostname written
+        // without a scheme is a file name as far as this is concerned.
+        for path in [
+            "docs/guide.md",
+            "../README.md",
+            "C:\\Users\\x\\a.md",
+            "www.example.com/x",
+            "guide.md#writing",
+        ] {
+            assert!(!is_url(path), "{path} is a path");
+        }
+    }
+
+    #[test]
+    fn a_target_is_unescaped_as_a_path() {
+        assert_eq!(unescape("docs/a%20file.md"), "docs/a file.md");
+        assert_eq!(unescape("plain.md"), "plain.md");
+        // A character written as the bytes it is made of.
+        assert_eq!(unescape("caf%C3%A9.md"), "café.md");
+        // And not every percent is an escape: a file really can be
+        // called this.
+        assert_eq!(unescape("100%.md"), "100%.md");
+        assert_eq!(unescape("a%zz.md"), "a%zz.md");
     }
 }

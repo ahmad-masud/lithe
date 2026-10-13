@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use lithe_lsp::{Client, Diagnostic, Event, Pending};
 
-use crate::context::Where;
+use crate::context::{GoesTo, Where};
 
 /// Above this, a buffer is not sent to a language server.
 ///
@@ -40,6 +40,16 @@ pub enum Asked {
     },
     /// No server is configured for this language at all.
     Unsupported,
+    /// The server that is running says it does not answer this.
+    ///
+    /// Worth telling apart from an empty answer: `gopls` and
+    /// `rust-analyzer` have no `textDocument/declaration` at all, and
+    /// "no declaration found" reads as "there isn't one" rather than as
+    /// "this server does not do that".
+    Unprovided {
+        server: &'static str,
+        what: &'static str,
+    },
 }
 
 impl std::fmt::Display for Asked {
@@ -51,6 +61,7 @@ impl std::fmt::Display for Asked {
                 write!(f, "no {language} language server — install it: {install}")
             }
             Asked::Unsupported => write!(f, "no language server for this file type"),
+            Asked::Unprovided { server, what } => write!(f, "{server} does not answer {what}"),
         }
     }
 }
@@ -98,6 +109,45 @@ pub enum Awaiting {
         /// a smaller range.
         range: Option<lithe_lsp::Range>,
     },
+}
+
+impl Awaiting {
+    /// The request this will send, for the questions that are one
+    /// request each. `None` where the question is a sequence, or where
+    /// the server was already asked whether it can answer.
+    fn method(&self) -> Option<&'static str> {
+        Some(match self {
+            Awaiting::Hover { .. } => "textDocument/hover",
+            Awaiting::Definition => "textDocument/definition",
+            Awaiting::Completion => "textDocument/completion",
+            Awaiting::References => "textDocument/references",
+            Awaiting::GoTo(which) => which.method(),
+            Awaiting::PrepareCalls { .. } => "textDocument/prepareCallHierarchy",
+            Awaiting::Rename(_) => "textDocument/rename",
+            Awaiting::CodeActions { .. } => "textDocument/codeAction",
+            Awaiting::Formatting { range: None, .. } => "textDocument/formatting",
+            Awaiting::Formatting { .. } => "textDocument/rangeFormatting",
+            Awaiting::Calls { .. } | Awaiting::ResolveCodeAction => return None,
+        })
+    }
+
+    /// What the question is after, in the words a person would use.
+    fn noun(&self) -> &'static str {
+        match self {
+            Awaiting::Hover { .. } => "hovers",
+            Awaiting::Definition => "definitions",
+            Awaiting::Completion => "completions",
+            Awaiting::References => "references",
+            Awaiting::GoTo(Where::Definition) => "definitions",
+            Awaiting::GoTo(Where::Declaration) => "declarations",
+            Awaiting::GoTo(Where::TypeDefinition) => "type definitions",
+            Awaiting::GoTo(Where::Implementation) => "implementations",
+            Awaiting::PrepareCalls { .. } | Awaiting::Calls { .. } => "call hierarchies",
+            Awaiting::CodeActions { .. } | Awaiting::ResolveCodeAction => "code actions",
+            Awaiting::Rename(_) => "renames",
+            Awaiting::Formatting { .. } => "formatting",
+        }
+    }
 }
 
 pub struct Lsp {
@@ -241,6 +291,26 @@ impl Lsp {
     }
 
     /// Issues a request and records what it was for.
+    /// Which of the four "go to" questions the server for this language
+    /// answers, for building the menu that offers them.
+    ///
+    /// All four when nothing is running yet: the server has not been
+    /// asked, and the question is also what starts it.
+    pub fn goes_to(&self, language: Option<&str>) -> GoesTo {
+        let Some(client) = language
+            .and_then(|language| self.clients.get(language))
+            .filter(|client| client.ready)
+        else {
+            return GoesTo::ALL;
+        };
+        GoesTo {
+            definition: client.provides(Where::Definition.method()),
+            declaration: client.provides(Where::Declaration.method()),
+            type_definition: client.provides(Where::TypeDefinition.method()),
+            implementation: client.provides(Where::Implementation.method()),
+        }
+    }
+
     pub fn ask(
         &mut self,
         language: &'static str,
@@ -268,6 +338,17 @@ impl Lsp {
         };
         if !client.ready {
             return Asked::Starting;
+        }
+        // Asked before sending, not inferred from an empty reply: a
+        // server that does not do something answers null, which reads
+        // exactly like one that had nothing to say.
+        if let Some(method) = what.method() {
+            if !client.provides(method) {
+                return Asked::Unprovided {
+                    server: client.command(),
+                    what: what.noun(),
+                };
+            }
         }
         let id = match &what {
             Awaiting::Hover { .. } => client.hover(path, position),

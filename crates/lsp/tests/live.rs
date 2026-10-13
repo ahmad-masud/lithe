@@ -37,10 +37,27 @@ impl Drop for Scratch {
     }
 }
 
+/// Whether a server is installed and will actually run.
+///
+/// Two traps, one per platform. The lookup is the crate's own rather than
+/// a second one here, because on Windows the file is `clangd.exe` and the
+/// name is not — a test that looked for the name alone would skip on a
+/// machine that has the server. And being on `PATH` is not enough:
+/// `rust-analyzer` there is very often a rustup proxy for a component
+/// nobody installed, which starts, says "unknown binary" and exits. The
+/// editor answers that by trying the next candidate and then reporting a
+/// missing server; a test that believed the proxy would instead fail as
+/// though the client were broken.
 fn on_path(binary: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(binary).is_file()))
-        .unwrap_or(false)
+    let Some(path) = lithe_lsp::which(binary) else {
+        return false;
+    };
+    // `--help` rather than `--version`, which gopls spells as a
+    // subcommand and exits 2 for.
+    std::process::Command::new(path)
+        .arg("--help")
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 #[test]
@@ -617,4 +634,116 @@ fn opening_a_file_before_the_handshake_does_not_kill_the_server() {
         text.contains("answer"),
         "the deferred didOpen should have reached it once ready: {answer}"
     );
+}
+
+/// Hover and go-to-definition, against the server a machine with no
+/// clangd and no rust-analyzer may still have.
+///
+/// These are the two questions the editor is asked most by hand, and the
+/// shortest proof that a `file:` URI leaves here in a shape a real server
+/// reads back: one it cannot parse is answered with nothing at all, which
+/// looks exactly like a server that has nothing to say.
+#[test]
+fn hover_and_definition_answer_against_gopls() {
+    if !on_path("gopls") {
+        eprintln!("skipping: gopls is not installed");
+        return;
+    }
+
+    let dir = Scratch::new("go");
+    std::fs::write(dir.path().join("go.mod"), "module probe\n\ngo 1.21\n").unwrap();
+    let file = dir.path().join("main.go");
+    // `target` is declared on line 2 and called on line 6.
+    let source = "package main\n\
+                  \n\
+                  func target() int {\n\
+                  \treturn 1\n\
+                  }\n\
+                  \n\
+                  func main() {\n\
+                  \t_ = target()\n\
+                  }\n";
+    std::fs::write(&file, source).unwrap();
+
+    let (tx, rx) = channel();
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let mut client = Client::start("go", dir.path(), tx, wake)
+        .expect("spawn")
+        .expect("gopls is on PATH");
+
+    // On the call to `target`, which is both what it is and where it
+    // came from.
+    let at = lithe_lsp::Position {
+        line: 7,
+        character: 7,
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut hover = None;
+    let mut definition = None;
+    let mut asked = false;
+
+    while Instant::now() < deadline && (hover.is_none() || definition.is_none()) {
+        let event = rx.recv_timeout(Duration::from_millis(500));
+        match event {
+            // Gone quiet: the workspace is loaded, so ask.
+            Err(_) => {
+                if client.ready && !asked {
+                    client.hover(&file, at);
+                    client.definition(&file, at);
+                    asked = true;
+                }
+            }
+            Ok(Event::Response { id, result }) if !client.ready => {
+                client.pending.remove(&id);
+                client.on_initialized(&result);
+                client.did_open(&file, source.to_string());
+            }
+            Ok(Event::Response { result, .. }) if asked && !result.is_null() => {
+                // Told apart by shape: a hover is an object with
+                // `contents`, a definition is a location or a list of
+                // them.
+                if result.get("contents").is_some() {
+                    hover = Some(result);
+                } else {
+                    definition = Some(result);
+                }
+            }
+            Ok(Event::Exited { .. }) => panic!("the server exited"),
+            Ok(_) => {}
+        }
+    }
+
+    let hover = hover.expect("no hover within 60s");
+    let text = hover
+        .get("contents")
+        .and_then(|c| c.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("target"),
+        "the hover should describe what is under it: {hover}"
+    );
+
+    // What it says it does, which is what the menu is built from: gopls
+    // answers hovers and definitions, and has no declarations at all —
+    // in Go a thing is declared where it is defined.
+    assert!(client.provides("textDocument/hover"));
+    assert!(client.provides("textDocument/definition"));
+    assert!(
+        !client.provides("textDocument/declaration"),
+        "gopls has no declarationProvider; offering the entry would be a dead end"
+    );
+
+    let definition = definition.expect("no definition within 60s");
+    let text = definition.to_string();
+    assert!(
+        text.contains("main.go"),
+        "the definition should point into our file: {text}"
+    );
+    assert!(
+        text.contains("\"line\":2"),
+        "`target` is declared on line 2: {text}"
+    );
+
+    client.shutdown();
 }

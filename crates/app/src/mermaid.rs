@@ -125,16 +125,23 @@ fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>, Vec<Group>)> {
 
     for line in lines {
         let line = line.trim_end_matches(';');
-        // Everything beyond a flat list of edges — subgraphs, styling,
-        // class definitions, click handlers — is refused rather than
-        // silently dropped, because dropping it draws a diagram that is
-        // missing something without saying so.
+        // Colour, class and click are presentation. This draws in box
+        // characters on a monochrome grid, so there is no fill to honour
+        // and no node to click: dropping them loses nothing that could
+        // have been drawn either way, and a chart whose author tinted one
+        // box is still the chart they drew. A direction inside a subgraph
+        // goes the same way — one direction per chart is what the layout
+        // can do.
+        //
+        // An edge is the other thing entirely. Anything that names one
+        // and cannot be read is refused below, because a diagram quietly
+        // missing an arrow says something false.
         let first = line.split_whitespace().next().unwrap_or("");
         if matches!(
             first,
-            "style" | "classDef" | "class" | "click" | "linkStyle"
+            "style" | "classDef" | "class" | "click" | "linkStyle" | "direction"
         ) {
-            return None;
+            continue;
         }
         if first == "subgraph" {
             let rest = line["subgraph".len()..].trim();
@@ -152,11 +159,26 @@ fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>, Vec<Group>)> {
 
         match split_edge(line) {
             Some((left, label, right)) => {
-                let from = intern(left, &mut index, &mut nodes)?;
-                let to = intern(right, &mut index, &mut nodes)?;
-                enrol(&mut groups, &open, from);
-                enrol(&mut groups, &open, to);
-                edges.push(Edge { from, to, label });
+                // `A & B --> C & D` is Mermaid's shorthand for every edge
+                // between the two sides. Reading it as one node called
+                // "A & B" found no such node and refused the whole chart.
+                let mut sources = Vec::new();
+                for token in chain(left) {
+                    let from = intern(token, &mut index, &mut nodes)?;
+                    enrol(&mut groups, &open, from);
+                    sources.push(from);
+                }
+                for token in chain(right) {
+                    let to = intern(token, &mut index, &mut nodes)?;
+                    enrol(&mut groups, &open, to);
+                    for &from in &sources {
+                        edges.push(Edge {
+                            from,
+                            to,
+                            label: label.clone(),
+                        });
+                    }
+                }
             }
             // A bare declaration, which is how a node gets a label it is
             // not given at its first edge.
@@ -196,6 +218,32 @@ fn enrol(groups: &mut [Group], open: &[usize], node: usize) {
             groups[g].members.push(node);
         }
     }
+}
+
+/// The nodes on one side of an edge: `A & B` is two of them.
+///
+/// Split at the top level only, because a label is free to hold an
+/// ampersand of its own — `A[Cut & Paste]` is one node.
+fn chain(side: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut start = 0;
+    for (at, c) in side.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '[' | '(' | '{' if !quoted => depth += 1,
+            ']' | ')' | '}' if !quoted => depth = depth.saturating_sub(1),
+            '&' if !quoted && depth == 0 => {
+                out.push(side[..at][start..].trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(side[start..].trim());
+    out.retain(|token| !token.is_empty());
+    out
 }
 
 /// Splits `A -->|label| B` into its three parts.
@@ -1210,7 +1258,6 @@ mod tests {
         )
         .is_none());
         assert!(render("erDiagram\n  A ||--o{ B : has\n", 100).is_none());
-        assert!(render("flowchart TB\n  A --> B\n  style A fill:#f9f\n", 100).is_none());
         // Control flow in a sequence diagram is drawn as nested frames;
         // without them the messages inside would read as though they
         // always happen, which is a different diagram.
@@ -1221,6 +1268,53 @@ mod tests {
         .is_none());
         // And a chart too wide for the column it has.
         assert!(render("flowchart LR\n  A[aaaaaaaaaaaa] --> B[bbbbbbbbbbbb]\n", 20).is_none());
+    }
+
+    #[test]
+    fn a_tinted_box_is_still_a_box() {
+        // Styling is dropped rather than refused: there is no colour on
+        // this grid to honour it with, and refusing threw away the
+        // structure as well — which is most of what made real charts
+        // in a real README come out as their own source.
+        let out = drawn(
+            "flowchart TD\n  A[Client] --> B[Server]\n  B --> C[(Store)]\n\
+             \n  style A fill:#f9f,stroke:#333\n  classDef hot fill:#f00\n\
+             \n  class B hot\n  click A \"https://example.com\"\n\
+             \n  linkStyle 0 stroke:#0f0\n",
+        );
+        for name in ["Client", "Server", "Store"] {
+            assert!(
+                out.contains(name),
+                "{name} was dropped with the styling:\n{out}"
+            );
+        }
+        assert!(out.contains('▼'), "the edges survived too:\n{out}");
+    }
+
+    #[test]
+    fn an_ampersand_is_every_edge_between_the_two_sides() {
+        let out = drawn("flowchart TD\n  A & B --> C\n");
+        for name in ["A", "B", "C"] {
+            assert!(out.contains(name), "{name} is a node:\n{out}");
+        }
+        // Two boxes on the top layer and one underneath, which is what
+        // two edges into one node looks like.
+        let rows: Vec<&str> = out.lines().collect();
+        let top = rows
+            .iter()
+            .position(|r| r.contains('A'))
+            .expect("the first layer");
+        assert!(rows[top].contains('B'), "A and B share a layer:\n{out}");
+        assert!(
+            rows.iter().skip(top).any(|r| r.contains('C')),
+            "C is below them:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_ampersand_inside_a_label_is_not_a_chain() {
+        let out = drawn("flowchart LR\n  A[Cut & Paste] --> B[Done]\n");
+        assert!(out.contains("Cut & Paste"), "one node, one label:\n{out}");
     }
 
     #[test]

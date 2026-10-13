@@ -16,6 +16,10 @@ git — gutter, staging, commit and blame.
 Languages: Rust, TypeScript, TSX, JavaScript, Python, Go, C, JSON, TOML.
 Adding one is a dependency and a row in `crates/syntax/src/languages.rs`.
 
+macOS and Windows, from the same source: Metal or DX12 under wgpu, the
+platform's own menu bar, its own file dialogs, and its own idea of which
+key the shortcuts hang off.
+
     cargo run --release -- path/to/file     # open a file
     cargo run --release -- path/to/project  # open a folder
 
@@ -34,6 +38,50 @@ The menu bar belongs to whichever app is frontmost, so click the lithe
 window to see **lithe · File · Edit · Go · View** rather than your
 terminal's menus.
 
+### As a Windows app
+
+    .\scripts\bundle.ps1            # -> target\release\lithe.exe
+    .\scripts\bundle.ps1 -Install   # -> %LOCALAPPDATA%\Programs\lithe,
+                                    #    with a Start menu shortcut
+
+Windows has no bundle format — an application is one .exe — so what makes
+it an app rather than a loose binary is compiled into it: the icon Explorer
+and the taskbar draw, and the version information Properties ▸ Details
+shows. `crates/app/build.rs` does that from `assets/lithe.ico`, which
+`scripts/make-icon.py --ico` draws, which is why the script draws it before
+starting cargo. Both are optional: a machine with no Python or no resource
+compiler builds the same editor with the generic icon on it.
+
+It is a windowed binary, so opening it from Explorer or the Start menu
+gives you the editor and nothing else — a console program that opens a
+window leaves a black box behind it for as long as it runs. Started from a
+terminal it attaches to that terminal, so `LITHE_TRACE=1` still logs and
+`--snapshot` still prints; a shell does not wait for a windowed process, so
+the prompt comes back while the editor is still open.
+
+**The modifier is ctrl rather than cmd.** Every shortcut below reads the
+same with one swapped for the other — `ctrl+P`, `ctrl+shift+P`,
+`ctrl+shift+G` — and the hints the editor draws say `ctrl` when it is the
+one running. `ctrl+space` and `ctrl+Tab` mean what they mean everywhere.
+
+The menu bar is the row under the title bar rather than the one at the top
+of the screen, with Settings and Exit at the foot of File and About under
+Help, which is where Windows keeps them. It is there to be read and
+clicked: the editor runs the shortcuts itself, because a Win32 accelerator
+fires only if the message loop translates it and winit's does not.
+
+Two entries are named differently because they do something different.
+**Reveal in Explorer** is the obvious one. **Move to Trash** puts the file
+in `%APPDATA%\lithe\trash` rather than the Recycle Bin: the shell will not
+say where it put a file it recycled, and the file tree's Undo is built on
+knowing exactly that. Settings and the recent-projects list are in that
+same `%APPDATA%\lithe\`.
+
+Language servers are looked up the way a shell looks them up, `PATHEXT`
+and all, so an npm-installed `typescript-language-server.cmd` is a server
+like any other — `CreateProcess` would only ever have tried `.exe`. None
+of them, and no `git`, flashes a console window of its own.
+
 Launched with no argument, lithe opens on a landing page: New buffer, Open
 file, Open folder, New window, and the projects you opened recently. Every
 row is clickable.
@@ -42,9 +90,13 @@ There is a native menu bar — File, Edit, Go, View — so the shortcuts below
 are discoverable rather than folklore. Open File, Open Folder and Save As
 use the system dialogs.
 
+The table is written in the Mac idiom. On Windows and Linux the modifier
+is `ctrl`: read every `cmd` below as `ctrl`, which is also what the editor
+itself prints there.
+
 | | |
 |---|---|
-| window | `cmd+shift+N` new window · each has its own project, buffers and tree |
+| window | `cmd+shift+N` new window · opens empty, on the landing page · each has its own project, buffers and tree |
 | file | `cmd+N` new buffer · File ▸ New File… creates one on disk · `cmd+O` open · `cmd+shift+O` folder · `cmd+S` save · `cmd+shift+S` save as |
 | tabs | click to switch · click the `x` to close · `cmd+W` close · `ctrl+Tab` cycle |
 | project | `cmd+P` fuzzy open · `cmd+B` file tree |
@@ -54,6 +106,7 @@ use the system dialogs.
 | view | `cmd+shift+V` preview · drag the sidebar edge to resize |
 | tabs | files, diffs and Settings are all tabs |
 | select | double-click a word · triple-click a line |
+| scroll | wheel · `shift`+wheel or a horizontal wheel for sideways · **middle-button drag** to pan · drag either scrollbar |
 | git | `cmd+shift+G` source control · `cmd+shift+A` stage · `cmd+shift+C` commit · `cmd+shift+B` line blame |
 | menu keys | `↑`/`↓` move · `Enter` choose · `Esc` or any click dismisses |
 | commands | `cmd+shift+P` |
@@ -78,7 +131,8 @@ Definition / Implementation, Find All References, Show Incoming Calls,
 Show Outgoing Calls, Rename Symbol, Format Buffer, Format Selections,
 Show Code Actions, Cut, Copy, Copy and Trim, Paste, Blame Line, View File
 History, Copy Permalink to Line, Open Preview, Reveal in Finder, Open in
-Terminal.
+Terminal. (Reveal in **Explorer** on Windows, which is the same entry
+naming the same thing.)
 
 The language-server entries need a server for the file's language; the
 git ones need the project to be a repository. **Copy Permalink to Line**
@@ -111,45 +165,121 @@ layout shows you a document nothing on the web would render that way.
 Inline HTML inside Markdown is still read, because there it is part of
 the Markdown.
 
+### The preview is a document, not a dump of the file
+
+**Prose is set in a proportional face**, which is the whole difference
+between a preview and a terminal showing Markdown. The editor is one
+monospace face by design — a uniform grid is what lets a screenful cost
+one instance per cell — and the preview is the one view that is not a
+grid, so it gets the platform's own text face: Segoe UI, SF Pro,
+whichever of them is installed. Emphasis is *slanted* rather than
+coloured, bold is heavier, and body text sits a shade below the editor's
+own contrast, because a page of prose at full contrast is a page nobody
+finishes.
+
+**Everything whose meaning is its alignment stays on the grid.** Code,
+tables and drawn diagrams are still monospace, still measured in cells,
+and so are the bullets and checkboxes that line up down the margin. Set a
+box-drawing frame proportionally and it comes apart in your hands.
+
+**The page is the pane, less its margins.** The margin is a share of the
+window rather than a fixed inset, so the page looks like a page at every
+size, and the column takes what is left — capped, because a line that runs
+the full width of a maximised window is one the eye loses its way back to
+the start of. The cap is measured in alphabets, which is how type is
+measured: the lowercase a–z of a face set solid is about thirteen ems, and
+four of those is the hundred-odd characters a line reads comfortably at in
+a window. Past the width where that still leaves a sensible margin the
+column keeps growing with the pane, because a document floating in the
+middle of a screenful of air is the other way to get this wrong.
+
+Everything in the document shares that column — code set wider than the
+prose beside it reads as a different page — with one exception: a drawn
+diagram is a figure, so it may use the whole page inside the margins. A
+flowchart refused for want of a few cells is shown as its own source,
+which is worse than a figure wider than the text above it.
+
+The layout asks the renderer how wide a run is rather than counting its
+characters, and the answer comes from the same glyph advances the
+renderer then draws with. A line cannot wrap in one place and be drawn in
+another, because there is only one number. Measuring a document that way
+costs what it sounds like it costs, so printable ASCII is summed from a
+per-face table rather than hashed a character at a time: this README, 36
+KB of it, lays out across a maximised window in **2.2 ms** — about what
+the hand-rolled monospace reader took to do something worse.
+
 ### What the Markdown preview understands
 
-Headings (`#` and the underlined kind, with the top two levels drawn
-larger than body text), paragraphs, hard breaks, `**bold**`, `*em*`,
-`***both***`, `~~struck~~`, `` `code` ``, links of all three kinds —
-inline, reference and bare URL — images named by their alt text, nested
-and ordered lists, `- [x]` checkboxes, block quotes, rules, pipe tables
-laid out as an aligned grid, YAML front matter (hidden, as a renderer
-hides it), backslash escapes, and the inline HTML a README actually
-contains.
+**CommonMark, as pulldown-cmark parses it**, plus the GitHub extensions a
+README actually uses: pipe tables, `~~struck~~`, `- [x]` checkboxes and
+footnotes. Headings of both kinds with the top two levels drawn larger
+than body text, paragraphs, hard breaks, `**bold**`, `*em*`, `***both***`,
+`` `code` ``, links of all three kinds — inline, reference and bare URL —
+images named by their alt text, nested and ordered lists tight or loose,
+block quotes, rules, indented as well as fenced code, YAML front matter
+(hidden, as a renderer hides it), backslash escapes, entity references,
+and the inline HTML a README actually contains.
+
+The parser is a dependency rather than ours on purpose. CommonMark is a
+standard with a long tail — a reference link defined after its use, lazy
+continuation, what counts as emphasis inside a word — and none of that
+tail is this editor's product. What *is* ours is everything after the
+events: which runs are bold, how a table fits in a column of characters,
+where a heading earns a second grid row. Half the module went when the
+parser arrived, and a 32 KB README now lays out in about a millisecond,
+which is less than half what the hand-rolled one took.
 
 Fenced code is highlighted by the same tree-sitter grammars the editor
 uses, picked from the language on the fence. A fence naming a language
 nothing is installed for stays plain rather than being coloured by a
-guess.
+guess, and an indented block names nothing, so it stays plain too.
 
 **Click a fenced block to copy it.** A drawn preview has no selection to
 drag, so the block is the unit: click anywhere in one and the source
 goes to the clipboard, as written rather than as rendered. The first row
 of each block says `copy`, so it is discoverable that it can be.
 
+**Links are followed.** The pointer turns to a hand over one, and a click
+does what the link says. A url — inline, reference, bare, or an `<a href>`
+written in HTML — opens in whatever the system opens urls with, handed
+over as one argument rather than through a shell, because a query string
+holds `&`. A `#fragment` scrolls to the heading with that anchor, matched
+on the slug the way every other renderer of the same file matches it.
+Anything else is a path beside the file being read, which is how a README
+points at the rest of its own repository: it opens in the editor, with
+`%20` unescaped and `docs/guide.md#writing` landing on the heading in the
+file it just opened. A badge is an image inside a link, so clicking it
+means the link rather than the picture; an image on its own means the
+image. A link to a folder is shown in Explorer rather than opened as a
+project, because replacing the project on a click would be a surprise.
+
 **A `mermaid` fence is drawn as a diagram**, in box-drawing characters
 on the same grid as everything else. Two kinds, which is what a
 project's documentation actually contains:
 
 - **Flowcharts** — `flowchart`/`graph` with `TB`, `TD`, `BT`, `LR` or
-  `RL`, node shapes, `subgraph` groups drawn as labelled frames, and
-  labelled edges in either `-->|label|` or `-- label -->` form. A step
-  is square and everything else is rounded: a monospace grid can
-  honestly express two outlines, and a rhombus made of box characters
-  reads as a mistake.
+  `RL`, node shapes, `subgraph` groups drawn as labelled frames, `A & B
+  --> C` for every edge between two sides, and labelled edges in either
+  `-->|label|` or `-- label -->` form. A step is square and everything
+  else is rounded: a monospace grid can honestly express two outlines,
+  and a rhombus made of box characters reads as a mistake.
 - **Sequence diagrams** — participants across the top, lifelines down,
   messages as arrows between them, replies dashed, and a message to
   itself turning back on its own lifeline.
 
-Anything else — a pie chart, a gantt chart, an ER diagram, `loop`/`alt`
-blocks, `style` directives, or a chart too wide for the column — stays
-a code block. A diagram drawn wrong is worse than the fence it came
-from: the source at least says what was meant.
+`style`, `classDef`, `class`, `click`, `linkStyle` and a `direction`
+inside a subgraph are read and dropped. They are presentation: this draws
+in box characters on a monochrome grid, so there is no fill to honour and
+no node to click, and refusing them threw away the structure as well —
+which is what made real charts in real READMEs come out as their own
+source.
+
+Anything that names an edge and cannot be read is still refused, and so
+is anything else: a pie chart, a gantt chart, an ER diagram, `loop`/`alt`
+blocks, or a chart too wide for the page it has. A diagram drawn wrong is
+worse than the fence it came from — the source at least says what was
+meant — but a diagram missing an arrow says something false, which is
+worse than both.
 
 Two limits worth knowing. A subgraph frame is dropped, and the nodes
 drawn without it, when the group's nodes did not land in a clean
@@ -195,6 +325,25 @@ reads a Cargo workspace and indexes it first, answering nothing until
 it has. The status bar says what it is busy with, and a question asked
 too early reports that rather than "nothing found". On a large project
 the first few seconds after opening are a wait, not a failure.
+
+**A server that asks the editor something is answered.** The protocol
+runs both ways, and a server left waiting on a reply can simply stop:
+gopls asks the editor to create a progress indicator before it will say
+another word, so an unanswered question meant no diagnostics, no hover
+and no go-to-definition for the whole session — in silence, which is the
+worst way for it to fail. The answers are mechanical ("go ahead", "no
+settings of ours", "that edit is declined") and are sent from the reading
+thread, which is the only place that cannot be busy when they arrive.
+
+**What a server says it cannot do is not offered.** Each one announces
+the requests it answers, and the right-click menu is built from that:
+neither `gopls` nor `rust-analyzer` implements `textDocument/declaration`
+— in Go and Rust a thing is declared where it is defined — so **Go to
+Declaration** is not in the menu for those languages, where it could only
+ever have reported "no declaration found". `clangd` does implement it,
+because C makes the distinction, and there it is offered. Asked by
+keyboard rather than by menu, the answer names the server: *gopls does
+not answer declarations*.
 
 Resting the pointer over a name for 400ms asks what it is, and the
 answer is drawn as a small document — a server sends Markdown, so the
@@ -246,10 +395,15 @@ type, and the diff rebuilds as you go. The new side is read from the
 buffer rather than from disk, so an edit shows up as it is typed instead
 of catching up at the next save.
 
-It opens in that file's own tab, marked `±`, rather than in a second
-one: the diff and the buffer are one thing, so switching away and back
-finds it where you left it. Clicking the file in Changes again puts the
-plain editor back; closing the tab closes both.
+It opens in that file's own tab rather than in a second one: the diff and
+the buffer are one thing, so switching away and back finds it where you
+left it. Clicking the file in Changes again puts the plain editor back;
+closing the tab closes both.
+
+That one tab is in two modes, so it says which it is in two ways: a `±`
+before the name, and the name itself in the colour the gutter marks a
+modified line with. A tab is read at a glance, and a colour is what
+reaches a glance.
 
 A diff opened from **History** is of a commit. There is no buffer behind
 it, so it says `read only` and means it, and clicking through a history
@@ -282,10 +436,18 @@ is recoverable and is what Undo reverses; **Delete** is not, so it is the
 one entry that asks first.
 
 The source control panel has two tabs. **changes** stages and unstages;
-**history** lists recent commits, and clicking one shows what it changed.
-**View File History** on a file narrows that tab to the commits that
-touched it — `--follow`, so a rename does not cut it short. Clicking the
-History tab widens it back to the project.
+**history** lists recent commits — hash, who made it, and what they said —
+and clicking one shows what it changed. **View File History** on a file
+narrows that tab to the commits that touched it — `--follow`, so a rename
+does not cut it short. Clicking the History tab widens it back to the
+project.
+
+The name takes a share of the row rather than a column of its own, and
+steps aside entirely when the sidebar is too narrow to hold a name and a
+summary at once; drag the divider to give it room. A name that does not
+fit is cut at a word — "Ahmad Masud" in eight columns is "Ahmad", not
+"Ahmad M…", because a given name is a name where half a surname is a
+typo.
 
 Clicking a file in the source control panel shows its **diff** against
 HEAD — unified, with both sides' line numbers and long unchanged runs
@@ -329,15 +491,35 @@ captioned with their real size. A file that is not text opens as an image
 or as a note saying so, and is never written back over.
 
 A Markdown file previews with `cmd+shift+V`: headings, lists, quotes,
-fences, inline code and links, wrapped to the window. There is one font at
-one size, so structure is carried by weight and colour — the glyph atlas
-holds a bold face keyed by weight alongside the regular one, rasterised on
-first use.
+fences, inline code and links, laid out as a page. Structure is carried by
+face, weight, slant and size — the glyph atlas holds each of them keyed by
+the same cache, rasterised on first use, so a document that never uses
+italics never pays for one. Links are live: the pointer turns to a hand
+over one, and a click opens the url, jumps to the heading, or opens the
+file beside this one.
 
 Scrolling is fractional rather than line-by-line, because a trackpad sends
 pixel deltas and rounding each one to a whole line is what makes scrolling
-feel like it is catching. The scrollbar is draggable, and the pointer is an
-I-beam over text.
+feel like it is catching. The scrollbar is draggable — the one belonging to
+whatever the text area is showing, so it drags a rendered preview and a
+diff as readily as a file — and the pointer is an I-beam over text.
+
+**Sideways, too.** A line longer than the window is reached with a
+horizontal wheel, with `shift` and a vertical one, by dragging the bar that
+appears along the bottom when there is something out there to reach, or by
+holding the **middle button** and dragging: the document follows the
+pointer, both ways at once. Typing off the right edge brings the view along
+by itself.
+
+The limit on how far right you can scroll is the longest line *in view*,
+not the longest in the file. Finding that one means reading every line,
+which is the one thing this editor does not do — so the limit moves as you
+scroll, which is also the honest answer: there is nothing to the right of
+what is in front of you. The same goes for the bar's own length.
+
+Not the auto-scroll that Windows does on the same button, where the view
+keeps moving while the pointer sits still. That needs a clock ticking
+frames out, and this editor redraws on damage and nothing else.
 
 Saving goes through a temp file and a rename, so an interrupted write cannot
 truncate your code. Closing a buffer, a window or the app with unsaved edits
@@ -425,6 +607,12 @@ frame against one glyph atlas. There is no widget tree.
     crates/lsp     lithe-lsp     JSON-RPC client, server lifecycle
     crates/vcs     lithe-vcs     gitoxide: HEAD blobs, line diff
 
+Four parsers, none of them ours: tree-sitter for code, ripgrep's engine
+for search, gitoxide for reading a repository, and pulldown-cmark for the
+preview. Each one is a standard with a long tail that is nobody's
+product, and each is wrapped in a crate here that decides what to do with
+what it says.
+
 Search uses ripgrep's own `grep-regex` and `grep-searcher`, so in-buffer
 find means exactly what project search means — one pattern syntax, one set
 of case rules. Project search streams: hits reach the panel as they are
@@ -460,12 +648,24 @@ costs five megabytes rather than twenty — the font system behind the atlas
 is eight on its own.
 
 Opening a folder replaces the project rather than merging into it. Two
-projects' files in one tree is never what was meant.
+projects' files in one tree is never what was meant. A new window opens
+empty, on the landing page: a second window is where you go to work on
+something else, and the page is one click from any project you have had
+open — including the one you just came from.
+
+**Coming back to a window re-reads the disk.** Anything that changes a
+project from outside the editor — a `git pull`, a branch switch, a build
+— happens while that window is not the one being typed into, and you find
+out by coming back to it. So that is when the file tree is rebuilt and the
+gutter's idea of HEAD is dropped. It is what a filesystem watcher would be
+for, without the thread, the dependency, or the queue of events arriving
+while nobody is looking; the tree reads only the directories that are
+expanded, so it costs what drawing it costs.
 
 Recent projects live in one plain text file, one absolute path per line —
 `~/Library/Application Support/lithe/recent-projects` on macOS,
-`$XDG_CONFIG_HOME/lithe/` elsewhere. No database, nothing to migrate, and
-you can edit it in the editor. Writing it re-reads first and merges, since
+`%APPDATA%\lithe\` on Windows, `$XDG_CONFIG_HOME/lithe/` elsewhere. No
+database, nothing to migrate, and you can edit it in the editor. Writing it re-reads first and merges, since
 several windows each hold their own copy and a stale write would drop
 whatever another added.
 
@@ -475,12 +675,14 @@ A hand-rolled text renderer fails in ways a type checker cannot see, so the
 renderer can draw to an offscreen texture and the tests read the pixels
 back:
 
-    cargo test --release                        # 201 tests, incl. pixel, live-server and real-repo tests
+    cargo test --release                        # 395 tests, incl. pixel, live-server and real-repo tests
     LITHE_TRACE=1 ./target/release/lithe .      # log every window event
     cargo run --release -- --snapshot out.raw file.rs  # one frame, raw RGBA
     cargo run --release -- --snapshot out.raw --picker .   # with the overlay up
 
-The render tests skip rather than fail where there is no GPU.
+The render tests skip rather than fail where there is no GPU. Three of the
+379 are about the `PATH` a GUI application is launched with, which is a
+Unix question, and do not run on Windows.
 
 ## Roadmap
 

@@ -58,6 +58,19 @@ gix           = { version = "0.88", default-features = false, features = [
 ] }
 imara-diff    = "0.2"
 
+# The Markdown preview's parser. A pull parser whose events borrow from
+# the source, which is why a document costs the same here as the rope it
+# came from. Three crates in all, two of which — memchr and bitflags —
+# ripgrep and wgpu had already brought. CommonMark is a standard with a
+# long tail of edge cases, and this is the half of a preview that is
+# nobody's product.
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# Windows only, and a build dependency: it compiles the .rc that gives
+# lithe.exe its icon and its version information. Nothing of it ends up in
+# the binary.
+embed-resource = "3"
+
 tree-sitter            = "0.27"
 tree-sitter-language   = "0.1"
 tree-sitter-rust       = "0.24"

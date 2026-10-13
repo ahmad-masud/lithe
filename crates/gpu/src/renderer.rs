@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use winit::window::Window;
 
-use crate::atlas::{Atlas, CellMetrics, Face, Size};
+use crate::atlas::{Atlas, CellMetrics, Face, Family, Size};
 use crate::Rgba;
 
 /// One instance. 48 bytes, so a dense 4K screenful of cells is well under a
@@ -426,6 +426,24 @@ impl Renderer {
         self.atlas.borrow_mut().metrics_at(size)
     }
 
+    /// Line geometry for a chosen face and size.
+    pub fn cell_in(&self, size: Size, family: Family) -> CellMetrics {
+        self.atlas.borrow_mut().metrics_in(size, family)
+    }
+
+    /// How wide `text` will be drawn, in physical pixels.
+    ///
+    /// The same per-glyph advances [`Frame::text_run`] moves the pen by,
+    /// so a line measured here and drawn there cannot disagree — which is
+    /// the whole reason the preview can wrap proportional text at all.
+    /// Rasterises anything it has not seen, which is why it takes the
+    /// queue: measuring a document is also what warms its glyphs.
+    pub fn measure(&self, text: &str, face: Face, size: Size, family: Family) -> f32 {
+        self.atlas
+            .borrow_mut()
+            .measure(&self.queue, text, face, size, family)
+    }
+
     /// Target size in physical pixels.
     pub fn size_px(&self) -> (f32, f32) {
         (self.width as f32, self.height as f32)
@@ -703,6 +721,71 @@ impl Frame<'_> {
             pen += advance;
         }
         pen
+    }
+
+    /// As [`Frame::text_sized`], in a chosen face.
+    ///
+    /// Eight arguments, because drawing one run of a document is eight
+    /// facts: where, what, in what colour, weight, slant, size and face.
+    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The pen moves by each glyph's own advance rather than by a cell,
+    /// which is what makes prose prose. Returns the x it ended at, so a
+    /// caller drawing a line of runs can hand the next one its start.
+    pub fn text_run(
+        &mut self,
+        x: f32,
+        baseline_y: f32,
+        text: &str,
+        color: Rgba,
+        face: Face,
+        size: Size,
+        family: Family,
+    ) -> f32 {
+        if family == Family::Mono {
+            return self.text_sized(x, baseline_y, text, color, face, size);
+        }
+        let Renderer {
+            atlas,
+            queue,
+            quads,
+            ..
+        } = &mut *self.r;
+        let mut atlas = atlas.borrow_mut();
+        let mut pen = x;
+
+        for ch in text.chars() {
+            let Some(g) = atlas.glyph_in(queue, ch, face, size, family) else {
+                continue;
+            };
+            // A space has an advance and no coverage.
+            if g.size[0] > 0.0 && g.size[1] > 0.0 {
+                quads.push(Quad {
+                    pos: [
+                        (pen + g.offset[0]).round(),
+                        (baseline_y + g.offset[1]).round(),
+                    ],
+                    size: g.size,
+                    uv: [g.uv.min[0], g.uv.min[1], g.uv.max[0], g.uv.max[1]],
+                    color: color.0,
+                    mode: 0.0,
+                    _pad: [0.0; 3],
+                });
+            }
+            pen += g.advance;
+        }
+        pen
+    }
+
+    /// How wide `text` would be drawn here. See [`Renderer::measure`].
+    pub fn measure(&self, text: &str, face: Face, size: Size, family: Family) -> f32 {
+        self.r.measure(text, face, size, family)
+    }
+
+    /// The grid's geometry, for a caller laying out around the text it
+    /// is drawing.
+    pub fn cell(&self) -> CellMetrics {
+        self.r.cell()
     }
 
     /// Draws an image into a rectangle.

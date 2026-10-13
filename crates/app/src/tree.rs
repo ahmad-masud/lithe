@@ -327,6 +327,31 @@ mod tests {
         dir
     }
 
+    /// What a `git pull` looks like from in here: files appear and
+    /// disappear under a tree nobody touched. Rebuilding re-reads the
+    /// directories that are open rather than trusting what it has.
+    #[test]
+    fn rebuilding_sees_what_changed_on_disk() {
+        let dir = fixture();
+        let mut tree = Tree::new(dir.path().to_path_buf());
+        let names =
+            |tree: &Tree| -> Vec<String> { tree.rows.iter().map(|r| r.name.clone()).collect() };
+        assert!(!names(&tree).contains(&"NOTICE".to_string()));
+
+        std::fs::write(
+            dir.path().join("NOTICE"),
+            "hello
+",
+        )
+        .unwrap();
+        std::fs::remove_file(dir.path().join("Cargo.toml")).unwrap();
+        tree.rebuild();
+
+        let after = names(&tree);
+        assert!(after.contains(&"NOTICE".to_string()), "got {after:?}");
+        assert!(!after.contains(&"Cargo.toml".to_string()), "got {after:?}");
+    }
+
     #[test]
     fn only_the_root_is_read_until_something_is_expanded() {
         let dir = fixture();

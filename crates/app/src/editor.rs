@@ -52,6 +52,15 @@ pub struct Editor {
     /// pixel deltas, and rounding each one to a whole line is what makes
     /// scrolling feel like it is catching on something.
     pub scroll: f32,
+    /// Horizontal scroll, in columns, and fractional for the same reason.
+    pub scroll_x: f32,
+    /// How many columns the editor last drew into.
+    ///
+    /// View state kept on the editor so that moving the caret can bring it
+    /// back on screen sideways as well as vertically. The alternative was
+    /// a second argument on `scroll_to_cursor` and its forty call sites,
+    /// each of which would have had to find out how wide the window is.
+    pub visible_cols: usize,
     /// `None` when the language is unknown or the file is too large.
     syntax: Option<Syntax>,
     history: History,
@@ -69,6 +78,8 @@ impl Editor {
             binary: false,
             revision: 0,
             scroll: 0.0,
+            scroll_x: 0.0,
+            visible_cols: 0,
             syntax: None,
             history: History::new(),
             tab_width,
@@ -850,11 +861,102 @@ impl Editor {
             self.scroll = line + margin + 1.0 - rows;
         }
         self.clamp_scroll(visible_rows);
+        self.scroll_to_cursor_column();
+    }
+
+    /// The same for the other axis: typing off the right edge of a long
+    /// line brings the view along rather than losing the caret.
+    ///
+    /// A narrower margin than the vertical one — three columns of context
+    /// is nothing, where three lines is a paragraph.
+    fn scroll_to_cursor_column(&mut self) {
+        const MARGIN: f32 = 6.0;
+        let cols = self.visible_cols as f32;
+        if cols <= 1.0 {
+            return;
+        }
+        let head = self.sel.primary().head;
+        let line = self.doc.char_to_line(head);
+        let col = self.column_of(line, head - self.doc.line_to_char(line)) as f32;
+        let margin = MARGIN.min((cols - 1.0) / 2.0);
+
+        if col < self.scroll_x + margin {
+            self.scroll_x = (col - margin).max(0.0);
+        } else if col + margin > self.scroll_x + cols - 1.0 {
+            self.scroll_x = col + margin + 1.0 - cols;
+        }
     }
 
     pub fn scroll_by(&mut self, lines: f32, visible_rows: usize) {
         self.scroll -= lines;
         self.clamp_scroll(visible_rows);
+    }
+
+    /// Scrolls sideways, as far as there is anything to see.
+    ///
+    /// The limit comes from the longest line *on screen*, not the longest
+    /// in the file: finding that one means reading every line, and the
+    /// whole editor is built on never doing that. It means the limit moves
+    /// as you scroll vertically, which is the honest answer — there is
+    /// nothing to the right of what is in front of you.
+    pub fn scroll_x_by(&mut self, columns: f32, visible_rows: usize, visible_cols: usize) {
+        self.scroll_x = (self.scroll_x + columns).max(0.0);
+        self.clamp_scroll_x(visible_rows, visible_cols);
+    }
+
+    pub fn clamp_scroll_x(&mut self, visible_rows: usize, visible_cols: usize) {
+        let widest = self.widest_visible(visible_rows, visible_cols) as f32;
+        let max = (widest + 2.0 - visible_cols as f32).max(0.0);
+        self.scroll_x = self.scroll_x.clamp(0.0, max);
+    }
+
+    /// Visual width of the widest line in view, in columns.
+    ///
+    /// Measured no further than one screen past the right edge, which is
+    /// as much as the limit above can use. A line longer than that is
+    /// reported as exactly that, and measured again — a screen further
+    /// along — when the view has moved. So the cost is the width of what
+    /// is on screen, which is what drawing the same rows costs anyway,
+    /// rather than the length of the longest line in the file.
+    pub fn widest_visible(&self, visible_rows: usize, visible_cols: usize) -> usize {
+        let cols = visible_cols.max(1);
+        let cap = self.scroll_x.max(0.0) as usize + cols * 2;
+        let top = self.top_line();
+        let last = (top + visible_rows).min(self.doc.len_lines().saturating_sub(1));
+        (top..=last)
+            .map(|line| {
+                // A tab only ever widens a line, so a line with more
+                // characters than the cap is already past it and does not
+                // need walking.
+                let chars = self.doc.line_len_chars(line);
+                if chars >= cap {
+                    cap
+                } else {
+                    self.column_of(line, chars).min(cap)
+                }
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Visual column of a character offset within a line, counting a tab
+    /// as the distance to the next tab stop.
+    fn column_of(&self, line: usize, char_col: usize) -> usize {
+        let Some(slice) = self.doc.line(line) else {
+            return 0;
+        };
+        let mut col = 0;
+        for (index, ch) in slice.chars().enumerate() {
+            if index >= char_col || ch == '\n' || ch == '\r' {
+                break;
+            }
+            col += if ch == '\t' {
+                self.tab_width - (col % self.tab_width)
+            } else {
+                1
+            };
+        }
+        col
     }
 
     /// Keeps the last line reachable without letting the document float
@@ -911,6 +1013,66 @@ mod tests {
 
     fn text(e: &Editor) -> String {
         e.doc.rope().to_string()
+    }
+
+    /// The limit on scrolling sideways is the longest line *in view*,
+    /// because finding the longest line in the file would mean reading
+    /// the file. Scrolling down to shorter lines pulls the view back.
+    #[test]
+    fn sideways_scrolling_stops_where_the_visible_lines_do() {
+        let mut e = ed("a very long line indeed, past any window
+short
+short
+");
+        e.visible_cols = 20;
+
+        e.scroll_x_by(1000.0, 1, 20);
+        assert!(e.scroll_x > 0.0, "the long line is reachable");
+        assert!(
+            e.scroll_x <= 40.0 + 2.0 - 20.0,
+            "but no further than its end: {}",
+            e.scroll_x
+        );
+
+        // Only the short lines are in view now, so there is nothing to
+        // the right any more.
+        e.scroll = 1.0;
+        e.clamp_scroll_x(1, 20);
+        assert_eq!(e.scroll_x, 0.0, "nothing out there to look at");
+    }
+
+    /// A caret typed off the right edge brings the view with it, the way
+    /// one moved off the bottom does.
+    #[test]
+    fn the_view_follows_the_caret_sideways() {
+        let mut e = ed("0123456789abcdefghijklmnopqrstuvwxyz
+");
+        e.visible_cols = 10;
+
+        e.sel = Selection::single(30);
+        e.scroll_to_cursor(1);
+        assert!(e.scroll_x > 0.0, "the caret is off to the right");
+        assert!(
+            e.scroll_x <= 30.0,
+            "and the view stops at it rather than past it: {}",
+            e.scroll_x
+        );
+
+        e.sel = Selection::single(0);
+        e.scroll_to_cursor(1);
+        assert_eq!(e.scroll_x, 0.0, "and comes back for the start of a line");
+    }
+
+    /// A tab is as wide as the distance to the next stop, which is what
+    /// the column the view scrolls in has to mean.
+    #[test]
+    fn a_tab_counts_as_the_columns_it_covers() {
+        let mut e = ed("	x
+");
+        // Wide enough that the measurement is not cut short by the cap
+        // on how far past the right edge it looks.
+        e.visible_cols = 20;
+        assert_eq!(e.widest_visible(1, 20), 5, "four columns of tab, then x");
     }
 
     #[test]

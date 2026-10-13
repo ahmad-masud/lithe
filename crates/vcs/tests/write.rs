@@ -209,6 +209,18 @@ fn blame_says_so_for_an_uncommitted_line() {
     );
 }
 
+/// git's paths are slash-separated on every platform — its own status
+/// output, a pathspec and a permalink all are — so ours have to be too.
+#[test]
+fn a_repository_path_is_spelled_the_way_git_spells_it() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let repo = Repo::discover(fixture.path()).expect("a repository");
+    let nested = fixture.path().join("src").join("main.rs");
+    assert_eq!(repo.relative(&nested).expect("inside"), "src/main.rs");
+}
+
 #[test]
 fn a_path_outside_the_repository_is_rejected() {
     let Some(fixture) = Fixture::new() else {

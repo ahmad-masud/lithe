@@ -14,6 +14,10 @@ pub struct Theme {
     pub cursor_line: Rgba,
     pub cursor: Rgba,
     pub selection: Rgba,
+    /// Body text in the Markdown preview. A shade quieter than the
+    /// editor's own: code is read a line at a time and wants contrast,
+    /// prose is read by the paragraph and does not.
+    pub preview_fg: Rgba,
     pub status_bg: Rgba,
     pub status_fg: Rgba,
     pub error: Rgba,
@@ -101,6 +105,7 @@ impl Default for Theme {
             // Drawn behind the glyphs, so it has to stay dark enough to read
             // through.
             selection: Rgba::hex(0x2A4A6B),
+            preview_fg: Rgba::hex(0xB6BCC8),
             status_bg: Rgba::hex(0x1A1D24),
             status_fg: Rgba::hex(0x7A8495),
             error: Rgba::hex(0xE06C75),

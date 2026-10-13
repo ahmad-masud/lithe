@@ -12,9 +12,7 @@
 
 use std::collections::HashMap;
 
-use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight,
-};
+use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight};
 
 /// Which face a glyph is rasterised in. Bold is a second set in the same
 /// atlas rather than a second atlas: the cache key carries the weight.
@@ -23,13 +21,48 @@ pub enum Face {
     #[default]
     Regular,
     Bold,
+    /// Slanted. Only prose asks for it: the editor has no italic, and a
+    /// grid of slanted code is nobody's idea of readable.
+    Italic,
+    BoldItalic,
 }
 
 impl Face {
     fn weight(self) -> Weight {
         match self {
-            Face::Regular => Weight::NORMAL,
-            Face::Bold => Weight::BOLD,
+            Face::Regular | Face::Italic => Weight::NORMAL,
+            Face::Bold | Face::BoldItalic => Weight::BOLD,
+        }
+    }
+
+    fn slant(self) -> cosmic_text::Style {
+        match self {
+            Face::Italic | Face::BoldItalic => cosmic_text::Style::Italic,
+            _ => cosmic_text::Style::Normal,
+        }
+    }
+}
+
+/// Which face a run is drawn in: the grid's, or a document's.
+///
+/// The editor is one monospace face by design — a uniform grid is what
+/// lets a screenful cost one instance per cell. The Markdown preview is a
+/// document rather than a grid, and prose set in a typewriter face reads
+/// like a terminal however well it is coloured, so it gets a proportional
+/// one. Code, tables and diagrams inside the preview stay on the grid,
+/// because their meaning is in their alignment.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Family {
+    #[default]
+    Mono,
+    Prose,
+}
+
+impl Family {
+    fn resolved(self) -> cosmic_text::Family<'static> {
+        match self {
+            Self::Mono => cosmic_text::Family::Monospace,
+            Self::Prose => cosmic_text::Family::SansSerif,
         }
     }
 }
@@ -95,6 +128,38 @@ const MONOSPACE_PREFERENCES: &[&str] = &[
     "Courier New",
 ];
 
+/// Candidate proportional faces for the preview's prose, best first.
+///
+/// The same problem as [`MONOSPACE_PREFERENCES`], for the same reason:
+/// without fontconfig, `Family::SansSerif` resolves to whichever face
+/// happens to sort first, which is how a document ends up set in
+/// something nobody chose. Each platform's own interface face comes
+/// first, because it is the one guaranteed to be hinted and complete at
+/// thirteen pixels.
+const PROSE_PREFERENCES: &[&str] = &[
+    // macOS
+    "SF Pro Text",
+    "SF Pro Display",
+    "Helvetica Neue",
+    // Windows
+    "Segoe UI Variable Text",
+    "Segoe UI",
+    // Linux
+    "Inter",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Liberation Sans",
+    // Broadly present, last resorts
+    "Arial",
+    "Helvetica",
+];
+
+/// Whether a character is one of the printable ASCII the advance table
+/// covers, which is most of a document by a wide margin.
+fn is_table_ascii(ch: char) -> bool {
+    ('\u{20}'..'\u{7f}').contains(&ch)
+}
+
 /// Normalised atlas rectangle.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UvRect {
@@ -112,6 +177,11 @@ pub struct Glyph {
     /// Offset from pen origin to the bitmap's top-left corner, physical px.
     /// `y` is already measured downward from the baseline.
     pub offset: [f32; 2],
+    /// How far the pen moves past this glyph, physical px.
+    ///
+    /// Equal to the cell for every glyph in the grid's own face, and the
+    /// whole point of the proportional one — an `i` is not an `M`.
+    pub advance: f32,
 }
 
 /// Grid geometry, in physical pixels.
@@ -135,9 +205,14 @@ pub struct Atlas {
     pen_y: u32,
     shelf_h: u32,
 
-    cache: HashMap<(char, Face, Size), Option<Glyph>>,
-    /// Grid geometry per size, measured on first use of that size.
-    sizes: HashMap<Size, CellMetrics>,
+    cache: HashMap<(char, Face, Size, Family), Option<Glyph>>,
+    /// Line geometry per size and face, measured on first use.
+    sizes: HashMap<(Size, Family), CellMetrics>,
+    /// Advances for printable ASCII, per face. Laying out a document asks
+    /// the same question tens of thousands of times in a row, and an
+    /// array index is a great deal cheaper than hashing a four-field key
+    /// to answer it.
+    ascii: HashMap<(Face, Size, Family), [f32; 95]>,
     /// Reserved fully-opaque texel. Lets a filled rect reuse the glyph
     /// pipeline rather than needing one of its own.
     pub opaque: UvRect,
@@ -176,6 +251,7 @@ impl Atlas {
             shelf_h: 0,
             cache: HashMap::new(),
             sizes: HashMap::new(),
+            ascii: HashMap::new(),
             opaque: UvRect::default(),
             metrics: CellMetrics {
                 advance: font_px * 0.6,
@@ -188,6 +264,7 @@ impl Atlas {
         };
 
         atlas.configure_monospace();
+        atlas.configure_prose();
         atlas.reserve_opaque_texel(queue);
         atlas.measure_cell();
         atlas.warm_ascii(queue);
@@ -219,6 +296,27 @@ impl Atlas {
         }
     }
 
+    /// The same, for the proportional face the preview sets prose in.
+    fn configure_prose(&mut self) {
+        let chosen = PROSE_PREFERENCES.iter().copied().find(|name| {
+            self.fonts.db().faces().any(|face| {
+                face.families
+                    .iter()
+                    .any(|(family, _)| family.eq_ignore_ascii_case(name))
+            })
+        });
+
+        match chosen {
+            Some(name) => {
+                self.fonts.db_mut().set_sans_serif_family(name);
+                log::info!("prose face: {name}");
+            }
+            // The preview then reads in whatever the system calls sans
+            // serif, which is still a document rather than a terminal.
+            None => log::warn!("no known prose face installed; falling back to the system default"),
+        }
+    }
+
     /// Writes a single 0xFF texel and hands back its uv, sampled by rects.
     fn reserve_opaque_texel(&mut self, queue: &wgpu::Queue) {
         let (x, y) = (self.pen_x, self.pen_y);
@@ -239,7 +337,7 @@ impl Atlas {
     fn measure_cell(&mut self) {
         let metrics = Metrics::new(self.font_px, (self.font_px * 1.4).round());
         let mut buf = Buffer::new(&mut self.fonts, metrics);
-        let attrs = Attrs::new().family(Family::Monospace);
+        let attrs = Attrs::new().family(Family::Mono.resolved());
         buf.set_text("M", &attrs, Shaping::Advanced, None);
         buf.shape_until_scroll(&mut self.fonts, false);
 
@@ -265,8 +363,16 @@ impl Atlas {
         // and when one does it rasterises on first sight like any other
         // uncommon glyph.
         for size in [Size::Body, Size::Large, Size::Huge] {
-            self.cache.insert((' ', Face::Regular, size), None);
-            self.cache.insert((' ', Face::Bold, size), None);
+            let advance = self.metrics_at(size).advance;
+            for face in [Face::Regular, Face::Bold] {
+                self.cache.insert(
+                    (' ', face, size, Family::Mono),
+                    Some(Glyph {
+                        advance,
+                        ..Glyph::default()
+                    }),
+                );
+            }
         }
     }
 
@@ -281,12 +387,75 @@ impl Atlas {
         face: Face,
         size: Size,
     ) -> Option<Glyph> {
-        if let Some(hit) = self.cache.get(&(ch, face, size)) {
+        self.glyph_in(queue, ch, face, size, Family::Mono)
+    }
+
+    /// As [`Atlas::glyph`], in a chosen face.
+    ///
+    /// A glyph with no coverage of its own — a space — still comes back,
+    /// because in a proportional face how wide a space is is a fact about
+    /// the font rather than about the grid.
+    pub fn glyph_in(
+        &mut self,
+        queue: &wgpu::Queue,
+        ch: char,
+        face: Face,
+        size: Size,
+        family: Family,
+    ) -> Option<Glyph> {
+        if let Some(hit) = self.cache.get(&(ch, face, size, family)) {
             return *hit;
         }
-        let packed = self.rasterize(queue, ch, face, size);
-        self.cache.insert((ch, face, size), packed);
+        let packed = self.rasterize(queue, ch, face, size, family);
+        self.cache.insert((ch, face, size, family), packed);
         packed
+    }
+
+    /// How wide `text` is drawn, in physical pixels.
+    ///
+    /// The same advances [`Atlas::glyph_in`] hands the renderer, so what
+    /// is measured here and what is drawn there cannot disagree.
+    pub fn measure(
+        &mut self,
+        queue: &wgpu::Queue,
+        text: &str,
+        face: Face,
+        size: Size,
+        family: Family,
+    ) -> f32 {
+        // Every cell the same width is the whole point of the grid.
+        if family == Family::Mono {
+            return self.metrics_in(size, family).advance * text.chars().count() as f32;
+        }
+        let key = (face, size, family);
+        if !self.ascii.contains_key(&key) {
+            let mut widths = [0.0f32; 95];
+            for (index, slot) in widths.iter_mut().enumerate() {
+                let ch = (0x20u8 + index as u8) as char;
+                *slot = self
+                    .glyph_in(queue, ch, face, size, family)
+                    .map_or(0.0, |glyph| glyph.advance);
+            }
+            self.ascii.insert(key, widths);
+        }
+        // Anything outside the table is rasterised first, so the sum
+        // below needs nothing but a look at what is already cached.
+        for ch in text.chars().filter(|ch| !is_table_ascii(*ch)) {
+            self.glyph_in(queue, ch, face, size, family);
+        }
+
+        let table = self.ascii.get(&key);
+        let cache = &self.cache;
+        text.chars()
+            .map(|ch| match (is_table_ascii(ch), table) {
+                (true, Some(widths)) => widths[ch as usize - 0x20],
+                _ => cache
+                    .get(&(ch, face, size, family))
+                    .copied()
+                    .flatten()
+                    .map_or(0.0, |glyph| glyph.advance),
+            })
+            .sum()
     }
 
     /// Grid geometry at `size`, measured once per size.
@@ -296,16 +465,26 @@ impl Atlas {
     /// guessed advance shows up immediately as text that drifts out of its
     /// own background.
     pub fn metrics_at(&mut self, size: Size) -> CellMetrics {
-        if size == Size::Body {
+        self.metrics_in(size, Family::Mono)
+    }
+
+    /// As [`Atlas::metrics_at`], for a chosen face.
+    ///
+    /// The advance it reports is the grid cell for a monospace face and
+    /// an `M` for a proportional one, where it means nothing — prose is
+    /// measured glyph by glyph. The line height and ascent are what the
+    /// preview lays rows out on, and those are the point.
+    pub fn metrics_in(&mut self, size: Size, family: Family) -> CellMetrics {
+        if size == Size::Body && family == Family::Mono {
             return self.metrics;
         }
-        if let Some(hit) = self.sizes.get(&size) {
+        if let Some(hit) = self.sizes.get(&(size, family)) {
             return *hit;
         }
         let px = self.font_px * size.factor();
         let metrics = Metrics::new(px, (px * 1.4).round());
         let mut buf = Buffer::new(&mut self.fonts, metrics);
-        let attrs = Attrs::new().family(Family::Monospace);
+        let attrs = Attrs::new().family(family.resolved());
         buf.set_text("M", &attrs, Shaping::Advanced, None);
         buf.shape_until_scroll(&mut self.fonts, false);
 
@@ -325,7 +504,7 @@ impl Atlas {
                 line_height: self.metrics.line_height * size.factor(),
                 ascent: self.metrics.ascent * size.factor(),
             });
-        self.sizes.insert(size, measured);
+        self.sizes.insert((size, family), measured);
         measured
     }
 
@@ -335,13 +514,20 @@ impl Atlas {
         ch: char,
         face: Face,
         size: Size,
+        family: Family,
     ) -> Option<Glyph> {
-        // Shape the character alone: we want the standalone glyph for a grid
-        // cell, not one altered by its neighbours' kerning or ligatures.
-        let line_height = self.metrics_at(size).line_height;
+        // Shape the character alone: we want the standalone glyph, not one
+        // altered by its neighbours' kerning or ligatures. That costs
+        // prose its kerning, and buys something worth more — the width
+        // this reports and the width it draws at are the same number, so
+        // a line can never wrap one place and be drawn in another.
+        let line_height = self.metrics_in(size, family).line_height;
         let metrics = Metrics::new(self.font_px * size.factor(), line_height);
         let mut buf = Buffer::new(&mut self.fonts, metrics);
-        let attrs = Attrs::new().family(Family::Monospace).weight(face.weight());
+        let attrs = Attrs::new()
+            .family(family.resolved())
+            .weight(face.weight())
+            .style(face.slant());
         let mut scratch = [0u8; 4];
         buf.set_text(
             ch.encode_utf8(&mut scratch),
@@ -351,18 +537,18 @@ impl Atlas {
         );
         buf.shape_until_scroll(&mut self.fonts, false);
 
-        let key = buf
-            .layout_runs()
-            .next()?
-            .glyphs
-            .first()?
-            .physical((0.0, 0.0), 1.0)
-            .cache_key;
+        let laid_out = buf.layout_runs().next()?.glyphs.first()?.clone();
+        let advance = laid_out.w;
+        let key = laid_out.physical((0.0, 0.0), 1.0).cache_key;
 
         let image = self.swash.get_image_uncached(&mut self.fonts, key)?;
         let (w, h) = (image.placement.width, image.placement.height);
+        // No coverage — a space, most often. It still moves the pen.
         if w == 0 || h == 0 {
-            return None;
+            return Some(Glyph {
+                advance,
+                ..Glyph::default()
+            });
         }
 
         // Coverage masks go straight in. Colour glyphs (emoji) need an RGBA
@@ -388,6 +574,7 @@ impl Atlas {
             },
             size: [w as f32, h as f32],
             offset: [image.placement.left as f32, -image.placement.top as f32],
+            advance,
         })
     }
 

@@ -16,8 +16,26 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use imara_diff::{Algorithm, Diff, InternedInput};
+
+/// Keeps `git` from opening a console window of its own.
+///
+/// `git` is a console program, and Windows gives one a console unless told
+/// not to — so staging a file from a windowed application would flash a
+/// black box over the editor. Its output is captured either way.
+#[cfg(windows)]
+fn no_console(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(windows))]
+fn no_console(command: &mut Command) -> &mut Command {
+    command
+}
 
 /// How a run of lines differs from the committed version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,9 +83,9 @@ impl Repo {
     /// templates are configured, and reimplementing that against gix
     /// would mean a repository subtly unlike the one `git init` makes.
     pub fn init(path: &Path) -> Result<Self, GitError> {
-        let output = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(path)
+        let mut command = std::process::Command::new("git");
+        command.args(["init"]).current_dir(path);
+        let output = no_console(&mut command)
             .output()
             .map_err(|e| GitError(format!("could not run git: {e}")))?;
         if !output.status.success() {
@@ -350,9 +368,9 @@ impl std::error::Error for GitError {}
 impl Repo {
     /// Runs `git` in the working tree and returns its stdout.
     fn git(&self, args: &[&str]) -> Result<String, GitError> {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&self.workdir)
+        let mut command = std::process::Command::new("git");
+        command.args(args).current_dir(&self.workdir);
+        let output = no_console(&mut command)
             .output()
             .map_err(|e| GitError(format!("could not run git: {e}")))?;
 
@@ -550,8 +568,8 @@ impl Repo {
     pub fn permalink(&self, path: &Path, line: usize) -> Option<String> {
         let remote = self.git(&["remote", "get-url", "origin"]).ok()?;
         let hash = self.head()?;
-        let relative = path.strip_prefix(self.workdir()).ok()?.to_str()?;
-        remote_link(remote.trim(), &hash, relative, line)
+        let relative = self.relative(path).ok()?;
+        remote_link(remote.trim(), &hash, &relative, line)
     }
 
     /// Who last touched each line of a file.
@@ -565,9 +583,24 @@ impl Repo {
         Some(parse_blame(&out))
     }
 
+    /// A path as git spells it: relative to the working tree, with forward
+    /// slashes.
+    ///
+    /// The separator matters beyond looks. git's own paths — `git status`,
+    /// a pathspec, a permalink on github.com — use `/` on every platform,
+    /// so a Windows path handed back as `crates\app\src\main.rs` would
+    /// disagree with the panel listing it, and `\` is an escape character
+    /// in a pathspec rather than a separator.
     pub fn relative(&self, path: &Path) -> Result<String, GitError> {
         path.strip_prefix(&self.workdir)
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| {
+                let text = p.to_string_lossy();
+                if std::path::MAIN_SEPARATOR == '/' {
+                    text.into_owned()
+                } else {
+                    text.replace(std::path::MAIN_SEPARATOR, "/")
+                }
+            })
             .map_err(|_| GitError(format!("{} is outside the repository", path.display())))
     }
 }

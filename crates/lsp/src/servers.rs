@@ -89,13 +89,59 @@ impl ServerConfig {
 }
 
 fn on_path(binary: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
+    which(binary).is_some()
+}
+
+/// The file on `PATH` a binary name resolves to.
+///
+/// The lookup is spelled out rather than left to the OS because Windows
+/// does half of it: `CreateProcess` appends `.exe` and nothing else, so an
+/// npm-installed server — `typescript-language-server.cmd`, a shim that is
+/// on `PATH` and runs perfectly — is invisible to a bare
+/// `Command::new("typescript-language-server")`. Resolving the name here
+/// means the editor finds what the shell would find, and spawns the file
+/// rather than the name.
+pub fn which(binary: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    which_in(binary, &path, &extensions())
+}
+
+/// Pure, and given its inputs rather than reading them, so it can be
+/// tested without changing a process-global that every other test in the
+/// binary is also reading.
+///
+/// `extensions` is `PATHEXT`: what Windows treats as executable, in the
+/// order it prefers. Empty everywhere else, where a name is just a name.
+fn which_in(
+    binary: &str,
+    path: &std::ffi::OsStr,
+    extensions: &[String],
+) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path).find_map(|dir| {
         let candidate = dir.join(binary);
-        candidate.is_file()
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        extensions.iter().find_map(|ext| {
+            let candidate = dir.join(format!("{binary}{ext}"));
+            candidate.is_file().then_some(candidate)
+        })
     })
+}
+
+#[cfg(windows)]
+fn extensions() -> Vec<String> {
+    let listed = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    listed
+        .split(';')
+        .filter(|ext| ext.starts_with('.'))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn extensions() -> Vec<String> {
+    Vec::new()
 }
 
 /// Puts the tools a person actually has back on `PATH`.
@@ -116,6 +162,12 @@ fn on_path(binary: &str) -> bool {
 /// Must be called before any threads are started — it mutates
 /// process-global state.
 pub fn widen_search_path() {
+    // Not Windows: Explorer hands a process the `PATH` the person's own
+    // environment holds, there is no login shell to ask what it should
+    // have been, and none of the directories guessed at below exist.
+    if cfg!(windows) {
+        return;
+    }
     let Some(current) = std::env::var_os("PATH") else {
         return;
     };
@@ -236,6 +288,11 @@ mod tests {
     /// macOS hands a GUI app launchd's `PATH`, so a server installed
     /// into a user directory is invisible and the editor reports "lsp
     /// missing" for one that is installed and working.
+    ///
+    /// Unix-only, as the behaviour is: these spell out `PATH` with `:`
+    /// between the directories and `/` inside them, which is the shape
+    /// the function is there to repair.
+    #[cfg(not(windows))]
     #[test]
     fn a_launchd_path_is_widened_back_to_the_usual_places() {
         let home = std::env::temp_dir().join("lithe-path-fixture");
@@ -257,6 +314,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn a_shell_built_path_is_left_alone() {
         let home = std::path::Path::new("/Users/someone");
@@ -274,6 +332,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn what_the_login_shell_says_wins_over_the_guesses() {
         let home = std::env::temp_dir().join("lithe-path-shell");
@@ -354,10 +413,35 @@ mod tests {
         assert_eq!(rust.commands[0][0], "rust-analyzer");
     }
 
+    /// The case Windows gets wrong on its own: an npm-installed server is
+    /// a `.cmd` shim, which the shell finds through `PATHEXT` and
+    /// `CreateProcess` — which only ever appends `.exe` — does not.
+    #[test]
+    fn a_name_resolves_through_the_extensions_a_shell_would_try() {
+        let dir = std::env::temp_dir().join("lithe-which-fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Spelled as `PATHEXT` spells it, so the two match on a
+        // case-sensitive filesystem as well as on Windows' own.
+        let shim = dir.join("probe-server.CMD");
+        std::fs::write(&shim, "@echo off\n").unwrap();
+
+        let path = std::ffi::OsString::from(&dir);
+        let pathext = [".EXE".to_string(), ".CMD".to_string()];
+        assert_eq!(which_in("probe-server", &path, &pathext), Some(shim));
+        // Without the extensions — which is every other platform — the
+        // name on its own is all there is, and it is not a file.
+        assert_eq!(which_in("probe-server", &path, &[]), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn path_lookup_finds_something_that_exists() {
-        // `sh` is on PATH on every platform this builds for.
-        assert!(on_path("sh"));
+        // One per platform that is always installed and always on `PATH`.
+        // `cmd` is also the case Windows gets wrong without `PATHEXT`:
+        // the file is `cmd.exe`, and the name is not.
+        let always = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(on_path(always), "{always} should be on PATH");
         assert!(!on_path("definitely-not-a-real-binary-xyzzy"));
     }
 }

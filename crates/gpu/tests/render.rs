@@ -189,3 +189,37 @@ fn an_image_is_drawn_in_its_own_colours() {
         .count();
     assert!(ink > 10, "the text before the image did not draw");
 }
+
+/// Prose is proportional and the grid is not, which is the whole
+/// difference between the preview reading as a document and reading as a
+/// terminal. An `i` must be narrower than an `M` in one and exactly as
+/// wide in the other.
+#[test]
+fn a_prose_face_is_proportional_and_the_grid_is_not() {
+    use lithe_gpu::{Face, Family, Size};
+
+    let Some(r) = renderer() else { return };
+
+    let mono = |text: &str| r.measure(text, Face::Regular, Size::Body, Family::Mono);
+    let prose = |text: &str| r.measure(text, Face::Regular, Size::Body, Family::Prose);
+
+    assert_eq!(mono("i"), mono("M"), "a grid cell is a grid cell");
+    assert!(
+        prose("i") > 0.0 && prose("i") < prose("M"),
+        "an i is narrower than an M: {} vs {}",
+        prose("i"),
+        prose("M")
+    );
+    // A space has no ink and still moves the pen; without this every
+    // proportional line would be drawn with its words run together.
+    assert!(prose(" ") > 0.0, "a space has a width");
+    assert_eq!(
+        prose("a b"),
+        prose("a") + prose(" ") + prose("b"),
+        "measuring a run is measuring its glyphs"
+    );
+
+    // Italic exists as its own face rather than as slanted body text.
+    let italic = r.measure("word", Face::Italic, Size::Body, Family::Prose);
+    assert!(italic > 0.0);
+}
