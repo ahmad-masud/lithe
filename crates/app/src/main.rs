@@ -1323,15 +1323,24 @@ impl App {
     /// pointer must not start a process.
     fn dwell_hover(&mut self) {
         let Some(pane) = self.pane() else { return };
-        if !pane.pointer_over_text
-            || pane.hover_asked
-            || pane.hover.is_some()
-            || pane.completion.is_some()
-            || pane.context.is_some()
-            || pane.pointer_moved.elapsed() < HOVER_DWELL
-        {
+        if !dwell_due(
+            pane.pointer_over_text,
+            pane.hover_asked,
+            pane.hover.is_some() || pane.completion.is_some() || pane.context.is_some(),
+            pane.pointer_moved.elapsed(),
+        ) {
             return;
         }
+        // This rest has been considered, whether or not there turns out
+        // to be anything to ask. Marking it only on the paths that do
+        // ask left `next_hover` handing back a deadline already in the
+        // past, so the loop woke, declined and re-armed without pause —
+        // 20% of a core spent resting a pointer over a file with no
+        // language server, which is invariant 1 broken outright.
+        if let Some(pane) = self.pane_mut() {
+            pane.hover_asked = true;
+        }
+        let Some(pane) = self.pane() else { return };
         let l = pane.layout();
         let (x, y) = (pane.pointer.x as f32, pane.pointer.y as f32);
         let Some(editor) = pane.ws.active() else {
@@ -1358,9 +1367,6 @@ impl App {
         }
         let position = lithe_lsp::to_position(&editor.doc, under);
 
-        if let Some(pane) = self.pane_mut() {
-            pane.hover_asked = true;
-        }
         // Anchored on the character, not the pointer: the popup should
         // sit against the thing it describes.
         let anchor = (x, y);
@@ -1393,7 +1399,10 @@ impl App {
                 let text = hover_text(&result);
                 let why = self.empty_because("no information");
                 let Some(pane) = self.pane_mut() else { return };
-                pane.hover_asked = false;
+                // Deliberately left set: an empty answer must not re-arm
+                // the dwell while the pointer has not moved, or the
+                // editor asks the same question forever. Moving the
+                // pointer is what clears it.
                 match text {
                     Some(text) => {
                         pane.hover = Some(view::Hover {
@@ -5091,6 +5100,20 @@ fn typed_prefix(editor: &editor::Editor) -> String {
     text.chars().skip(text.chars().count() - kept).collect()
 }
 
+/// Whether a pointer that has come to rest should be asked about.
+///
+/// Pure, so the one rule that keeps the editor from spinning on its own
+/// timer can be tested without a window: a rest is considered once, and
+/// not again until the pointer moves.
+fn dwell_due(
+    over_text: bool,
+    already_asked: bool,
+    showing: bool,
+    resting: std::time::Duration,
+) -> bool {
+    over_text && !already_asked && !showing && resting >= HOVER_DWELL
+}
+
 /// Which line of the working copy a diff row shows.
 ///
 /// In the split view a row is a pair of sides and only the right one is
@@ -6352,5 +6375,51 @@ mod link_tests {
         // called this.
         assert_eq!(unescape("100%.md"), "100%.md");
         assert_eq!(unescape("a%zz.md"), "a%zz.md");
+    }
+}
+
+#[cfg(test)]
+mod dwell_tests {
+    use super::{dwell_due, HOVER_DWELL};
+    use std::time::Duration;
+
+    #[test]
+    fn a_rest_is_considered_once_and_not_again() {
+        let rested = HOVER_DWELL + Duration::from_millis(1);
+        assert!(
+            dwell_due(true, false, false, rested),
+            "a pointer resting over text should be asked about"
+        );
+        // The whole point. `dwell_hover` marks the rest considered even
+        // when it decides there is nothing to ask — a file with no
+        // language server, say. Without that the deadline it schedules
+        // is already in the past, so the loop wakes, declines and
+        // re-arms with no pause at all: 20% of a core spent doing
+        // nothing, which is invariant 1 broken outright.
+        assert!(
+            !dwell_due(true, true, false, rested),
+            "a rest already considered must not re-arm"
+        );
+    }
+
+    #[test]
+    fn nothing_is_asked_before_the_pointer_has_settled() {
+        assert!(!dwell_due(true, false, false, Duration::ZERO));
+        assert!(!dwell_due(
+            true,
+            false,
+            false,
+            HOVER_DWELL - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn nothing_is_asked_over_the_chrome_or_behind_a_popup() {
+        let rested = HOVER_DWELL * 2;
+        assert!(!dwell_due(false, false, false, rested), "not over text");
+        assert!(
+            !dwell_due(true, false, true, rested),
+            "a popup is already saying something"
+        );
     }
 }

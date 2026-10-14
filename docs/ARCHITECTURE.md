@@ -417,3 +417,16 @@ Paths are buffered rather than acted on. They arrive on AppKit's thread
 and can arrive before the event loop is running — a file double-clicked
 in Finder is delivered before `resumed`, which is why the first window
 opens on it rather than on the landing page.
+
+The hover dwell nearly cost the first invariant. `dwell_hover` marked a
+rest as considered only on the paths that went on to ask the server, so
+a rest it declined — a file with no language server, most obviously —
+left `next_hover` scheduling a deadline already in the past. The loop
+woke, declined, re-armed, and spun: 11–21% of a core, measured, while
+nothing at all was happening. It marks the rest unconditionally now,
+and only the pointer moving clears it.
+
+It was invisible until a benchmark opened a file. With no file open the
+pointer is never over text, so the dwell never arms and idle CPU reads
+0.000% — which is exactly what the invariant claims, measured in the
+one state where it could not fail.
