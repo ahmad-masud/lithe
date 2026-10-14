@@ -352,6 +352,18 @@ code block. `cmd+I` asks about the caret instead. Nothing is asked
 unless a server for that language is already running: resting a pointer
 must not start a process.
 
+## Opening files from Finder
+
+Double-click a file, drop one on the Dock icon, or `open -a lithe.app
+<path>`: all three work, for files and for folders, whether lithe is
+already running or not. A folder opens as a project, a file opens as a
+tab in the window you are in.
+
+This needs two halves and is broken without either: the bundle declares
+which documents it accepts, and the app answers the event macOS sends
+to deliver them. Declaring the types alone gets you "can't open files
+of this type" with extra steps.
+
 ## Starting a repository
 
 Open Source Control (`cmd+shift+G`) somewhere that is not a repository

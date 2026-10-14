@@ -396,3 +396,24 @@ in the one place every notification already goes through.
 A document's URI is made absolute first. A relative path yields
 `file://crates/a.rs`, where `crates` parses as the host — the server is
 told about a document on another machine and answers about nothing.
+
+A bundled app is not handed its documents on the command line.
+LaunchServices sends them to the application delegate, and an app that
+declares no document types is refused outright — "can't open files of
+this type", for every file, including from `open -a`. Declaring the
+types without handling the event is the same refusal with extra steps.
+
+winit registers an application delegate of its own and asserts the one
+installed is that exact class, so replacing it panics the first time
+winit looks. Its documentation describes a guarantee not to register
+one; that is from a different version than the one here. The method is
+therefore added to winit's own delegate class at runtime, before the
+loop starts: Objective-C lets a class gain a method at any point,
+existing instances pick it up, winit's check still passes because the
+class is unchanged, and AppKit asks `respondsToSelector:` only when it
+has a document to deliver.
+
+Paths are buffered rather than acted on. They arrive on AppKit's thread
+and can arrive before the event loop is running — a file double-clicked
+in Finder is delivered before `resumed`, which is why the first window
+opens on it rather than on the landing page.

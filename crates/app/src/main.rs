@@ -21,6 +21,7 @@ mod lsp;
 mod markdown;
 mod menu;
 mod mermaid;
+mod openfiles;
 mod picker;
 mod recents;
 mod settings;
@@ -88,7 +89,7 @@ const AUTOSAVE_AFTER: std::time::Duration = std::time::Duration::from_millis(900
 
 /// Sent from a worker — nucleo's matcher, or a menu click — when the loop
 /// needs to wake and look at something.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Wake;
 
 /// One window, and everything it is showing.
@@ -1866,6 +1867,32 @@ impl App {
 
     /// Opens a window. The second and later ones share the first window's
     /// GPU device and glyph atlas rather than building their own.
+    /// Opens whatever Finder, the Dock or `open -a` has handed us.
+    ///
+    /// Into the focused window, because that is where "open this file"
+    /// means it should go; a second window is what `cmd+shift+N` is for.
+    fn open_handed_files(&mut self, el: &ActiveEventLoop) {
+        for path in openfiles::take() {
+            if self.panes.is_empty() {
+                self.open_window(el, Some(path));
+                continue;
+            }
+            if let Some(pane) = self.pane_mut() {
+                if path.is_dir() {
+                    // A folder dropped on the Dock is a project, the
+                    // same as `cmd+shift+O`.
+                    pane.open_folder(path);
+                } else {
+                    // Deliberate, not provisional: asking the system to
+                    // open a file is not browsing past it.
+                    pane.open_path_as(path, false);
+                }
+                pane.retitle();
+                pane.redraw();
+            }
+        }
+    }
+
     fn open_window(&mut self, el: &ActiveEventLoop, arg: Option<PathBuf>) {
         let attrs = Window::default_attributes()
             .with_title("lithe")
@@ -4280,11 +4307,15 @@ impl ApplicationHandler<Wake> for App {
         // Wait, not Poll. There is no animation clock, so an idle editor
         // wakes for input and nothing else.
         el.set_control_flow(ControlFlow::Wait);
-        let initial = self.initial.take();
+        // A document double-clicked in Finder arrives through the
+        // delegate before the loop is running, so the first window
+        // opens on it rather than on the landing page.
+        let initial = self.initial.take().or_else(|| openfiles::take().pop());
         self.open_window(el, initial);
         if self.panes.is_empty() {
             el.exit();
         }
+        self.open_handed_files(el);
     }
 
     /// Schedules the next timed wake-up, or goes back to waiting for
@@ -4325,6 +4356,7 @@ impl ApplicationHandler<Wake> for App {
     /// A worker finished something: nucleo found more matches, or a menu
     /// item was clicked.
     fn user_event(&mut self, el: &ActiveEventLoop, _event: Wake) {
+        self.open_handed_files(el);
         let clicked: Vec<_> = self
             .menu_events
             .as_ref()
@@ -5229,7 +5261,7 @@ fn unescape(target: &str) -> String {
 /// otherwise: a black box would flash over the editor every time someone
 /// chose Reveal or Open in Terminal. Elsewhere this is just `Command::new`.
 fn spawnable(program: &str) -> std::process::Command {
-    let mut command = std::process::Command::new(program);
+    let command = std::process::Command::new(program);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -5809,6 +5841,11 @@ fn main() -> Result<()> {
         // the keyboard handler picks the shortcuts back up.
         Err(e) => log::warn!("could not install the menu bar: {e}"),
     }
+
+    // Likewise after the event loop exists: a bundled app is handed its
+    // documents through the application delegate, and winit leaves that
+    // slot free for exactly this.
+    openfiles::install(event_loop.create_proxy());
 
     event_loop.run_app(&mut app).context("event loop failed")?;
     // Servers outlive the window otherwise, and rust-analyzer is not a

@@ -42,10 +42,50 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key>       <true/>
-  <!-- No CFBundleDocumentTypes yet: declaring them would put lithe in
-       "Open With" menus, and opening a file that way sends an
-       application:openFiles: event the editor does not handle. That is a
-       promise to keep once it does. -->
+  <!-- Without these LaunchServices refuses before the app is even
+       consulted: "can't open files of this type" for everything,
+       including from \`open -a\`. The delegate in src/openfiles.rs is the
+       other half; declaring types without handling the event would be
+       the same refusal with extra steps.
+
+       Text and source are Alternate, so lithe appears in "Open With"
+       without taking over as the default for files another editor owns.
+       The catch-all is rank None for the same reason: an editor should
+       be able to open anything handed to it, without volunteering for
+       every file on the disk. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>     <string>Text</string>
+      <key>CFBundleTypeRole</key>     <string>Editor</string>
+      <key>LSHandlerRank</key>        <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.plain-text</string>
+        <string>public.text</string>
+        <string>public.source-code</string>
+        <string>public.script</string>
+        <string>public.shell-script</string>
+        <string>public.xml</string>
+        <string>public.json</string>
+        <string>net.daringfireball.markdown</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>     <string>Any file</string>
+      <key>CFBundleTypeRole</key>     <string>Editor</string>
+      <key>LSHandlerRank</key>        <string>None</string>
+      <key>LSItemContentTypes</key>
+      <array><string>public.data</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>     <string>Folder</string>
+      <key>CFBundleTypeRole</key>     <string>Editor</string>
+      <key>LSHandlerRank</key>        <string>None</string>
+      <key>LSItemContentTypes</key>
+      <array><string>public.folder</string></array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST

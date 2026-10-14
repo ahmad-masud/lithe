@@ -36,3 +36,12 @@ env_logger.workspace = true
 # Info.plist does for the Mac bundle. Windows only, and build-time only.
 [target.'cfg(windows)'.build-dependencies]
 embed-resource.workspace = true
+
+# Finder, the Dock and `open -a` hand a bundled app its documents through
+# the application delegate, not the command line. Pinned to the versions
+# winit itself uses: a different objc2 means a different `NSApplication`
+# type and `setDelegate:` will not take ours.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.3"
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.2.2", features = ["NSArray", "NSString", "NSURL"] }
