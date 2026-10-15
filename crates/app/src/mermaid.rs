@@ -51,13 +51,28 @@ impl Dir {
 /// characters looks like a mistake rather than a diamond.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {
+    /// `A[..]`, a step.
     Rect,
+    /// `A(..)` and `A((..))`, a terminus.
     Round,
+    /// `A{..}`, a decision. Drawn with sloped corners, which is as
+    /// close to a diamond as a character grid gets — and close enough,
+    /// because what matters is that it is not the same shape as a step.
+    Diamond,
+    /// `A[(..)]`, a store. A disc across the top, which is the symbol
+    /// everyone already reads as a database.
+    Cylinder,
 }
 
 #[derive(Clone, Debug)]
 struct Node {
-    label: String,
+    /// The label, already broken where it said to break.
+    ///
+    /// Mermaid writes a line break inside a label as a literal `\n` or
+    /// as `<br>`, which the source carries through verbatim. Collapsing
+    /// those to a space made `Node 0 (leader)\ngRPC + Raft` one very
+    /// wide box saying something the author did not write.
+    lines: Vec<String>,
     shape: Shape,
     layer: usize,
     /// Column within the layer, and then the cell the box is centred on.
@@ -70,6 +85,14 @@ struct Edge {
     from: usize,
     to: usize,
     label: Option<String>,
+    /// `A <--> B`: a link rather than a direction.
+    ///
+    /// It says the two are connected, not that one comes before the
+    /// other, so it must not push its target down a layer. Letting it
+    /// do that is what spread the three peers of a Raft cluster down
+    /// three rows of the page and left the subgraph round them with
+    /// nothing it could honestly frame.
+    both: bool,
 }
 
 /// Renders a `mermaid` fence, or `None` when it is not a flowchart this
@@ -88,7 +111,7 @@ pub fn render(source: &str, columns: usize) -> Option<Vec<String>> {
     if nodes.is_empty() {
         return None;
     }
-    layer(&mut nodes, &edges);
+    layer(&mut nodes, &edges, &groups);
     let canvas = if dir.vertical() {
         draw_vertical(dir, &mut nodes, &edges, &groups, columns)
     } else {
@@ -158,7 +181,7 @@ fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>, Vec<Group>)> {
         }
 
         match split_edge(line) {
-            Some((left, label, right)) => {
+            Some((left, label, right, both)) => {
                 // `A & B --> C & D` is Mermaid's shorthand for every edge
                 // between the two sides. Reading it as one node called
                 // "A & B" found no such node and refused the whole chart.
@@ -176,6 +199,7 @@ fn parse(source: &str) -> Option<(Dir, Vec<Node>, Vec<Edge>, Vec<Group>)> {
                             from,
                             to,
                             label: label.clone(),
+                            both,
                         });
                     }
                 }
@@ -250,8 +274,11 @@ fn chain(side: &str) -> Vec<&str> {
 ///
 /// Returns `None` when the line holds no edge at all, which the caller
 /// reads as a bare node declaration.
-fn split_edge(line: &str) -> Option<(&str, Option<String>, &str)> {
+fn split_edge(line: &str) -> Option<(&str, Option<String>, &str, bool)> {
     let (at, len) = last_arrow(line)?;
+    // `<-->` and `<==>` point both ways, which is a link rather than an
+    // order. Read off the arrow itself, before the sides are trimmed.
+    let both = line[at..at + len].starts_with('<');
     let left = line[..at].trim();
     let mut rest = line[at + len..].trim_start();
     // `--o` and `--x` end an edge with a circle or a cross; the tail
@@ -297,7 +324,7 @@ fn split_edge(line: &str) -> Option<(&str, Option<String>, &str)> {
             None => (left, None),
         },
     };
-    Some((left, label, right))
+    Some((left, label, right, both))
 }
 
 /// The last arrow in a line, as a byte offset and length.
@@ -341,7 +368,7 @@ fn intern(token: &str, index: &mut HashMap<String, usize>, nodes: &mut Vec<Node>
     let (id, label, shape) = node_parts(token)?;
     if let Some(&at) = index.get(&id) {
         if let Some(label) = label {
-            nodes[at].label = label;
+            nodes[at].lines = label;
             nodes[at].shape = shape;
         }
         return Some(at);
@@ -349,7 +376,7 @@ fn intern(token: &str, index: &mut HashMap<String, usize>, nodes: &mut Vec<Node>
     let at = nodes.len();
     index.insert(id.clone(), at);
     nodes.push(Node {
-        label: label.unwrap_or(id),
+        lines: label.unwrap_or_else(|| vec![id]),
         shape,
         layer: 0,
         order: 0,
@@ -358,8 +385,8 @@ fn intern(token: &str, index: &mut HashMap<String, usize>, nodes: &mut Vec<Node>
     Some(at)
 }
 
-/// Splits `A[Label]` into its id, its label and its outline.
-fn node_parts(token: &str) -> Option<(String, Option<String>, Shape)> {
+/// Splits `A[Label]` into its id, the rows of its label and its outline.
+fn node_parts(token: &str) -> Option<(String, Option<Vec<String>>, Shape)> {
     let token = token.trim();
     if token.is_empty() {
         return None;
@@ -380,7 +407,11 @@ fn node_parts(token: &str) -> Option<(String, Option<String>, Shape)> {
     let inner = &token[open..];
     // A rectangle is `[..]`; everything else Mermaid offers is drawn
     // rounded. See `Shape`.
-    let shape = if inner.starts_with('[') && !inner.starts_with("[[") && !inner.starts_with("[(") {
+    let shape = if inner.starts_with("[(") {
+        Shape::Cylinder
+    } else if inner.starts_with('{') {
+        Shape::Diamond
+    } else if inner.starts_with('[') && !inner.starts_with("[[") {
         Shape::Rect
     } else {
         Shape::Round
@@ -388,14 +419,20 @@ fn node_parts(token: &str) -> Option<(String, Option<String>, Shape)> {
     let label = inner
         .trim_matches(|c| matches!(c, '[' | ']' | '(' | ')' | '{' | '}' | '>' | '"'))
         .trim()
-        // A quoted label can carry `\n`, which is a line break Mermaid
-        // draws and this cannot: one row per box is what keeps the
-        // layout arithmetic honest, so it becomes a space.
-        .replace("\\n", " ")
-        .replace('"', "")
-        .to_string();
-    let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
-    Some((id, (!label.is_empty()).then_some(label), shape))
+        .replace('"', "");
+    // A label breaks where Mermaid says it breaks. The source carries
+    // `\n` as two characters and `<br>` as itself, so both are found
+    // here rather than in whatever wrote the file.
+    let rows: Vec<String> = label
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("<br>", "\n")
+        .replace("\\n", "\n")
+        .split('\n')
+        .map(|row| row.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|row| !row.is_empty())
+        .collect();
+    Some((id, (!rows.is_empty()).then_some(rows), shape))
 }
 
 /// Puts each node one layer below its deepest predecessor.
@@ -404,11 +441,62 @@ fn node_parts(token: &str) -> Option<(String, Option<String>, Shape)> {
 /// because a flowchart with a loop in it is still a flowchart someone
 /// wants to look at — the cap is what keeps a cycle from running
 /// forever, and the layering it settles on is good enough to draw.
-fn layer(nodes: &mut [Node], edges: &[Edge]) {
+fn layer(nodes: &mut [Node], edges: &[Edge], groups: &[Group]) {
     for _ in 0..nodes.len() {
         let mut moved = false;
         for edge in edges {
-            if edge.from == edge.to {
+            // A two-headed arrow says the ends are connected, not that
+            // one comes before the other, so it ranks neither.
+            if edge.from == edge.to || edge.both {
+                continue;
+            }
+            let want = nodes[edge.from].layer + 1;
+            if nodes[edge.to].layer < want {
+                nodes[edge.to].layer = want;
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    // A node in a subgraph with nothing pointing at it has no layer of
+    // its own, so it sits at the top while its peers are further down
+    // and the subgraph cannot be framed without enclosing strangers.
+    // It joins its peers instead — a subgraph is drawn as one region,
+    // which is the whole of what declaring one asks for.
+    let ranked: Vec<bool> = {
+        let mut has = vec![false; nodes.len()];
+        for edge in edges {
+            if edge.from != edge.to && !edge.both {
+                has[edge.to] = true;
+            }
+        }
+        has
+    };
+    for group in groups {
+        let settled = group
+            .members
+            .iter()
+            .filter(|i| ranked[**i])
+            .map(|i| nodes[*i].layer)
+            .max();
+        let Some(settled) = settled else { continue };
+        for &member in &group.members {
+            if !ranked[member] {
+                nodes[member].layer = settled;
+            }
+        }
+    }
+
+    // Pulling a node down can leave an edge from it pointing upwards,
+    // so what follows it comes down too. Bounded, like the relaxation
+    // above, and for the same reason.
+    for _ in 0..nodes.len() {
+        let mut moved = false;
+        for edge in edges {
+            if edge.from == edge.to || edge.both {
                 continue;
             }
             let want = nodes[edge.from].layer + 1;
@@ -433,11 +521,38 @@ fn layer(nodes: &mut [Node], edges: &[Edge]) {
 }
 
 /// Cells a box takes, including its border and one space of padding.
-fn box_width(label: &str) -> usize {
-    label.chars().count() + 4
+fn box_width(node: &Node) -> usize {
+    node.lines
+        .iter()
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 4
 }
 
+/// Rows a box takes: one per line of its label, and its two borders.
+///
+/// A store has one more, for the disc across its top.
+fn box_height(node: &Node) -> usize {
+    node.lines.len().max(1) + 2 + usize::from(node.shape == Shape::Cylinder)
+}
+
+/// Rows the tallest box in a layer takes, which is the layer's height.
+fn layer_height(nodes: &[Node], layer: &[usize]) -> usize {
+    layer
+        .iter()
+        .map(|i| box_height(&nodes[*i]))
+        .max()
+        .unwrap_or(BOX_H)
+}
+
+/// A box with a one-line label, which is most of them.
 const BOX_H: usize = 3;
+/// Rows a subgraph frame keeps between its border and the boxes in it.
+///
+/// Two: one for the border itself, and one for whatever an edge is
+/// doing on its way in or out.
+const FRAME_PAD: usize = 2;
 /// Rows between one layer of boxes and the next.
 ///
 /// Three, not two: an arrow needs a row to leave by, a row to run
@@ -535,30 +650,52 @@ impl Canvas {
         }
     }
 
-    /// A box with its label centred, at `x`,`y`.
-    fn boxed(&mut self, x: usize, y: usize, label: &str, shape: Shape) {
-        let width = box_width(label);
-        let (tl, tr, bl, br) = match shape {
+    /// A box with its label inside, at `x`,`y`.
+    ///
+    /// As many rows as the label has lines, each centred in the box:
+    /// a two-line label in a left-aligned box reads as one line that
+    /// ran out of room.
+    fn boxed(&mut self, x: usize, y: usize, node: &Node) {
+        let width = box_width(node);
+        let height = box_height(node);
+        let (tl, tr, bl, br) = match node.shape {
             Shape::Rect => ('┌', '┐', '└', '┘'),
-            Shape::Round => ('╭', '╮', '╰', '╯'),
+            Shape::Round | Shape::Cylinder => ('╭', '╮', '╰', '╯'),
+            Shape::Diamond => ('╱', '╲', '╲', '╱'),
         };
-        for row in 0..3 {
+        for row in 0..height {
             for i in 0..width {
                 self.set(x + i, y + row, ' ');
             }
         }
+        let last = height - 1;
         self.set(x, y, tl);
         self.set(x + width - 1, y, tr);
-        self.set(x, y + 2, bl);
-        self.set(x + width - 1, y + 2, br);
+        self.set(x, y + last, bl);
+        self.set(x + width - 1, y + last, br);
         for i in 1..width - 1 {
             self.set(x + i, y, '─');
-            self.set(x + i, y + 2, '─');
+            self.set(x + i, y + last, '─');
         }
-        self.set(x, y + 1, '│');
-        self.set(x + width - 1, y + 1, '│');
-        for (i, ch) in label.chars().enumerate() {
-            self.set(x + 2 + i, y + 1, ch);
+        for row in 1..last {
+            self.set(x, y + row, '│');
+            self.set(x + width - 1, y + row, '│');
+        }
+        // A store's disc: the line that makes a rounded box read as a
+        // cylinder rather than as a terminus.
+        let lid = usize::from(node.shape == Shape::Cylinder);
+        if lid == 1 {
+            self.set(x, y + 1, '├');
+            self.set(x + width - 1, y + 1, '┤');
+            for i in 1..width - 1 {
+                self.set(x + i, y + 1, '─');
+            }
+        }
+        for (row, text) in node.lines.iter().enumerate() {
+            let inset = (width - text.chars().count()) / 2;
+            for (i, ch) in text.chars().enumerate() {
+                self.set(x + inset + i, y + 1 + lid + row, ch);
+            }
         }
     }
 
@@ -631,10 +768,7 @@ fn draw_vertical(
     let widths: Vec<usize> = rows
         .iter()
         .map(|layer| {
-            layer
-                .iter()
-                .map(|i| box_width(&nodes[*i].label))
-                .sum::<usize>()
+            layer.iter().map(|i| box_width(&nodes[*i])).sum::<usize>()
                 + GAP_H * layer.len().saturating_sub(1)
         })
         .collect();
@@ -647,15 +781,40 @@ fn draw_vertical(
         .map(|l| l.chars().count() + 3)
         .max()
         .unwrap_or(0);
-    let content = *widths.iter().max()? + 1;
+    // A subgraph's title is written on its top border, so a group
+    // whose boxes are narrower than its name still needs the room:
+    // without this the title did not fit and was dropped, and the
+    // subgraph was drawn as an unlabelled box.
+    let titles = groups
+        .iter()
+        .filter(|g| !g.members.is_empty())
+        .map(|g| g.title.chars().count() + 6)
+        .max()
+        .unwrap_or(0);
+    let content = (*widths.iter().max()?).max(titles) + 1;
     let width = content + gutter;
     if width > columns {
         return None;
     }
-    // A group frame is drawn one row above the layer it starts on, so
-    // the canvas needs a row of headroom or the frame lands on the box.
-    let headroom = usize::from(!groups.is_empty());
-    let height = headroom + rows.len() * BOX_H + rows.len().saturating_sub(1) * GAP_V + headroom;
+    // A frame needs rows of its own, above and below the boxes it
+    // holds, or an arrowhead arriving at the layer inside it lands on
+    // the border and eats the title: `Raft Cluster` came out as
+    // `Raft Cl▼ster`. Three more rows between layers buys them, and
+    // the room is only taken when there is a subgraph to spend it on.
+    let framed = !groups.is_empty();
+    let headroom = if framed { FRAME_PAD } else { 0 };
+    let gap = if framed { GAP_V + 3 } else { GAP_V };
+    // Layers are no longer all one height — a box is as tall as its
+    // label has lines — so the row each one starts on is the sum of
+    // the ones above it rather than its depth times a constant.
+    let heights: Vec<usize> = rows.iter().map(|l| layer_height(nodes, l)).collect();
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut at = headroom;
+    for height in &heights {
+        starts.push(at);
+        at += height + gap;
+    }
+    let height = at.saturating_sub(gap) + headroom;
     // The order layers were drawn in, so a group frame can find the row
     // a layer landed on even when the direction reversed them.
     let rows_order: Vec<usize> = rows
@@ -665,15 +824,17 @@ fn draw_vertical(
 
     let mut canvas = Canvas::new(width + 4, height);
     let mut tops: Vec<usize> = vec![0; nodes.len()];
+    let mut bottoms: Vec<usize> = vec![0; nodes.len()];
 
     for (depth, layer) in rows.iter().enumerate() {
-        let y = headroom + depth * (BOX_H + GAP_V);
+        let y = starts[depth];
         let mut x = (content - widths[depth]) / 2;
         for &i in layer {
-            let w = box_width(&nodes[i].label);
-            canvas.boxed(x, y, &nodes[i].label, nodes[i].shape);
+            let w = box_width(&nodes[i]);
+            canvas.boxed(x, y, &nodes[i]);
             nodes[i].centre = x + w / 2;
             tops[i] = y;
+            bottoms[i] = y + box_height(&nodes[i]);
             x += w + GAP_H;
         }
     }
@@ -700,24 +861,40 @@ fn draw_vertical(
         let left = group
             .members
             .iter()
-            .map(|i| nodes[*i].centre - box_width(&nodes[*i].label) / 2)
+            .map(|i| nodes[*i].centre - box_width(&nodes[*i]) / 2)
             .min()?;
         let right = group
             .members
             .iter()
-            .map(|i| nodes[*i].centre + box_width(&nodes[*i].label) / 2)
+            .map(|i| nodes[*i].centre + box_width(&nodes[*i]) / 2)
             .max()?;
         let depth = |layer: usize| rows_order.iter().position(|l| *l == layer).unwrap_or(layer);
-        let top = headroom + depth(first) * (BOX_H + GAP_V);
-        let bottom = headroom + depth(last) * (BOX_H + GAP_V) + BOX_H;
+        let (first_depth, last_depth) = (depth(first), depth(last));
+        let top = starts.get(first_depth).copied().unwrap_or(headroom);
+        let bottom = starts.get(last_depth).copied().unwrap_or(headroom)
+            + heights.get(last_depth).copied().unwrap_or(BOX_H);
+        // Below the row a link between two members is routed on, so
+        // such a link is drawn inside the subgraph it belongs to. Wide
+        // enough for the title, which is written along the top border
+        // and is otherwise dropped for want of room.
+        let x0 = left.saturating_sub(2);
+        let x1 = (right + 2).max(x0 + group.title.chars().count() + 4);
         canvas.frame(
-            left.saturating_sub(2),
-            top - 1,
-            right + 2,
-            bottom,
+            x0,
+            top.saturating_sub(FRAME_PAD),
+            x1.min(content),
+            bottom + FRAME_PAD,
             &group.title,
         );
     }
+
+    // Edges whose ends landed on one row, which a top-to-bottom route
+    // cannot express. Collected here and drawn below the row they
+    // share, once everything on it is placed.
+    let mut same_layer: Vec<&Edge> = Vec::new();
+    // Labels already placed in the gutter, so two do not land on each
+    // other and one of them come out half-written.
+    let mut taken: Vec<(usize, String)> = Vec::new();
 
     for edge in edges {
         if edge.from == edge.to {
@@ -727,9 +904,10 @@ fn draw_vertical(
         // Drawn from whichever end is higher on the canvas, so an edge
         // that runs against the layout direction still points somewhere.
         let (top, bottom) = if tops[a] <= tops[b] { (a, b) } else { (b, a) };
-        let from_y = tops[top] + BOX_H;
+        let from_y = bottoms[top];
         let to_y = tops[bottom];
         if to_y <= from_y {
+            same_layer.push(edge);
             continue;
         }
         let mid = from_y + (to_y - from_y) / 2;
@@ -766,6 +944,62 @@ fn draw_vertical(
             }
         }
     }
+    // Edges between boxes on the same row, routed under it: down out
+    // of one, across, and up into the other. Drawn last so they give
+    // way to everything already placed.
+    for edge in same_layer {
+        let (a, b) = (edge.from, edge.to);
+        if nodes[a].centre == nodes[b].centre {
+            continue;
+        }
+        let base = bottoms[a].max(bottoms[b]);
+        let run = base + 1;
+        if run >= height {
+            continue;
+        }
+        let (lo, hi) = (
+            nodes[a].centre.min(nodes[b].centre),
+            nodes[a].centre.max(nodes[b].centre),
+        );
+        for x in lo..=hi {
+            canvas.under(x, run, '─');
+        }
+        canvas.join(lo, run, '╰', '┴');
+        canvas.join(hi, run, '╯', '┴');
+        // Pointing up into the box it arrives at, since it comes from
+        // below. A two-headed arrow arrives at both.
+        canvas.put(nodes[b].centre, base, '▲');
+        if edge.both {
+            canvas.put(nodes[a].centre, base, '▲');
+        } else {
+            canvas.under(nodes[a].centre, base, '│');
+        }
+        if let Some(label) = edge.label.as_deref() {
+            // In the gutter, not beside the arrow: a same-row link runs
+            // across the whole width between its ends, so there is no
+            // clear cell next to it — the label landed on the line and
+            // came out as `Raft─consensus────`.
+            //
+            // Three links between the same three peers usually carry
+            // the same word, so an identical label on a row it is
+            // already on is the one already there; a different one
+            // steps down until it finds a row of its own.
+            let here = |taken: &[(usize, String)], row: usize| {
+                taken.iter().any(|(r, l)| *r == row && l == label)
+            };
+            let used = |taken: &[(usize, String)], row: usize| taken.iter().any(|(r, _)| *r == row);
+            let mut row = run;
+            while !here(&taken, row) && used(&taken, row) && row + 1 < height {
+                row += 1;
+            }
+            if here(&taken, row) {
+                continue;
+            }
+            taken.push((row, label.to_string()));
+            canvas.label(content + 1, row, label);
+        }
+    }
+
     Some(canvas.into_lines())
 }
 
@@ -782,17 +1016,40 @@ fn draw_horizontal(
         .map(|layer| {
             layer
                 .iter()
-                .map(|i| box_width(&nodes[*i].label))
+                .map(|i| box_width(&nodes[*i]))
                 .max()
                 .unwrap_or(0)
         })
         .collect();
-    let width: usize = col_widths.iter().sum::<usize>() + GAP_LR * cols.len().saturating_sub(1) + 1;
+    // Edge labels are written in the space between two columns, so
+    // that space has to be wide enough for them. Without this a label
+    // was centred on the connector it belonged to and cut in half by
+    // it: `no` came out as `n`.
+    let lane = edges
+        .iter()
+        .filter_map(|e| e.label.as_deref())
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let gap_lr = GAP_LR + if lane > 0 { lane + 1 } else { 0 };
+    let width: usize = col_widths.iter().sum::<usize>() + gap_lr * cols.len().saturating_sub(1) + 1;
     if width > columns {
         return None;
     }
-    let tallest = cols.iter().map(Vec::len).max()?;
-    let height = tallest * (BOX_H + 1);
+    // Boxes are not all one height — a label can have more than one
+    // line, and a store has a disc across its top — so a column is as
+    // tall as the boxes in it rather than as its count times a
+    // constant.
+    let spans: Vec<usize> = cols
+        .iter()
+        .map(|layer| {
+            layer
+                .iter()
+                .map(|i| box_height(&nodes[*i]) + 1)
+                .sum::<usize>()
+        })
+        .collect();
+    let height = *spans.iter().max()?;
 
     let mut canvas = Canvas::new(width, height);
     let mut lefts: Vec<usize> = vec![0; nodes.len()];
@@ -803,16 +1060,18 @@ fn draw_horizontal(
     for (depth, layer) in cols.iter().enumerate() {
         // Each column centred against the tallest, for the same reason
         // the vertical layout centres its rows.
-        let span = layer.len() * (BOX_H + 1);
-        let mut y = (height - span) / 2;
+        let mut y = (height - spans[depth]) / 2;
         for &i in layer {
-            canvas.boxed(x, y, &nodes[i].label, nodes[i].shape);
+            let tall = box_height(&nodes[i]);
+            canvas.boxed(x, y, &nodes[i]);
             lefts[i] = x;
-            rights[i] = x + box_width(&nodes[i].label);
-            mids[i] = y + 1;
-            y += BOX_H + 1;
+            rights[i] = x + box_width(&nodes[i]);
+            // The middle of the box, so an arrow arrives beside the
+            // label rather than on a border or on a store's disc.
+            mids[i] = y + tall / 2;
+            y += tall + 1;
         }
-        x += col_widths[depth] + GAP_LR;
+        x += col_widths[depth] + gap_lr;
     }
 
     for edge in edges {
@@ -848,9 +1107,13 @@ fn draw_horizontal(
         canvas.put(to_x.saturating_sub(1), y1, '▶');
 
         if let Some(label) = edge.label.as_deref() {
-            let at = mid.saturating_sub(label.chars().count() / 2);
-            let row = y0.min(y1).saturating_sub(1);
-            canvas.text(at, row, label);
+            // Beside the arrowhead and one row above it: clear of the
+            // connector, which cut a centred label in half, and on a
+            // row of its own, which two edges leaving the same box
+            // were not — both labels landed on one row and the second
+            // was written over the first.
+            let at = to_x.saturating_sub(1 + label.chars().count());
+            canvas.label(at, y1.saturating_sub(1), label);
         }
     }
     Some(canvas.into_lines())
@@ -930,7 +1193,17 @@ mod sequence {
 
         let mut x = 0;
         for (i, name) in names.iter().enumerate() {
-            canvas.boxed(x, 0, name, super::Shape::Rect);
+            canvas.boxed(
+                x,
+                0,
+                &super::Node {
+                    lines: vec![name.clone()],
+                    shape: super::Shape::Rect,
+                    layer: 0,
+                    order: 0,
+                    centre: 0,
+                },
+            );
             x += widths[i] + GAP;
         }
 
@@ -1137,10 +1410,34 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_is_drawn_differently_from_a_step() {
-        let out = drawn("flowchart TB\n  A[Step] --> B{Choice}\n");
+    fn every_shape_is_drawn_differently_from_the_others() {
+        // A flowchart says what a thing is by the shape it is drawn
+        // as, so a decision that looks like a step has thrown the
+        // information away.
+        let out =
+            drawn("flowchart TB\n  A[Step] --> B{Choice}\n  B --> C(Done)\n  B --> D[(Store)]\n");
         assert!(out.contains('┌'), "a step is square: {out}");
-        assert!(out.contains('╭'), "a decision is rounded: {out}");
+        assert!(out.contains('╱'), "a decision is sloped: {out}");
+        assert!(out.contains('╭'), "a terminus is rounded: {out}");
+        assert!(
+            out.contains('├') && out.contains('┤'),
+            "a store has a disc across its top: {out}"
+        );
+    }
+
+    #[test]
+    fn a_store_is_taller_than_the_box_beside_it() {
+        // The disc is a row of its own, so the layout has to give it
+        // one — a box drawn taller than the row it was placed in
+        // writes through whatever is under it.
+        let out = drawn("flowchart LR\n  A[Step] --> B[(Store)]\n");
+        for row in out.lines() {
+            assert!(
+                !row.contains("Step") || !row.contains("Store"),
+                "the two sit on different rows of their boxes: {out}"
+            );
+        }
+        assert!(out.contains("Step") && out.contains("Store"), "{out}");
     }
 
     #[test]
@@ -1183,11 +1480,71 @@ mod tests {
     }
 
     #[test]
-    fn a_quoted_label_loses_its_escapes_rather_than_showing_them() {
+    fn a_quoted_label_breaks_where_it_says_to_break() {
         let out = drawn("flowchart TB\n  A[\"Node 0 (leader)\\ngRPC\"] --> B[Next]\n");
-        assert!(out.contains("Node 0 (leader) gRPC"), "{out}");
         assert!(!out.contains('\\'), "the escape should not survive:\n{out}");
         assert!(!out.contains('"'), "nor the quotes:\n{out}");
+        // Two rows of one box, not one row saying something the author
+        // did not write.
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("Node 0 (leader)"))
+            .expect("the first line of the label");
+        assert!(
+            rows[first + 1].contains("gRPC"),
+            "the second line belongs under the first:\n{out}"
+        );
+        assert!(!rows[first].contains("gRPC"), "and not beside it:\n{out}");
+    }
+
+    #[test]
+    fn a_br_tag_breaks_a_label_too() {
+        let out = drawn("flowchart TB\n  A[One<br/>Two] --> B[Next]\n");
+        let rows: Vec<&str> = out.lines().collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("One"))
+            .expect("the first line");
+        assert!(rows[first + 1].contains("Two"), "{out}");
+        assert!(!out.contains("<br"), "the tag itself is not text:\n{out}");
+    }
+
+    #[test]
+    fn a_two_headed_arrow_leaves_its_ends_side_by_side() {
+        // `<-->` says two nodes are connected, not that one comes
+        // before the other. Ranking it put the peers of a cluster on
+        // three separate rows.
+        let out = drawn("flowchart TB\n  A[Aaa] <--> B[Bbb]\n");
+        let rows: Vec<&str> = out.lines().collect();
+        let a = rows.iter().position(|r| r.contains("Aaa")).expect("Aaa");
+        let b = rows.iter().position(|r| r.contains("Bbb")).expect("Bbb");
+        assert_eq!(a, b, "both on one row:\n{out}");
+    }
+
+    #[test]
+    fn a_subgraph_keeps_its_members_together() {
+        // `C` is only reachable by a two-headed arrow, so nothing ranks
+        // it and it would sit at the top on its own — leaving the
+        // subgraph round it unable to frame anything honestly.
+        let source = "flowchart TB\n               subgraph g [Group]\n    A[Aaa]\n    C[Ccc]\n  end\n               Z[Zzz] --> A\n  A <--> C\n";
+        let out = drawn(source);
+        let rows: Vec<&str> = out.lines().collect();
+        let a = rows.iter().position(|r| r.contains("Aaa")).expect("Aaa");
+        let c = rows.iter().position(|r| r.contains("Ccc")).expect("Ccc");
+        assert_eq!(a, c, "members share a row:\n{out}");
+        assert!(out.contains("Group"), "and the frame is drawn:\n{out}");
+        assert!(out.contains('╎'), "with sides:\n{out}");
+    }
+
+    #[test]
+    fn an_arrow_into_a_subgraph_does_not_land_on_its_title() {
+        // The arrowhead used to arrive on the frame's top border:
+        // `Raft Cluster` came out as `Raft Cl▼ster`.
+        let source = "flowchart TB\n               Z[Zzz] --> A\n  subgraph g [Raft Cluster]\n    A[Aaa]\n  end\n";
+        let out = drawn(source);
+        assert!(out.contains("Raft Cluster"), "the title survives:\n{out}");
+        assert!(out.contains('▼'), "and the arrow still arrives:\n{out}");
     }
 
     #[test]

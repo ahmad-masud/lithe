@@ -436,12 +436,10 @@ source node; a maximal run cannot, and it also handles the
 `A -- label --> B` form, where the real arrow is the second run and the
 label sits between them.
 
-A fenced block carries its own source on every one of its rows. The
-preview is drawn, not laid out as selectable text, so there is nothing
-to drag-select; the block is the unit instead, and a click anywhere in
-it copies. Carrying the text on every row rather than only the first
-means the click needs no walk back to find where the block started, and
-an `Arc` means a row still costs a refcount to clone.
+A fenced block carries its own source on every one of its rows, so a
+click anywhere in it copies the block without a walk back to find
+where it started; an `Arc` means a row still costs a refcount to
+clone.
 
 Asking for a frame when a window is created is not enough on macOS. The
 frame is drawn before AppKit has finished activating the app, so nothing
@@ -463,6 +461,46 @@ is what lets the layering stay one simple pass. The frame is skipped
 when the group's nodes did not land in a clean rectangle — a frame round
 nodes it does not own is a worse error than no frame, and the diagram is
 still drawn either way.
+
+Three things decide whether they do land in one. A two-headed arrow
+does not rank its target: `<-->` says two nodes are connected, not
+that one comes before the other, and letting it push its target down a
+layer put the three peers of a Raft cluster on three rows with the
+subgraph round them unable to frame anything. A member of a subgraph
+that nothing points at joins the layer its ranked peers settled on,
+rather than floating to the top alone. And the relaxation runs again
+afterwards, because pulling a node down can leave an edge out of it
+pointing upwards.
+
+That leaves edges between boxes on one row, which a top-to-bottom
+route cannot express. They are collected while the rest are drawn and
+routed under the row they share: down out of one, across, and up into
+the other, with a head at each end of a two-headed arrow. The route
+sits inside the subgraph frame, because an edge between two members
+belongs to the subgraph.
+
+A frame needs rows of its own. Without them the arrowhead arriving at
+the layer inside it landed on the top border and ate the title, so
+`Raft Cluster` came out as `Raft Cl▼ster`; the gap between layers
+grows by three when there is a subgraph to spend it on, and only then.
+The canvas is also widened to the longest title, since a title that
+does not fit on its border is dropped and the subgraph is drawn
+unlabelled.
+
+A box is as tall as its label has lines. Mermaid writes a break inside
+a label as a literal `\n` or as `<br>`, which the source carries
+through verbatim, and collapsing those to a space made
+`Node 0 (leader)\ngRPC + Raft` one very wide box saying something the
+author did not write. Both layouts therefore measure each layer rather
+than multiplying a constant.
+
+What a node *is* comes from its shape, so four are drawn rather than
+two: a step is square, a terminus rounded, a decision sloped at the
+corners — as close to a diamond as a character grid gets, and close
+enough because what matters is that it is not a step — and a store has
+a disc across its top, which is the symbol everyone already reads as a
+database. The disc is a row of its own, which is the other reason box
+heights vary.
 
 A sequence diagram's message text goes down before its lifelines, which
 are then drawn only where the text is not. The other order put a `│`
