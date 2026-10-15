@@ -107,6 +107,9 @@ struct Pane {
     git: Option<GitPanel>,
     /// Set when something could have changed what `git status` would say.
     git_stale: bool,
+    /// Whether a save has already been refused for writing over a file
+    /// that changed on disk, so the next one goes through.
+    overwrite_ok: bool,
     /// Sidebar width in cells; dragged by its divider.
     sidebar_cols: f32,
     /// Rendered Markdown, and the buffer revision plus column count it was
@@ -881,6 +884,16 @@ impl Pane {
         let Some(editor) = self.ws.active_mut() else {
             return;
         };
+        // Saving is a temp-file-and-rename, so writing over a file that
+        // something else has changed replaces it wholesale and without
+        // a word. Refuse once and say so; asking again goes through.
+        if editor.changed_underneath() && !self.overwrite_ok {
+            self.overwrite_ok = true;
+            self.status =
+                Some("changed on disk since you opened it — save again to overwrite".into());
+            return;
+        }
+        self.overwrite_ok = false;
         self.git_stale = true;
         self.status = Some(match editor.save() {
             Ok(()) => format!(
@@ -1876,6 +1889,53 @@ impl App {
 
     /// Opens a window. The second and later ones share the first window's
     /// GPU device and glyph atlas rather than building their own.
+    /// Picks up changes made to open files by something else.
+    ///
+    /// Coming back to the window is the moment to look: a checkout, a
+    /// rebase or another editor happened while you were away, and the
+    /// buffer is now showing a file that no longer exists in that form.
+    ///
+    /// A clean buffer is reloaded without asking, because nothing is
+    /// lost by it. A dirty one is left alone and says so — the two
+    /// versions both matter and only you know which wins.
+    fn refresh_from_disk(&mut self, id: WindowId) {
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let mut reloaded = 0usize;
+        let mut conflicted: Vec<String> = Vec::new();
+        for editor in pane.ws.files_mut() {
+            if !editor.changed_underneath() {
+                continue;
+            }
+            let name = editor
+                .path
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if editor.dirty {
+                conflicted.push(name);
+            } else if editor.reload().is_ok() {
+                reloaded += 1;
+            }
+        }
+        if reloaded > 0 {
+            pane.git_stale = true;
+            pane.hunks_for = None;
+            pane.preview_for = None;
+        }
+        pane.status = match (conflicted.as_slice(), reloaded) {
+            ([], 0) => return,
+            ([], 1) => Some("reloaded, changed on disk".into()),
+            ([], n) => Some(format!("reloaded {n} files, changed on disk")),
+            (names, _) => Some(format!(
+                "{} changed on disk and has unsaved edits — save to overwrite, or close to discard",
+                names.join(", ")
+            )),
+        };
+    }
+
     /// Opens whatever Finder, the Dock or `open -a` has handed us.
     ///
     /// Into the focused window, because that is where "open this file"
@@ -1987,6 +2047,7 @@ impl App {
 
         let repo = ws.root.as_deref().and_then(lithe_vcs::Repo::discover);
         let pane = Pane {
+            overwrite_ok: false,
             code_actions: Vec::new(),
             blame_on: false,
             blame: None,
@@ -2457,6 +2518,11 @@ impl App {
                 if let Some(e) = pane.ws.active_mut() {
                     e.add_cursor(1);
                     e.scroll_to_cursor(rows);
+                }
+            }
+            Command::GotoLine => {
+                if pane.ws.active().is_some() {
+                    pane.prompt = Some(Prompt::goto_line());
                 }
             }
             Command::SelectLine => {
@@ -3382,6 +3448,30 @@ impl App {
                                 pane.hunks_for = None;
                                 pane.git_stale = true;
                             }
+                            PromptAction::GotoLine => {
+                                // 1-based, as every editor and every
+                                // compiler error reports a line.
+                                match prompt.text.trim().parse::<usize>() {
+                                    Ok(line) if line >= 1 => {
+                                        let rows = pane.visible_rows();
+                                        let total = pane
+                                            .ws
+                                            .active()
+                                            .map(|e| e.doc.len_lines())
+                                            .unwrap_or(0);
+                                        if let Some(editor) = pane.ws.active_mut() {
+                                            let at = (line - 1).min(total.saturating_sub(1));
+                                            let head = editor.doc.line_to_char(at);
+                                            editor.sel.collapse_to(Cursor::at(head));
+                                            editor.scroll_to_cursor(rows);
+                                        }
+                                    }
+                                    _ => {
+                                        pane.status =
+                                            Some(format!("{:?} is not a line", prompt.text.trim()))
+                                    }
+                                }
+                            }
                             PromptAction::RenameSymbol => {
                                 let name = prompt.text.trim().to_string();
                                 if name.is_empty() {
@@ -3798,6 +3888,7 @@ impl App {
                 Key::Character("f") | Key::Character("F") if shift => Some(Command::SearchProject),
                 Key::Character("f") if alt => Some(Command::Replace),
                 Key::Character("f") => Some(Command::Find),
+                Key::Character("g") | Key::Character("G") if !shift => Some(Command::GotoLine),
                 Key::Character("i") => Some(Command::Hover),
                 Key::Character("c") => Some(Command::Copy),
                 Key::Character("x") => Some(Command::Cut),
@@ -3911,7 +4002,11 @@ impl App {
                 true
             }
             Key::Named(NamedKey::Backspace) => {
-                editor.backspace();
+                // An empty pair goes as one, so backspacing the `(` of
+                // `()` does not leave the `)` behind.
+                if !editor.backspace_pair() {
+                    editor.backspace();
+                }
                 editor.scroll_to_cursor(rows);
                 true
             }
@@ -3954,7 +4049,12 @@ impl App {
                 if typed.is_empty() {
                     return false;
                 }
-                editor.insert(&typed);
+                // A bracket or quote closes itself, a closer already
+                // there is stepped over, and a selection is surrounded.
+                // Anything else is just typed.
+                if !editor.type_pair(&typed) {
+                    editor.insert(&typed);
+                }
                 editor.scroll_to_cursor(rows);
                 true
             }
@@ -4449,6 +4549,9 @@ impl ApplicationHandler<Wake> for App {
             // drawing it costs.
             WindowEvent::Focused(true) => {
                 self.focused = Some(id);
+                // Coming back is when a checkout or another editor has
+                // happened; look before anything is drawn or saved.
+                self.refresh_from_disk(id);
                 if let Some(pane) = self.panes.get_mut(&id) {
                     pane.refresh_tree();
                     // HEAD may be a different commit now, so the gutter's

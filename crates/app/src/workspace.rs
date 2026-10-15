@@ -12,6 +12,11 @@ use anyhow::Result;
 use crate::editor::Editor;
 
 /// What a tab shows.
+// The file variant is deliberately not boxed. It is the one reached on
+// every keystroke and every frame, and a pointer chase to save a
+// couple of hundred bytes per open tab is the wrong trade: ten tabs is
+// two kilobytes.
+#[allow(clippy::large_enum_variant)]
 pub enum Tab {
     /// A file, or a scratch buffer.
     File(Editor),

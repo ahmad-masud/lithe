@@ -34,6 +34,26 @@ fn shift(at: usize, moved: usize, delta: isize) -> usize {
     }
 }
 
+/// A file's identity on disk, cheap enough to check often.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DiskStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+impl DiskStamp {
+    /// `None` when the file cannot be stated, which includes not
+    /// existing — a deleted file is a change too, but not one this
+    /// reports, because the buffer is then the only copy left.
+    pub fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: meta.modified().ok()?,
+            len: meta.len(),
+        })
+    }
+}
+
 pub struct Editor {
     pub doc: TextBuffer,
     pub sel: Selection,
@@ -45,6 +65,15 @@ pub struct Editor {
     /// The file is not text. It still opens — as an image, or as a note
     /// saying so — rather than refusing with a decoding error.
     pub binary: bool,
+    /// What the file looked like on disk when it was last read or
+    /// written: its modified time and length.
+    ///
+    /// Not a hash. The point is to notice that something else changed
+    /// the file — a checkout, a rebase, another editor — and mtime and
+    /// length together catch that for the price of a `stat`, where
+    /// re-reading the file to hash it would cost the whole file on
+    /// every check.
+    pub on_disk: Option<DiskStamp>,
     /// Bumped on every change. Lets the language server sync notice work
     /// without diffing the document.
     pub revision: u64,
@@ -69,6 +98,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(doc: TextBuffer, path: Option<PathBuf>, tab_width: usize) -> Self {
+        let on_disk = path.as_deref().and_then(DiskStamp::of);
         let mut editor = Self {
             doc,
             sel: Selection::single(0),
@@ -76,6 +106,7 @@ impl Editor {
             dirty: false,
             preview: false,
             binary: false,
+            on_disk,
             revision: 0,
             scroll: 0.0,
             scroll_x: 0.0,
@@ -104,6 +135,49 @@ impl Editor {
             }
             Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
         }
+    }
+
+    /// Whether something other than this editor changed the file.
+    ///
+    /// A buffer whose file has moved underneath it must not be saved
+    /// over the top: the write is a temp-file-and-rename, so it would
+    /// replace a `git checkout` or another editor's work wholesale and
+    /// without a word.
+    pub fn changed_underneath(&self) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        let Some(stamp) = self.on_disk else {
+            return false;
+        };
+        // A file that cannot be stated is gone, not changed. The buffer
+        // is then the only copy and saving it is the right thing.
+        DiskStamp::of(path).is_some_and(|now| now != stamp)
+    }
+
+    /// Re-reads the file, discarding the buffer.
+    ///
+    /// Only for a clean buffer: there is nothing to weigh up when
+    /// nothing would be lost. The cursor is kept where it was, clamped,
+    /// because a reload after a checkout should leave you where you
+    /// were reading.
+    pub fn reload(&mut self) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        let head = self.sel.primary().head;
+        let scroll = self.scroll;
+        let fresh = Self::open(&path, self.tab_width)?;
+        self.doc = fresh.doc;
+        self.binary = fresh.binary;
+        self.on_disk = fresh.on_disk;
+        self.dirty = false;
+        self.revision = self.revision.wrapping_add(1);
+        self.history = History::new();
+        self.sel = Selection::single(head.min(self.doc.len_chars()));
+        self.scroll = scroll;
+        self.attach_syntax();
+        Ok(())
     }
 
     /// Picks a grammar from the path and does the first parse.
@@ -301,6 +375,130 @@ impl Editor {
     pub fn insert(&mut self, text: &str) {
         let owned = text.to_string();
         self.edit(|_, cursor| Some((cursor.range(), owned.clone())));
+    }
+
+    /// The closing half of a pair worth closing automatically.
+    fn closer(open: char) -> Option<char> {
+        Some(match open {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '"' => '"',
+            '\'' => '\'',
+            '`' => '`',
+            _ => return None,
+        })
+    }
+
+    /// Types `text`, closing a bracket or quote when that is what was
+    /// typed, and stepping over a closer already there.
+    ///
+    /// Returns false when `text` is nothing special, so the caller can
+    /// fall back to a plain insert.
+    ///
+    /// The rules are the restrained ones. A pair is only closed where
+    /// what follows is the end of the line or a character that closes
+    /// or separates — typing `(` before a word is reaching into
+    /// existing code, and an inserted `)` there lands in the middle of
+    /// it. A quote is not closed next to a word character at all,
+    /// because an apostrophe in prose is commoner than an empty pair.
+    pub fn type_pair(&mut self, text: &str) -> bool {
+        let mut chars = text.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            return false;
+        };
+
+        // Stepping over a closer we put there: typing `)` where one
+        // already sits moves past it rather than doubling it.
+        if matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`')
+            && self
+                .sel
+                .cursors()
+                .iter()
+                .all(|c| c.is_empty() && self.doc.char_at(c.head) == Some(ch))
+        {
+            let moved: Vec<Cursor> = self
+                .sel
+                .cursors()
+                .iter()
+                .map(|c| Cursor::at(c.head + 1))
+                .collect();
+            self.sel = Selection::from_cursors(moved);
+            return true;
+        }
+
+        let Some(close) = Self::closer(ch) else {
+            return false;
+        };
+
+        // A selection is surrounded rather than replaced, which is the
+        // other half of why this is worth having.
+        if self.sel.cursors().iter().any(|c| !c.is_empty()) {
+            let wrapped: Vec<(Range<usize>, String)> = self
+                .sel
+                .cursors()
+                .iter()
+                .filter(|c| !c.is_empty())
+                .map(|c| {
+                    let inner = self.doc.slice_to_string(c.range());
+                    (c.range(), format!("{ch}{inner}{close}"))
+                })
+                .collect();
+            return self.apply_edits(wrapped) > 0;
+        }
+
+        let openable = self.sel.cursors().iter().all(|cursor| {
+            let after = self.doc.char_at(cursor.head);
+            let before = cursor.head.checked_sub(1).and_then(|i| self.doc.char_at(i));
+            let room = match after {
+                None | Some('\n') => true,
+                Some(c) => c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | '.'),
+            };
+            // `it's` must not become `it''s`, and neither must a quote
+            // closed straight after a word.
+            let quote = matches!(ch, '"' | '\'' | '`');
+            room && !(quote && before.is_some_and(|c| c.is_alphanumeric() || c == '_'))
+        });
+        if !openable {
+            return false;
+        }
+
+        self.edit(|_, cursor| Some((cursor.range(), format!("{ch}{close}"))));
+        // Between the two, not after them.
+        let inside: Vec<Cursor> = self
+            .sel
+            .cursors()
+            .iter()
+            .map(|c| Cursor::at(c.head.saturating_sub(1)))
+            .collect();
+        self.sel = Selection::from_cursors(inside);
+        true
+    }
+
+    /// Deletes backwards, taking an empty pair with it.
+    ///
+    /// Backspacing the `(` of `()` that nothing was typed into should
+    /// leave neither half behind.
+    pub fn backspace_pair(&mut self) -> bool {
+        let empty_pair = self.sel.cursors().iter().all(|c| {
+            c.is_empty()
+                && c.head > 0
+                && self
+                    .doc
+                    .char_at(c.head - 1)
+                    .and_then(Self::closer)
+                    .is_some_and(|close| self.doc.char_at(c.head) == Some(close))
+        });
+        if !empty_pair || self.sel.is_empty() {
+            return false;
+        }
+        let spans: Vec<(Range<usize>, String)> = self
+            .sel
+            .cursors()
+            .iter()
+            .map(|c| (c.head - 1..c.head + 1, String::new()))
+            .collect();
+        self.apply_edits(spans) > 0
     }
 
     /// Newline, carrying the current line's indentation, and one level more
@@ -997,6 +1195,10 @@ impl Editor {
         }
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("cannot replace {}", path.display()))?;
+        // The file on disk is now this buffer, so the next check
+        // compares against what we just wrote rather than what was
+        // there before it.
+        self.on_disk = DiskStamp::of(&path);
 
         self.dirty = false;
         Ok(())
@@ -1597,5 +1799,200 @@ mod vscode_tests {
         assert_eq!(text(&e), "three\n");
         assert!(e.undo());
         assert_eq!(text(&e), "one\ntwo\nthree\n", "two lines, one undo");
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    fn written(name: &str, text: &str) -> (crate::testutil::TempDir, std::path::PathBuf) {
+        let dir = crate::testutil::TempDir::new();
+        dir.write(name, text);
+        let path = dir.path().join(name);
+        (dir, path)
+    }
+
+    /// Saving is a temp-file-and-rename, so a buffer whose file moved
+    /// underneath it would replace a checkout or another editor's work
+    /// wholesale and without a word.
+    #[test]
+    fn a_file_changed_by_something_else_is_noticed() {
+        let (_dir, path) = written("a.txt", "original\n");
+        let editor = Editor::open(&path, 4).unwrap();
+        assert!(!editor.changed_underneath(), "nothing has touched it yet");
+
+        // mtime has a resolution, so the length does the work here —
+        // which is the point of stamping both.
+        std::fs::write(&path, "changed by someone else\n").unwrap();
+        assert!(editor.changed_underneath(), "a write must be noticed");
+    }
+
+    #[test]
+    fn saving_makes_this_buffer_the_new_truth() {
+        let (_dir, path) = written("a.txt", "original\n");
+        let mut editor = Editor::open(&path, 4).unwrap();
+        std::fs::write(&path, "changed\n").unwrap();
+        assert!(editor.changed_underneath());
+
+        editor.insert("x");
+        editor.save().unwrap();
+        assert!(
+            !editor.changed_underneath(),
+            "after writing it, the file on disk is this buffer"
+        );
+    }
+
+    #[test]
+    fn a_reload_takes_the_file_and_keeps_your_place() {
+        let (_dir, path) = written("a.txt", "one\ntwo\nthree\n");
+        let mut editor = Editor::open(&path, 4).unwrap();
+        let at = editor.doc.line_to_char(2);
+        editor.sel = Selection::single(at);
+
+        std::fs::write(&path, "ONE\nTWO\nTHREE\nFOUR\n").unwrap();
+        editor.reload().unwrap();
+
+        assert_eq!(editor.doc.rope().to_string(), "ONE\nTWO\nTHREE\nFOUR\n");
+        assert!(!editor.dirty, "a reload is not an edit");
+        assert_eq!(
+            editor.sel.primary().head,
+            at,
+            "still where you were reading"
+        );
+        assert!(!editor.changed_underneath(), "and up to date again");
+    }
+
+    #[test]
+    fn a_reload_onto_a_shorter_file_does_not_strand_the_cursor() {
+        let (_dir, path) = written("a.txt", "one\ntwo\nthree\nfour\nfive\n");
+        let mut editor = Editor::open(&path, 4).unwrap();
+        editor.sel = Selection::single(editor.doc.len_chars());
+
+        std::fs::write(&path, "one\n").unwrap();
+        editor.reload().unwrap();
+        assert!(
+            editor.sel.primary().head <= editor.doc.len_chars(),
+            "the cursor must be inside the file it is now in"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_gone_is_not_reported_as_changed() {
+        // The buffer is then the only copy left, and saving it is the
+        // right thing rather than something to warn about.
+        let (_dir, path) = written("a.txt", "text\n");
+        let editor = Editor::open(&path, 4).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!editor.changed_underneath());
+    }
+
+    #[test]
+    fn a_buffer_with_no_file_has_nothing_to_compare_against() {
+        let editor = Editor::new(TextBuffer::from_text("scratch\n"), None, 4);
+        assert!(!editor.changed_underneath());
+    }
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+
+    fn ed(text: &str, at: usize) -> Editor {
+        let mut e = Editor::new(TextBuffer::from_text(text), None, 4);
+        e.sel = Selection::single(at);
+        e
+    }
+
+    fn typed(e: &mut Editor, text: &str) {
+        if !e.type_pair(text) {
+            e.insert(text);
+        }
+    }
+
+    fn text(e: &Editor) -> String {
+        e.doc.rope().to_string()
+    }
+
+    #[test]
+    fn a_bracket_closes_itself_and_leaves_the_caret_between() {
+        let mut e = ed("", 0);
+        typed(&mut e, "(");
+        assert_eq!(text(&e), "()");
+        assert_eq!(e.sel.primary().head, 1, "inside the pair, not after it");
+
+        typed(&mut e, "x");
+        assert_eq!(text(&e), "(x)");
+    }
+
+    #[test]
+    fn typing_the_closer_steps_over_it_rather_than_doubling_it() {
+        let mut e = ed("", 0);
+        typed(&mut e, "(");
+        typed(&mut e, ")");
+        assert_eq!(text(&e), "()", "not `())`");
+        assert_eq!(e.sel.primary().head, 2, "past the pair");
+    }
+
+    #[test]
+    fn a_selection_is_surrounded_rather_than_replaced() {
+        let mut e = ed("wrap me\n", 0);
+        e.sel = Selection::from_cursor(Cursor { anchor: 0, head: 7 });
+        typed(&mut e, "(");
+        assert_eq!(text(&e), "(wrap me)\n");
+    }
+
+    #[test]
+    fn nothing_is_closed_in_the_middle_of_a_word() {
+        // Reaching into existing code: the inserted closer would land
+        // inside the word rather than around anything.
+        let mut e = ed("value\n", 2);
+        typed(&mut e, "(");
+        assert_eq!(text(&e), "va(lue\n", "just the one character");
+    }
+
+    #[test]
+    fn an_apostrophe_is_not_an_empty_pair() {
+        let mut e = ed("it\n", 2);
+        typed(&mut e, "'");
+        assert_eq!(text(&e), "it'\n", "`it's` is commoner than `it''`");
+    }
+
+    #[test]
+    fn a_pair_still_closes_before_a_closer_or_a_separator() {
+        for (before, at, want) in [("()", 1, "(())"), ("f(,)", 2, "f((),)")] {
+            let mut e = ed(before, at);
+            typed(&mut e, "(");
+            assert_eq!(text(&e), want, "in {before:?} at {at}");
+        }
+    }
+
+    #[test]
+    fn backspacing_an_empty_pair_takes_both_halves() {
+        let mut e = ed("", 0);
+        typed(&mut e, "(");
+        assert!(e.backspace_pair());
+        assert_eq!(text(&e), "");
+
+        // But not once there is something between them.
+        let mut e = ed("(x)", 2);
+        assert!(!e.backspace_pair(), "`x` is not an empty pair");
+    }
+
+    #[test]
+    fn pairing_works_at_every_cursor_at_once() {
+        let mut e = ed("a\na\na\n", 0);
+        e.sel = Selection::from_cursors(vec![Cursor::at(1), Cursor::at(3), Cursor::at(5)]);
+        typed(&mut e, "(");
+        assert_eq!(text(&e), "a()\na()\na()\n");
+    }
+
+    #[test]
+    fn a_whole_pair_is_one_undo_step() {
+        let mut e = ed("", 0);
+        typed(&mut e, "(");
+        assert_eq!(text(&e), "()");
+        assert!(e.undo());
+        assert_eq!(text(&e), "", "both halves go together");
     }
 }
