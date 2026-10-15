@@ -491,3 +491,59 @@ fn init_makes_a_repository_where_there_was_none() {
     );
     let _ = std::fs::remove_dir_all(&path);
 }
+
+#[test]
+fn discarding_puts_a_file_back_to_its_committed_state() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let path = fixture.path().join("src/main.rs");
+    let committed = std::fs::read_to_string(&path).unwrap();
+    fixture.write("src/main.rs", "fn main() {\n    broken();\n}\n");
+
+    let repo = Repo::discover(fixture.path()).unwrap();
+    assert!(!repo.changes().is_empty(), "the edit should show");
+
+    repo.discard(&path).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), committed);
+    assert!(repo.changes().is_empty(), "and nothing is left to commit");
+}
+
+#[test]
+fn discarding_takes_a_staged_change_with_it() {
+    // `git restore` alone only touches the working copy, so a staged
+    // change would come back the moment anything read the index.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let path = fixture.path().join("src/main.rs");
+    let committed = std::fs::read_to_string(&path).unwrap();
+    fixture.write("src/main.rs", "fn main() {\n    staged();\n}\n");
+    fixture.git(&["add", "src/main.rs"]);
+
+    let repo = Repo::discover(fixture.path()).unwrap();
+    assert!(
+        repo.changes().iter().any(|c| c.staged),
+        "staged, to begin with"
+    );
+
+    repo.discard(&path).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), committed);
+    assert!(repo.changes().is_empty(), "both halves gone");
+}
+
+#[test]
+fn discarding_an_untracked_file_deletes_it() {
+    // There is no committed version to go back to, so this is the only
+    // thing discarding it can mean.
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("new.rs", "fn fresh() {}\n");
+    let path = fixture.path().join("new.rs");
+
+    let repo = Repo::discover(fixture.path()).unwrap();
+    repo.discard(&path).unwrap();
+    assert!(!path.exists(), "an untracked file is removed");
+    assert!(repo.changes().is_empty());
+}

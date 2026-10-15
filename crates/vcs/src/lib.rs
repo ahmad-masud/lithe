@@ -402,6 +402,27 @@ impl Repo {
     }
 
     /// Commits what is staged. Returns the short hash.
+    /// Throws away a file's uncommitted changes.
+    ///
+    /// Both halves, because "discard" means the file goes back to how
+    /// the last commit left it and a staged change is still a change:
+    /// `git restore` only touches the working copy, so a file that was
+    /// staged and then reverted would come back the moment anything
+    /// looked at the index.
+    ///
+    /// A file git has never seen has no committed version to go back
+    /// to. `git restore` fails on one, so it is deleted instead, which
+    /// is what discarding an untracked file can only mean.
+    pub fn discard(&self, path: &Path) -> Result<(), GitError> {
+        let relative = self.relative(path)?;
+        if !self.is_tracked(path) {
+            return std::fs::remove_file(path)
+                .map_err(|e| GitError(format!("could not delete {relative}: {e}")));
+        }
+        self.git(&["restore", "--staged", "--worktree", "--", &relative])
+            .map(|_| ())
+    }
+
     pub fn commit(&self, message: &str) -> Result<String, GitError> {
         if message.trim().is_empty() {
             return Err(GitError("a commit needs a message".into()));

@@ -1113,6 +1113,8 @@ struct App {
     /// clipboard: a path copied here is a file to move, not a string to
     /// type, and conflating the two loses one of them.
     file_clipboard: Option<FileClip>,
+    /// The file a discard has been offered for and not yet confirmed.
+    discarding: Option<PathBuf>,
     /// Filesystem changes made from the explorer, for its Undo/Redo.
     file_undo: Vec<FileOp>,
     file_redo: Vec<FileOp>,
@@ -1144,6 +1146,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             // A missing clipboard is survivable; the editor still edits.
             file_clipboard: None,
+            discarding: None,
             file_undo: Vec::new(),
             file_redo: Vec::new(),
             clipboard: arboard::Clipboard::new()
@@ -2723,6 +2726,20 @@ impl App {
             CtxAction::Trash => self.trash(target),
 
             // --- shelling out ---
+            CtxAction::OpenChange => {
+                if let (Some(pane), Some(path)) = (self.pane_mut(), target) {
+                    pane.open_path_as(path, false);
+                    pane.retitle();
+                }
+            }
+            CtxAction::ShowDiff => {
+                if let (Some(pane), Some(path)) = (self.pane_mut(), target) {
+                    pane.show_diff(path);
+                }
+            }
+            CtxAction::StageFile => self.stage_path(target, true),
+            CtxAction::UnstageFile => self.stage_path(target, false),
+            CtxAction::DiscardFile => self.discard_path(target),
             CtxAction::RevealInFinder => self.reveal(target),
             CtxAction::OpenInDefaultApp => self.open_in_default_app(target),
             CtxAction::OpenInTerminal => {
@@ -3265,6 +3282,15 @@ impl App {
                     &state,
                 )
             }
+            // A changed file: the menu is about the change, not the
+            // file on disk.
+            Hit::GitRow(row) | Hit::GitStage(row) => {
+                let change = pane.git.as_ref().and_then(|g| g.change_at(row));
+                let Some((path, staged)) = change.map(|c| (c.path.clone(), c.staged)) else {
+                    return;
+                };
+                ContextMenu::for_change(at, path, staged)
+            }
             // Empty space in the sidebar acts on the project root.
             Hit::Elsewhere if x < l.tree_w && pane.tree.is_some() => {
                 ContextMenu::for_explorer(at, None, true, &state)
@@ -3289,6 +3315,69 @@ impl App {
             _ => return,
         };
         pane.context = Some(menu);
+    }
+
+    /// Stages or unstages one file by path.
+    fn stage_path(&mut self, target: Option<PathBuf>, stage: bool) {
+        let Some(pane) = self.pane_mut() else { return };
+        let (Some(path), Some(repo)) = (target, pane.repo.as_ref()) else {
+            return;
+        };
+        let result = if stage {
+            repo.stage(&path)
+        } else {
+            repo.unstage(&path)
+        };
+        pane.status = Some(match result {
+            Ok(()) => format!(
+                "{} {}",
+                if stage { "staged" } else { "unstaged" },
+                name_of(&path)
+            ),
+            Err(e) => format!("{e}"),
+        });
+        pane.git_stale = true;
+        pane.hunks_for = None;
+    }
+
+    /// Throws away one file's uncommitted changes.
+    ///
+    /// Asked for twice. This is the one thing the editor does that
+    /// destroys work git cannot give back, and a menu entry is one
+    /// slip away from a row you meant to click.
+    fn discard_path(&mut self, target: Option<PathBuf>) {
+        let Some(path) = target else { return };
+        let confirmed = self.discarding.as_deref() == Some(path.as_path());
+        let Some(pane) = self.pane_mut() else { return };
+        if !confirmed {
+            pane.status = Some(format!(
+                "discard every change to {}? choose it again to confirm",
+                name_of(&path)
+            ));
+            self.discarding = Some(path);
+            return;
+        }
+        self.discarding = None;
+        let Some(pane) = self.pane_mut() else { return };
+        let Some(repo) = pane.repo.as_ref() else {
+            return;
+        };
+        pane.status = Some(match repo.discard(&path) {
+            Ok(()) => format!("discarded changes to {}", name_of(&path)),
+            Err(e) => format!("{e}"),
+        });
+        pane.git_stale = true;
+        pane.hunks_for = None;
+        // The buffer is now behind the file, and reloading it is the
+        // whole point of having discarded.
+        for editor in pane.ws.files_mut() {
+            if editor.path.as_deref() == Some(path.as_path()) && editor.reload().is_err() {
+                pane.status = Some(format!(
+                    "discarded, but could not reload {}",
+                    name_of(&path)
+                ));
+            }
+        }
     }
 
     /// Stages or unstages the active file.
@@ -5246,6 +5335,13 @@ fn dwell_due(
     resting: std::time::Duration,
 ) -> bool {
     over_text && !already_asked && !showing && resting >= HOVER_DWELL
+}
+
+/// A path's file name, for a message about it.
+fn name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 /// Which line of the working copy a diff row shows.

@@ -24,6 +24,11 @@ pub enum Action {
     Rename,
     Trash,
     Delete,
+    StageFile,
+    UnstageFile,
+    DiscardFile,
+    OpenChange,
+    ShowDiff,
     CopyPath,
     CopyRelativePath,
     RevealInFinder,
@@ -192,6 +197,34 @@ impl ContextMenu {
     }
 
     /// The menu for a row in the file tree.
+    /// The menu for a file in the source control panel.
+    ///
+    /// Short on purpose: the panel is a list of changes, so the things
+    /// worth offering are the ones that act on a change. Opening and
+    /// revealing are there because a list of file names is also a way
+    /// of getting to a file.
+    pub fn for_change(at: (f32, f32), target: PathBuf, staged: bool) -> Self {
+        let entries = vec![
+            Entry::item("Open File", "", Action::OpenChange),
+            Entry::item("Show Diff", "", Action::ShowDiff),
+            Entry::separator(),
+            if staged {
+                Entry::item("Unstage", "", Action::UnstageFile)
+            } else {
+                Entry::item("Stage", "", Action::StageFile)
+            },
+            // Last, and after a separator, because it is the only one
+            // here that destroys work and cannot be undone by us.
+            Entry::separator(),
+            Entry::item("Discard Changes…", "", Action::DiscardFile),
+            Entry::separator(),
+            Entry::item("Copy Path", "", Action::CopyPath),
+            Entry::item("Copy Relative Path", "", Action::CopyRelativePath),
+            Entry::item("Reveal in Finder", "", Action::RevealInFinder),
+        ];
+        Self::new(entries, at, Some(target))
+    }
+
     pub fn for_explorer(
         at: (f32, f32),
         target: Option<PathBuf>,
@@ -624,5 +657,68 @@ mod tests {
             .max()
             .unwrap();
         assert!(menu.columns() > widest, "labels would be clipped");
+    }
+}
+
+#[cfg(test)]
+mod change_menu_tests {
+    use super::*;
+
+    fn labels(menu: &ContextMenu) -> Vec<&str> {
+        menu.entries
+            .iter()
+            .filter(|e| e.action.is_some())
+            .map(|e| e.label.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_changed_file_is_offered_what_acts_on_the_change() {
+        let menu = ContextMenu::for_change((0.0, 0.0), PathBuf::from("a.rs"), false);
+        let labels = labels(&menu);
+        assert!(labels.contains(&"Stage"), "{labels:?}");
+        assert!(!labels.contains(&"Unstage"), "it is not staged: {labels:?}");
+        assert!(labels.contains(&"Discard Changes…"), "{labels:?}");
+        assert!(labels.contains(&"Show Diff"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_staged_file_is_offered_the_other_half() {
+        let menu = ContextMenu::for_change((0.0, 0.0), PathBuf::from("a.rs"), true);
+        let labels = labels(&menu);
+        assert!(labels.contains(&"Unstage"), "{labels:?}");
+        assert!(
+            !labels.contains(&"Stage"),
+            "staging what is staged does nothing: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn discarding_is_last_and_set_apart() {
+        // It is the one entry here that destroys work git cannot give
+        // back, so it must not sit under the pointer by accident.
+        let menu = ContextMenu::for_change((0.0, 0.0), PathBuf::from("a.rs"), false);
+        let at = menu
+            .entries
+            .iter()
+            .position(|e| e.label == "Discard Changes…")
+            .expect("a discard entry");
+        assert!(
+            menu.entries[at - 1].action.is_none(),
+            "a separator should sit above it"
+        );
+        assert!(
+            menu.entries[at].label.ends_with('…'),
+            "the ellipsis says it will ask"
+        );
+    }
+
+    #[test]
+    fn the_menu_knows_which_file_it_is_about() {
+        let menu = ContextMenu::for_change((0.0, 0.0), PathBuf::from("src/a.rs"), false);
+        assert_eq!(
+            menu.target.as_deref(),
+            Some(std::path::Path::new("src/a.rs"))
+        );
     }
 }
