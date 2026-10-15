@@ -31,6 +31,9 @@ pub struct Theme {
     /// Chrome: file tree, tab strip, picker panel.
     pub panel_bg: Rgba,
     pub panel_active: Rgba,
+    /// What sits under the pointer. Drawn over whatever is behind it,
+    /// so it reads the same on a selected row as on a bare one.
+    pub hover: Rgba,
     pub tree_dir: Rgba,
     pub tree_file: Rgba,
     /// Dims the editor behind the picker.
@@ -118,6 +121,9 @@ impl Default for Theme {
             diff_removed_bg: Rgba::hex(0x2C1A1D),
             panel_bg: Rgba::hex(0x101217),
             panel_active: Rgba::hex(0x232832),
+            // Deliberately faint. Hover is an answer to "is this a
+            // thing I can click", not a selection.
+            hover: Rgba::hex(0xFFFFFF).alpha(0.06),
             tree_dir: Rgba::hex(0x9DB2CE),
             tree_file: Rgba::hex(0x868E9E),
             scrim: Rgba::hex(0x05070A).alpha(0.62),

@@ -81,6 +81,18 @@ const BLINK_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 /// under it. Long enough that crossing the window asks nothing, short
 /// enough that stopping on a name feels like it answered.
 const HOVER_DWELL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How long a hover highlight takes to fade in or out.
+///
+/// Bounded and self-cancelling, like the caret blink and for the same
+/// reason: it is the only kind of animation a damage-driven editor can
+/// honestly have. Once the fade is done no further frame is asked for,
+/// and idle CPU goes back to nothing.
+///
+/// Short on purpose. Long enough that the highlight arrives rather than
+/// appears, short enough that it has finished before you have decided
+/// to click.
+const HOVER_FADE: std::time::Duration = std::time::Duration::from_millis(90);
 /// How long a buffer must sit untouched before autosave writes it.
 ///
 /// Long enough that it does not fire mid-word, short enough that you stop
@@ -156,6 +168,12 @@ struct Pane {
     /// Set while a dwell question is out, so resting asks once rather
     /// than once per wake-up.
     hover_asked: bool,
+    /// The element under the pointer, and the one it just left, so the
+    /// first can fade in while the second fades out.
+    hovered: Option<view::Hit>,
+    hover_was: Option<view::Hit>,
+    /// When those last changed.
+    hover_at: std::time::Instant,
     /// The repository this project sits in, if any. Discovered once.
     repo: Option<lithe_vcs::Repo>,
     /// Differences from HEAD for the active file, and what they were
@@ -474,6 +492,41 @@ impl Pane {
             return None;
         }
         Some(self.pointer_moved + HOVER_DWELL)
+    }
+
+    /// How far through the hover fade we are, 0 to 1.
+    fn hover_fade(&self) -> f32 {
+        let elapsed = self.hover_at.elapsed().as_secs_f32();
+        (elapsed / HOVER_FADE.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    /// When the hover fade next needs a frame, while one is running.
+    ///
+    /// `None` once it has finished, which is what keeps an idle window
+    /// idle: the animation stops asking rather than being stopped.
+    fn next_hover_frame(&self) -> Option<std::time::Instant> {
+        (self.hover_fade() < 1.0).then(std::time::Instant::now)
+    }
+
+    /// Records what the pointer is over, starting a fade when it moves
+    /// from one element to another.
+    ///
+    /// Only discrete things are tracked. The text and the scrollbar
+    /// carry a position, so every pixel of movement would read as a
+    /// different element and restart the fade forever.
+    fn set_hovered(&mut self, over: view::Hit) {
+        let now = view::hoverable(over);
+        if now == self.hovered {
+            return;
+        }
+        // Mid-fade, what is being left is still what was being left:
+        // taking the half-faded value as the new start would make a
+        // quick sweep across a row of buttons stutter.
+        if self.hover_fade() >= 1.0 {
+            self.hover_was = self.hovered;
+        }
+        self.hovered = now;
+        self.hover_at = std::time::Instant::now();
     }
 
     /// Takes down the tooltip, and re-arms the dwell.
@@ -975,6 +1028,7 @@ impl Pane {
         // the repository.
         let branch = self.repo.as_ref().and_then(lithe_vcs::Repo::branch);
         let caret_visible = self.caret_visible();
+        let hover_fade = self.hover_fade();
         let Pane {
             renderer,
             ws,
@@ -993,6 +1047,8 @@ impl Pane {
             marks,
             completion,
             hover,
+            hovered,
+            hover_was,
             prompt,
             hunks,
             blame_note,
@@ -1017,6 +1073,9 @@ impl Pane {
             lsp: *lsp_state,
             lsp_busy: lsp_busy.as_deref(),
             autosave,
+            hovered: *hovered,
+            hover_was: *hover_was,
+            hover_fade,
             find: find.as_ref(),
             search: search.as_ref(),
             find_matches,
@@ -2080,6 +2139,9 @@ impl App {
             pointer_moved: std::time::Instant::now(),
             pointer_over_text: false,
             hover_asked: false,
+            hovered: None,
+            hover_was: None,
+            hover_at: std::time::Instant::now(),
             hunks: Vec::new(),
             hunks_for: None,
             prompt: None,
@@ -4441,6 +4503,7 @@ impl ApplicationHandler<Wake> for App {
                 pane.next_blink(),
                 pane.next_autosave(autosave),
                 pane.next_hover(),
+                pane.next_hover_frame(),
             ]
             .into_iter()
             .flatten()
@@ -4585,6 +4648,14 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
 
+            // Leaving the window is leaving every element in it.
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.set_hovered(Hit::Elsewhere);
+                    pane.redraw();
+                }
+            }
+
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
 
             WindowEvent::Resized(size) => {
@@ -4631,6 +4702,7 @@ impl ApplicationHandler<Wake> for App {
 
                 // Moving re-starts the dwell, and takes down a tooltip
                 // once the pointer has left the character it was about.
+                pane.set_hovered(over);
                 let was = pane.pointer_over_text;
                 pane.pointer_over_text = matches!(over, Hit::Text);
                 let moved_away = pane
@@ -5844,6 +5916,12 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         lsp: None,
         lsp_busy: None,
         autosave: false,
+        // `--overlay hovered` parks the pointer on a tree row, which
+        // is the only way to see a hover state in a still frame.
+        // Distinct from `hover`, which is the language server's popup.
+        hovered: (overlay == Some("hovered")).then_some(view::Hit::Tree(2)),
+        hover_was: None,
+        hover_fade: 1.0,
         image: picture.as_ref(),
         settings: ws.showing_settings().then_some(&defaults),
         context: context.as_ref(),
@@ -6524,5 +6602,57 @@ mod dwell_tests {
             !dwell_due(true, false, true, rested),
             "a popup is already saying something"
         );
+    }
+}
+
+#[cfg(test)]
+mod hover_fade_tests {
+    use super::HOVER_FADE;
+    use crate::view::{hoverable, Hit};
+
+    /// The fade must be bounded, or invariant 1 goes with it: a window
+    /// that keeps asking for frames is a window burning a core.
+    #[test]
+    fn the_fade_finishes_and_stops_asking() {
+        let fade = |elapsed: std::time::Duration| {
+            (elapsed.as_secs_f32() / HOVER_FADE.as_secs_f32()).clamp(0.0, 1.0)
+        };
+        assert_eq!(fade(std::time::Duration::ZERO), 0.0);
+        assert!((0.0..1.0).contains(&fade(HOVER_FADE / 2)));
+        assert_eq!(fade(HOVER_FADE), 1.0);
+        assert_eq!(
+            fade(HOVER_FADE * 100),
+            1.0,
+            "it must settle, not keep climbing"
+        );
+    }
+
+    /// Only discrete things are tracked. The text and the scrollbar
+    /// carry a position, so every pixel of movement would read as a
+    /// different element, restart the fade and never let it finish —
+    /// an animation that never ends is a frame clock.
+    #[test]
+    fn nothing_that_moves_with_the_pointer_is_hoverable() {
+        assert_eq!(hoverable(Hit::Text), None);
+        assert_eq!(hoverable(Hit::Scrollbar(12.0)), None);
+        assert_eq!(hoverable(Hit::DiffText { row: 1, column: 2 }), None);
+        assert_eq!(hoverable(Hit::SidebarDivider), None);
+        assert_eq!(hoverable(Hit::Elsewhere), None);
+    }
+
+    #[test]
+    fn the_things_you_click_are_hoverable() {
+        for hit in [
+            Hit::Tab(0),
+            Hit::TabClose(0),
+            Hit::Tree(3),
+            Hit::GitRow(1),
+            Hit::GitStage(1),
+            Hit::GitInit,
+            Hit::Status(crate::view::StatusButton::Git),
+            Hit::Landing(crate::view::LandingAction::NewFile),
+        ] {
+            assert_eq!(hoverable(hit), Some(hit), "{hit:?} should highlight");
+        }
     }
 }

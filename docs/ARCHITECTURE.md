@@ -468,3 +468,30 @@ existing code, and the closer would land inside it. A quote is not
 closed next to a word character at all, because an apostrophe in prose
 is commoner than an empty pair. The whole pair is one undo step, and
 backspacing an empty one takes both halves.
+
+Hover highlights fade, and that is the second bounded timer. An
+animation needs a clock, which is the thing invariant 1 says this
+editor does not have — it is why video playback was declined. A hover
+fade is allowed for the same reason the caret blink is: it is bounded
+and self-cancelling. `next_hover_frame` stops returning a deadline
+once the fade reaches 1, so the window goes back to waiting for input
+rather than being told to stop.
+
+Only discrete elements are hoverable. `Hit::Text`, `Hit::Scrollbar` and
+`Hit::DiffText` carry a position, so every pixel of movement would read
+as a different element, restart the fade and never let it finish — an
+animation that never ends is a frame clock by another name, and that
+is exactly the thing being avoided.
+
+The element being left and the one being arrived at are both drawn,
+crossing over, so sweeping along a row of tabs leaves a trail that
+settles rather than a highlight that jumps. A fade already in progress
+does not take its half-faded value as the next starting point, or a
+quick sweep stutters.
+
+Measuring idle CPU for this needs the event count beside it. Three of
+four runs read 12-15% and were contaminated by real trackpad input —
+`TouchpadPressure` and `CursorMoved` arriving while nothing was
+supposed to be happening. The clean run, 0 events, reads 0.00%. A CPU
+figure without the event count cannot tell a spin from a finger
+resting on the trackpad.

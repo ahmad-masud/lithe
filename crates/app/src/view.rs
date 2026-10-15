@@ -391,6 +391,11 @@ pub struct Scene<'a> {
     pub lsp_busy: Option<&'a str>,
     /// Whether autosave is on, for the status bar.
     pub autosave: bool,
+    /// What the pointer is over, what it just left, and how far the
+    /// highlight has faded between them.
+    pub hovered: Option<Hit>,
+    pub hover_was: Option<Hit>,
+    pub hover_fade: f32,
     /// Projects offered on the landing page, newest first.
     pub recents: &'a [&'a Path],
     /// Highlight spans for the visible byte range, in paint order.
@@ -671,6 +676,65 @@ pub fn context_bounds(l: &Layout, menu: &ContextMenu) -> (f32, f32, f32, f32) {
     (x, y, width, height)
 }
 
+/// The hit, if it names something worth highlighting under the pointer.
+///
+/// Discrete things only. The text and the scrollbar carry a position,
+/// so every pixel of movement would read as a different element and
+/// restart the fade without ever finishing it.
+pub fn hoverable(hit: Hit) -> Option<Hit> {
+    matches!(
+        hit,
+        Hit::Tab(_)
+            | Hit::TabClose(_)
+            | Hit::Tree(_)
+            | Hit::GitRow(_)
+            | Hit::GitStage(_)
+            | Hit::GitCommit(_)
+            | Hit::GitMode(_)
+            | Hit::GitInit
+            | Hit::Status(_)
+            | Hit::Setting(_)
+            | Hit::Landing(_)
+            | Hit::Context(_)
+    )
+    .then_some(hit)
+}
+
+/// How strongly to tint `what`, given what the pointer is on and how
+/// far the fade has got.
+///
+/// The one leaving and the one arriving are both drawn, crossing over,
+/// so a pointer swept along a row of tabs leaves a trail that settles
+/// rather than a highlight that jumps.
+pub fn hover_alpha(scene: &Scene<'_>, what: Hit) -> f32 {
+    let into = scene.hovered == Some(what);
+    let outof = scene.hover_was == Some(what);
+    match (into, outof) {
+        (true, _) => scene.hover_fade,
+        (false, true) => 1.0 - scene.hover_fade,
+        _ => 0.0,
+    }
+}
+
+/// Paints the hover tint over a row or button, if it is the one under
+/// the pointer. Over whatever is already there, so a selected row and a
+/// bare one both read the same when hovered.
+fn tint(
+    f: &mut lithe_gpu::Frame<'_>,
+    scene: &Scene<'_>,
+    what: Hit,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) {
+    let a = hover_alpha(scene, what);
+    if a > 0.0 {
+        let c = scene.theme.hover;
+        f.rect(x, y, w, h, c.alpha(c.0[3] * a));
+    }
+}
+
 pub fn hit_test(l: &Layout, panels: &Panels<'_>, x: f32, y: f32) -> Hit {
     // An open menu takes every click: one inside it chooses, one outside
     // dismisses, and nothing underneath should act in either case.
@@ -922,6 +986,15 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
 
             // The row being typed into is highlighted like the active
             // file, because that is what it is about to be.
+            tint(
+                &mut f,
+                scene,
+                Hit::Tree(tree.scroll + row),
+                0.0,
+                y,
+                l.tree_w,
+                l.cell.line_height,
+            );
             if editing || Some(entry.path.as_path()) == active_path {
                 f.rect(0.0, y, l.tree_w, l.cell.line_height, theme.panel_active);
             }
@@ -984,6 +1057,20 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
             let Some(row) = rows.get(index) else { break };
             let y = offset as f32 * l.cell.line_height;
             let baseline = y + l.cell.ascent;
+            for what in [
+                Hit::GitRow(index),
+                Hit::GitCommit(index),
+                Hit::GitInit,
+                Hit::GitStage(index),
+            ] {
+                let narrow = matches!(what, Hit::GitStage(_));
+                let x = if narrow {
+                    l.tree_w - STAGE_COLS * l.cell.advance
+                } else {
+                    0.0
+                };
+                tint(&mut f, scene, what, x, y, l.tree_w - x, l.cell.line_height);
+            }
 
             match row {
                 GitRowKind::Blank => {}
@@ -1119,7 +1206,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
 
     // ---- editor, or the landing page when there is nothing to edit ----
     if let Some(settings) = scene.settings {
-        draw_settings(&mut f, &l, settings, theme, scratch);
+        draw_settings(&mut f, &l, settings, scene, scratch);
     } else if let Some(view) = scene.image {
         draw_image(&mut f, &l, view, theme, scratch);
     } else if let Some(lines) = scene.diff {
@@ -1160,6 +1247,17 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                 // A bright rule under the active tab.
                 f.rect(*x0, l.tab_h - 2.0, x1 - x0, 2.0, theme.cursor);
             }
+            tint(&mut f, scene, Hit::Tab(index), *x0, 0.0, x1 - x0, l.tab_h);
+            let close_w = CLOSE_COLS * l.cell.advance;
+            tint(
+                &mut f,
+                scene,
+                Hit::TabClose(index),
+                x1 - close_w,
+                0.0,
+                close_w,
+                l.tab_h,
+            );
             // A provisional tab is drawn dimmer even when it is active,
             // so "this will be replaced by the next click" is visible
             // without having to remember how it was opened.
@@ -1217,6 +1315,15 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                 theme.panel_active,
             );
         }
+        tint(
+            &mut f,
+            scene,
+            Hit::Status(slot.button),
+            *x0,
+            status_y,
+            x1 - x0,
+            l.cell.line_height,
+        );
         // An active toggle gets a rule along its top edge as well as a
         // fill, so it reads as pressed rather than merely tinted.
         if slot.active {
@@ -1604,9 +1711,10 @@ fn draw_settings(
     f: &mut lithe_gpu::Frame<'_>,
     l: &Layout,
     settings: &Settings,
-    theme: &Theme,
+    scene: &Scene<'_>,
     scratch: &mut Scratch,
 ) {
+    let theme = scene.theme;
     let rows = setting_rows();
     let (ox, oy, width) = settings_origin(l, rows.len());
 
@@ -1622,6 +1730,15 @@ fn draw_settings(
                 f.text(ox, baseline, text, theme.status_fg);
             }
             SettingRow::Switch(setting) => {
+                tint(
+                    f,
+                    scene,
+                    Hit::Setting(*setting),
+                    ox,
+                    y,
+                    width,
+                    l.cell.line_height,
+                );
                 let on = setting.value(settings);
                 // A box that is filled or empty, rather than a tick: at
                 // one weight a tick and a cross look the same.
@@ -2719,6 +2836,17 @@ fn draw_landing(
     for (index, entry) in rows.iter().enumerate() {
         let y = oy + index as f32 * l.cell.line_height;
         let baseline = y + l.cell.ascent;
+        if let Some(action) = entry.action {
+            tint(
+                f,
+                scene,
+                Hit::Landing(action),
+                ox,
+                y,
+                width,
+                l.cell.line_height,
+            );
+        }
 
         match &entry.row {
             Row::Blank => {}
@@ -3303,6 +3431,9 @@ mod tests {
             lsp: None,
             lsp_busy: None,
             autosave: false,
+            hovered: None,
+            hover_was: None,
+            hover_fade: 1.0,
             prompt: None,
             caret_visible: true,
             recents: &[],
@@ -3865,6 +3996,9 @@ mod tests {
             lsp: None,
             lsp_busy: None,
             autosave: false,
+            hovered: None,
+            hover_was: None,
+            hover_fade: 1.0,
             prompt: None,
             caret_visible: true,
             find: None,
@@ -4470,6 +4604,9 @@ mod tests {
             lsp: None,
             lsp_busy: None,
             autosave: false,
+            hovered: None,
+            hover_was: None,
+            hover_fade: 1.0,
             prompt: None,
             caret_visible: true,
             recents: &[],
