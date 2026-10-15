@@ -300,6 +300,28 @@ mod tests {
     }
 
     #[test]
+    fn a_syntax_that_was_never_parsed_yields_nothing() {
+        // The failure this guards is silent: `for_path` hands back a
+        // grammar with no tree, and highlighting against it returns an
+        // empty span list rather than an error. A caller that forgot
+        // the `parse` gets plain text and no complaint, which is how
+        // the diff's committed side was shipped uncoloured once.
+        let mut syntax = Syntax::for_path(Path::new("x.rs")).expect("rust grammar");
+        let buffer = TextBuffer::from_text("fn main() { let x = 1; }\n");
+        let bytes = buffer.rope().len_bytes();
+        assert!(
+            kinds_in(&mut syntax, &buffer, 0..bytes).is_empty(),
+            "an unparsed grammar cannot know anything about the text"
+        );
+
+        syntax.parse(&buffer);
+        assert!(
+            !kinds_in(&mut syntax, &buffer, 0..bytes).is_empty(),
+            "the same grammar, parsed, must colour the same text"
+        );
+    }
+
+    #[test]
     fn keywords_strings_and_comments_are_recognised() {
         let (mut syntax, buffer) = rust("// hi\nfn main() { let s = \"x\"; }\n");
         let found = kinds_in(&mut syntax, &buffer, 0..buffer.len_bytes());

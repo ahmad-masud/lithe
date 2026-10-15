@@ -181,6 +181,9 @@ struct Pane {
     scratch: Scratch,
     /// Highlight spans for the visible range, recomputed each frame.
     highlights: Vec<Span>,
+    /// The same, for a diff's two sides.
+    diff_old_spans: Vec<Span>,
+    diff_new_spans: Vec<Span>,
     /// Shown in the status bar until the next keystroke.
     status: Option<String>,
     pointer: PhysicalPosition<f64>,
@@ -594,12 +597,32 @@ impl Pane {
         };
         let lines = lithe_vcs::unified(&committed, &current, 3);
 
+        // The committed side is parsed once. It cannot change while
+        // the diff is open, so a rebuild on every keystroke carries the
+        // existing tree across rather than making another.
+        let (old, old_syntax) = match self.ws.diff_mut() {
+            Some(existing) if existing.path == path && existing.old.len_bytes() > 0 => (
+                std::mem::take(&mut existing.old),
+                existing.old_syntax.take(),
+            ),
+            _ => {
+                let doc = lithe_core::TextBuffer::from_text(&committed);
+                let mut syntax = lithe_syntax::Syntax::for_path(path);
+                if let Some(syntax) = syntax.as_mut() {
+                    syntax.parse(&doc);
+                }
+                (doc, syntax)
+            }
+        };
+
         self.ws.show_diff(
             path,
             workspace::Diff {
                 // Filled in by `show_diff`, which moves the tab's own
                 // buffer across rather than opening a second one.
                 editor: None,
+                old,
+                old_syntax,
                 title,
                 path: path.to_path_buf(),
                 lines,
@@ -975,9 +998,83 @@ impl Pane {
         editor.highlights(range, highlights);
     }
 
+    /// Highlight spans for the diff's two sides, over the rows showing.
+    ///
+    /// Two queries a frame rather than one per row, and bounded by the
+    /// viewport like everything else: the new side comes off the live
+    /// buffer's incremental tree, the old side off the one parsed when
+    /// the diff was built.
+    fn refresh_diff_highlights(&mut self) {
+        self.diff_old_spans.clear();
+        self.diff_new_spans.clear();
+        let rows = self.visible_rows();
+        let top = self.ws.diff().map_or(0, |d| d.scroll.max(0.0) as usize);
+        let side_by_side = self.preview_defaults.side_by_side_diff;
+
+        // Which lines of each side the visible rows show.
+        let Some(diff) = self.ws.diff() else { return };
+        let mut old_lines: Vec<usize> = Vec::new();
+        let mut new_lines: Vec<usize> = Vec::new();
+        let pairs = side_by_side.then(|| lithe_vcs::pair_columns(&diff.lines));
+        for row in top..top + rows + 2 {
+            let shown: [Option<usize>; 2] = match &pairs {
+                Some(pairs) => match pairs.get(row) {
+                    Some((left, right)) => [
+                        left.and_then(|i| diff.lines.get(i)).and_then(|l| l.old),
+                        right.and_then(|i| diff.lines.get(i)).and_then(|l| l.new),
+                    ],
+                    None => break,
+                },
+                None => match diff.lines.get(row) {
+                    Some(line) => [line.old, line.new],
+                    None => break,
+                },
+            };
+            if let Some(old) = shown[0] {
+                old_lines.push(old.saturating_sub(1));
+            }
+            if let Some(new) = shown[1] {
+                new_lines.push(new.saturating_sub(1));
+            }
+        }
+
+        let span = |doc: &lithe_core::TextBuffer, lines: &[usize]| {
+            let (first, last) = (*lines.iter().min()?, *lines.iter().max()?);
+            let last = last.min(doc.len_lines().saturating_sub(1));
+            let start = doc.line_to_char(first.min(last));
+            let end = (doc.line_to_char(last) + doc.line_len_chars(last)).min(doc.len_chars());
+            let rope = doc.rope();
+            Some(rope.char_to_byte(start)..rope.char_to_byte(end))
+        };
+
+        // The committed side, from the tree built with the diff.
+        if let Some(range) = span(&diff.old, &old_lines) {
+            let Some(diff) = self.ws.diff_mut() else {
+                return;
+            };
+            let doc = std::mem::take(&mut diff.old);
+            if let Some(syntax) = diff.old_syntax.as_mut() {
+                syntax.highlights(&doc, range, &mut self.diff_old_spans);
+            }
+            if let Some(diff) = self.ws.diff_mut() {
+                diff.old = doc;
+            }
+        }
+
+        // The working side, from the buffer's own tree.
+        let range = self
+            .ws
+            .active()
+            .and_then(|editor| span(&editor.doc, &new_lines));
+        if let (Some(range), Some(editor)) = (range, self.ws.active_mut()) {
+            editor.highlights(range, &mut self.diff_new_spans);
+        }
+    }
+
     fn draw(&mut self, theme: &Theme, recents: &[&Path], autosave: bool) {
         self.note_viewport();
         self.refresh_highlights();
+        self.refresh_diff_highlights();
         self.refresh_find_matches();
         self.refresh_hunks();
         self.refresh_git();
@@ -1015,6 +1112,8 @@ impl Pane {
             blame_note,
             scratch,
             highlights,
+            diff_old_spans,
+            diff_new_spans,
             status,
             lsp_state,
             lsp_busy,
@@ -1025,6 +1124,9 @@ impl Pane {
             blame: blame_note.as_deref(),
             recents,
             highlights,
+            diff_old: ws.diff().map(|d| &d.old),
+            diff_old_spans,
+            diff_new_spans,
             diagnostics: marks,
             completion: completion.as_ref(),
             prompt: prompt.as_ref(),
@@ -2107,6 +2209,8 @@ impl App {
             prompt: None,
             scratch: Scratch::default(),
             highlights: Vec::new(),
+            diff_old_spans: Vec::new(),
+            diff_new_spans: Vec::new(),
             status: None,
             pointer: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
@@ -4430,6 +4534,10 @@ impl App {
                         // it to type into, and nothing to rebuild it
                         // from.
                         editor: None,
+                        // A commit's diff spans many files, so there is
+                        // no single document to colour it against.
+                        old: lithe_core::TextBuffer::new(),
+                        old_syntax: None,
                         path: PathBuf::new(),
                         title: format!("{short}  {summary}"),
                         lines,
@@ -5860,8 +5968,19 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         {
             let committed = repo.committed(&path).unwrap_or_default();
             let current = std::fs::read_to_string(&path).unwrap_or_default();
+            // Parsed here as `build_diff` parses it. A syntax that was
+            // made and not parsed has no tree and yields no spans, which
+            // would make the snapshot show a plain diff and call it
+            // correct.
+            let old = lithe_core::TextBuffer::from_text(&committed);
+            let mut old_syntax = lithe_syntax::Syntax::for_path(&path);
+            if let Some(syntax) = old_syntax.as_mut() {
+                syntax.parse(&old);
+            }
             let diff = workspace::Diff {
                 editor: None,
+                old,
+                old_syntax,
                 title: repo.relative(&path).unwrap_or_default(),
                 path: path.clone(),
                 lines: lithe_vcs::unified(&committed, &current, 3),
@@ -5873,6 +5992,28 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
     }
     if overlay == Some("settings") {
         ws.show_settings();
+    }
+
+    // Both sides of a diff, as `refresh_diff_highlights` computes them.
+    // A still frame is always at the top, so the window is the first
+    // `rows` lines of each document rather than a scrolled slice.
+    let whole = |doc: &lithe_core::TextBuffer| {
+        let last = rows.min(doc.len_lines().saturating_sub(1));
+        let end = (doc.line_to_char(last) + doc.line_len_chars(last)).min(doc.len_chars());
+        0..doc.rope().char_to_byte(end)
+    };
+    let mut diff_old_spans = Vec::new();
+    let mut diff_new_spans = Vec::new();
+    if let Some(diff) = ws.diff_mut() {
+        let doc = std::mem::take(&mut diff.old);
+        if let Some(syntax) = diff.old_syntax.as_mut() {
+            syntax.highlights(&doc, whole(&doc), &mut diff_old_spans);
+        }
+        diff.old = doc;
+        if let Some(editor) = diff.editor.as_mut() {
+            let range = whole(&editor.doc);
+            editor.highlights(range, &mut diff_new_spans);
+        }
     }
 
     let git_panel = matches!(overlay, Some("git") | Some("history")).then(|| {
@@ -5985,6 +6126,9 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         search: search.as_ref(),
         find_matches: &find_matches,
         highlights: &highlights,
+        diff_old: ws.diff().map(|d| &d.old),
+        diff_old_spans: &diff_old_spans,
+        diff_new_spans: &diff_new_spans,
         tree: tree.as_ref(),
         git: git_panel.as_ref(),
         sidebar_cols: view::TREE_COLS,
@@ -6390,6 +6534,8 @@ mod diff_tests {
     fn view(lines: Vec<DiffLine>) -> workspace::Diff {
         workspace::Diff {
             editor: Some(editor::Editor::new(lithe_core::TextBuffer::new(), None, 4)),
+            old: lithe_core::TextBuffer::new(),
+            old_syntax: None,
             path: PathBuf::from("a.rs"),
             title: "a.rs".into(),
             lines,
@@ -6483,6 +6629,8 @@ mod diff_tests {
         let mut ws = workspace::Workspace::empty(None);
         let commit = || workspace::Diff {
             editor: None,
+            old: lithe_core::TextBuffer::new(),
+            old_syntax: None,
             path: PathBuf::new(),
             title: "abc123  a commit".into(),
             lines: Vec::new(),

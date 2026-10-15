@@ -259,6 +259,32 @@ rather than handing a file back. It no longer closes with the panel that
 opened it: a tab outlives the thing that opened it, which is most of
 what being a tab means.
 
+A diff is coloured by the grammar on both sides, and the asymmetry is
+deliberate: a removed line on the left and an added line on the right
+keep their flat red and green, because on a split view the colour is
+what tells you which side you are reading. Everything else — context,
+and the counterpart of a change — is painted the way the editor paints
+it, so a diff of code reads as code.
+
+The committed side is a document in its own right, with its own parse
+tree, built once when the diff is built and carried across every
+rebuild. An editable diff is rebuilt on every keystroke, but what a
+commit says cannot change while you type, so re-parsing it per keystroke
+would be work for an answer that is already known. The working side
+needs no document of its own: it is the buffer, and the buffer's tree is
+already incremental.
+
+Both queries are bounded to the visible rows, like the editor's. The
+mapping is the diff row's line number, which the editable diff already
+had to carry for the caret.
+
+The offscreen snapshot computes those spans too. It did not at first,
+and the still frame it produced showed a plain diff and gave no sign
+anything was missing — a verification tool that silently agrees is worse
+than no tool, so the snapshot now mirrors the pane: it parses the
+committed side rather than only constructing a grammar for it, and fills
+both span lists before the scene is built.
+
 A page that fills the text area is hit-tested where the text area is,
 not before the chrome. Testing the settings page first meant it returned
 "nothing here" for every click outside its own switches, which swallowed

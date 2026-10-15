@@ -36,6 +36,15 @@ pub enum Tab {
 pub struct Diff {
     /// `None` for a commit's diff, which has nothing behind it to edit.
     pub editor: Option<Editor>,
+    /// The committed side, kept as a document with its own parse tree.
+    ///
+    /// The new side is coloured from the live buffer's tree, which is
+    /// already incremental. The old side has no buffer, so it gets one
+    /// — parsed once when the diff is built and carried across every
+    /// rebuild, because what a commit says never changes while you
+    /// type.
+    pub old: lithe_core::TextBuffer,
+    pub old_syntax: Option<lithe_syntax::Syntax>,
     pub title: String,
     /// The working file, empty for a commit.
     pub path: PathBuf,
@@ -491,6 +500,8 @@ mod tests {
     fn diff_of(path: &str) -> Diff {
         Diff {
             editor: None,
+            old: lithe_core::TextBuffer::new(),
+            old_syntax: None,
             title: path.to_string(),
             path: PathBuf::from(path),
             lines: Vec::new(),

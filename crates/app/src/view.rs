@@ -397,6 +397,11 @@ pub struct Scene<'a> {
     pub recents: &'a [&'a Path],
     /// Highlight spans for the visible byte range, in paint order.
     pub highlights: &'a [Span],
+    /// The committed side of a diff, and highlight spans for both
+    /// sides of it.
+    pub diff_old: Option<&'a lithe_core::TextBuffer>,
+    pub diff_old_spans: &'a [Span],
+    pub diff_new_spans: &'a [Span],
     pub tree: Option<&'a Tree>,
     pub git: Option<&'a GitPanel>,
     /// Sidebar width in cells, as the person has dragged it.
@@ -1950,18 +1955,23 @@ fn draw_diff(
         let text_x = l.text_x + numbers * l.cell.advance;
         f.text(text_x, baseline, sign, colour);
 
-        scratch.text.clear();
         let room = (frame.new_text_w / l.cell.advance) as usize;
-        truncate_tail(&mut scratch.text, &line.text, room);
-        f.text(
+        diff_text(
+            f,
+            scene,
+            line,
+            // One column, so a removed line is read against the old
+            // side and everything else against the new.
+            line.kind == LineKind::Removed,
             text_x + 2.0 * l.cell.advance,
             baseline,
-            &scratch.text,
+            room,
             if line.kind == LineKind::Skipped {
                 theme.gutter_fg
             } else {
                 colour
             },
+            scratch,
         );
         if let Some(span) = selected_cells(scene, line) {
             f.rect(
@@ -1993,6 +2003,103 @@ fn draw_diff(
             height,
             theme.scrollbar_thumb,
         );
+    }
+}
+
+/// Draws one diff row's text, coloured by its own side's grammar.
+///
+/// Falls back to the flat colour when there is nothing to colour with:
+/// a commit's diff spans many files and has no single document behind
+/// it, and a language with no grammar has no spans either.
+#[allow(clippy::too_many_arguments)]
+fn diff_text(
+    f: &mut lithe_gpu::Frame<'_>,
+    scene: &Scene<'_>,
+    line: &lithe_vcs::DiffLine,
+    old_side: bool,
+    x: f32,
+    baseline: f32,
+    room: usize,
+    flat: Rgba,
+    scratch: &mut Scratch,
+) {
+    use lithe_vcs::LineKind;
+
+    let theme = scene.theme;
+    let plain = |f: &mut lithe_gpu::Frame<'_>, scratch: &mut Scratch| {
+        scratch.text.clear();
+        truncate_tail(&mut scratch.text, &line.text, room);
+        f.text(x, baseline, &scratch.text, flat);
+    };
+
+    // An elided run is a marker, not code, and a removed or added line
+    // keeps its red or green: the colour is what says which side it is
+    // on, and grammar colours would take that away.
+    if line.kind == LineKind::Skipped
+        || (old_side && line.kind == LineKind::Removed)
+        || (!old_side && line.kind == LineKind::Added)
+    {
+        plain(f, scratch);
+        return;
+    }
+
+    let (doc, spans) = if old_side {
+        (scene.diff_old, scene.diff_old_spans)
+    } else {
+        (
+            scene.workspace.active().map(|e| &e.doc),
+            scene.diff_new_spans,
+        )
+    };
+    let number = if old_side { line.old } else { line.new };
+    let (Some(doc), Some(number)) = (doc, number) else {
+        plain(f, scratch);
+        return;
+    };
+    let index = number.saturating_sub(1);
+    if spans.is_empty() || index >= doc.len_lines() {
+        plain(f, scratch);
+        return;
+    }
+
+    let chars = doc.line_len_chars(index).min(line.text.chars().count());
+    scratch.styles.clear();
+    scratch.styles.resize(chars, None);
+    if chars > 0 {
+        let rope = doc.rope();
+        let start_char = doc.line_to_char(index);
+        let start = rope.char_to_byte(start_char);
+        let end = rope.char_to_byte(start_char + chars);
+        for span in spans {
+            if span.start >= end {
+                break;
+            }
+            if span.end <= start {
+                continue;
+            }
+            let from = rope.byte_to_char(span.start.max(start)) - start_char;
+            let to = rope.byte_to_char(span.end.min(end)) - start_char;
+            for style in scratch.styles[from.min(chars)..to.min(chars)].iter_mut() {
+                *style = Some(span.kind);
+            }
+        }
+    }
+
+    // One run per colour change, as the editor does.
+    let mut pen = x;
+    let mut run = String::new();
+    let mut kind = scratch.styles.first().copied().flatten();
+    for (i, ch) in line.text.chars().take(room).enumerate() {
+        let here = scratch.styles.get(i).copied().flatten();
+        if here != kind && !run.is_empty() {
+            pen = f.text(pen, baseline, &run, theme.colour(kind));
+            run.clear();
+        }
+        kind = here;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        f.text(pen, baseline, &run, theme.colour(kind));
     }
 }
 
@@ -2103,18 +2210,21 @@ fn draw_diff_split(
             }
             f.text(origin, baseline, &scratch.text, theme.gutter_fg);
 
-            scratch.text.clear();
             let room = ((frame.new_text_w / l.cell.advance) as usize).saturating_sub(1);
-            truncate_tail(&mut scratch.text, &line.text, room);
-            f.text(
+            diff_text(
+                f,
+                scene,
+                line,
+                side == 0.0,
                 origin + numbers,
                 baseline,
-                &scratch.text,
+                room,
                 if line.kind == LineKind::Skipped {
                     theme.gutter_fg
                 } else {
                     colour
                 },
+                scratch,
             );
             // The caret belongs on the new side only; the old one is a
             // committed version and has no cursor in it.
@@ -3417,6 +3527,9 @@ mod tests {
             caret_visible: true,
             recents: &[],
             highlights: &[],
+            diff_old: None,
+            diff_old_spans: &[],
+            diff_new_spans: &[],
             tree: None,
             git: None,
             sidebar_cols: TREE_COLS,
@@ -3968,6 +4081,9 @@ mod tests {
             workspace: &ws,
             recents: &[],
             highlights: &[],
+            diff_old: None,
+            diff_old_spans: &[],
+            diff_new_spans: &[],
             diagnostics: &[],
             completion: None,
             hunks: &[],
@@ -4569,6 +4685,9 @@ mod tests {
         ws.push(editor);
         let theme = Theme::default();
         let scene = Scene {
+            diff_old: None,
+            diff_old_spans: &[],
+            diff_new_spans: &[],
             blame: None,
             workspace: &ws,
             find: None,
