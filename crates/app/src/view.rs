@@ -3626,7 +3626,6 @@ mod tests {
         (x, y)
     }
 
-    #[test]
     /// The text must sit inside its own current-line highlight.
     ///
     /// Everything drawn behind the text — the highlight, the selection,
