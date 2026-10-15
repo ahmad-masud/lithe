@@ -323,6 +323,7 @@ pub struct Prompt {
 pub enum PromptAction {
     Commit,
     RenameSymbol,
+    GotoLine,
 }
 
 impl Prompt {
@@ -331,6 +332,14 @@ impl Prompt {
             label: "commit message",
             text: String::new(),
             action: PromptAction::Commit,
+        }
+    }
+
+    pub fn goto_line() -> Self {
+        Self {
+            label: "line",
+            text: String::new(),
+            action: PromptAction::GotoLine,
         }
     }
 

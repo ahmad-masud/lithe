@@ -110,7 +110,8 @@ itself prints there.
 | git | `cmd+shift+G` source control · `cmd+shift+A` stage · `cmd+shift+C` commit · `cmd+shift+B` line blame |
 | menu keys | `↑`/`↓` move · `Enter` choose · `Esc` or any click dismisses |
 | commands | `cmd+shift+P` |
-| edit | type, `Enter`, `Backspace`/`Delete`, `Tab` / `shift+Tab` |
+| edit | type, `Enter`, `Backspace`/`Delete`, `Tab` / `shift+Tab` · brackets and quotes close themselves |
+| go | `cmd+G` go to line |
 | move | arrows, `alt+`arrows (word), `cmd+`arrows (line/doc), `Home`/`End`, `PageUp`/`PageDown` |
 | select | `shift` + any motion, `cmd+A`, click and drag |
 | multi-cursor | `cmd+D` next match · `cmd+shift+L` every match · `cmd+alt+`↑`/`↓ cursor above/below · `alt+click` · `Esc` collapses |
@@ -363,6 +364,20 @@ This needs two halves and is broken without either: the bundle declares
 which documents it accepts, and the app answers the event macOS sends
 to deliver them. Declaring the types alone gets you "can't open files
 of this type" with extra steps.
+
+## Files that change underneath you
+
+Saving writes to a temporary file and renames over the original, so a
+buffer whose file has moved on — a checkout, a rebase, another editor —
+would replace that work wholesale and without a word. Each buffer
+remembers the modified time and length it last read or wrote.
+
+Coming back to the window is when it looks. A clean buffer is reloaded
+silently, since nothing is lost by it, and you keep your place. A
+buffer with unsaved edits is left alone and says so: both versions
+matter and only you know which wins. Saving over a changed file is
+refused once and allowed the second time, so it is a decision rather
+than an accident.
 
 ## Starting a repository
 

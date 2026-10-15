@@ -60,6 +60,7 @@ const ITEMS: &[(&str, Command)] = &[
     ("edit.find", Command::Find),
     ("edit.replace", Command::Replace),
     ("edit.search_project", Command::SearchProject),
+    ("go.line", Command::GotoLine),
     ("go.file", Command::OpenFile),
     ("go.buffer", Command::SwitchBuffer),
     ("go.command", Command::Palette),
@@ -248,6 +249,7 @@ pub fn build() -> muda::Result<Menu> {
         true,
         &[
             &item("go.file", "Go to File…", Some("CmdOrCtrl+P")),
+            &item("go.line", "Go to Line…", Some("CmdOrCtrl+G")),
             &item("go.buffer", "Switch Buffer…", None),
             &item("go.command", "Command Palette…", Some("CmdOrCtrl+Shift+P")),
         ],

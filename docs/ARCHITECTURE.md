@@ -446,3 +446,25 @@ decoration side of the split: they agreed with each other while both
 disagreed with the text. The test that catches it compares the cursor
 line's gutter number — drawn on the text's baseline, in a colour no
 other row uses — against the highlight band, in pixels.
+
+An open buffer can go stale, and saving it would be a silent
+overwrite. The write is a temp-file-and-rename, so a buffer whose file
+has moved underneath it — a checkout, a rebase, another editor —
+replaces that work wholesale and without a word. Each buffer stamps
+the mtime and length it last read or wrote, which catches the case for
+the price of a `stat`; a hash would cost the whole file on every check.
+
+Coming back to the window is when the check happens, because that is
+when something else has been at it. A clean buffer is reloaded without
+asking, since nothing is lost. A dirty one is left alone and says so —
+both versions matter and only the person knows which wins — and a save
+is refused once, then allowed, so overwriting is a decision rather
+than an accident.
+
+Bracket pairing is deliberately restrained. A pair is closed only when
+what follows is the end of the line or a character that closes or
+separates: typing `(` in the middle of a word is reaching into
+existing code, and the closer would land inside it. A quote is not
+closed next to a word character at all, because an apostrophe in prose
+is commoner than an empty pair. The whole pair is one undo step, and
+backspacing an empty one takes both halves.
