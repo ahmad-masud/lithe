@@ -430,3 +430,19 @@ It was invisible until a benchmark opened a file. With no file open the
 pointer is never over text, so the dwell never arms and idle CPU reads
 0.000% — which is exactly what the invariant claims, measured in the
 one state where it could not fail.
+
+The text and its decorations must share one row position. Everything
+drawn behind the text — the current-line highlight, the selection, the
+find matches, the caret — went through a `row_y` closure that subtracts
+the fractional scroll. The text computed its own baseline and did not,
+so at any scroll position that was not a whole number of rows the
+caret sat up to a full row away from the character it was in front of.
+They share `row_y` now, which is the only arrangement in which they
+cannot drift apart.
+
+It survived a caret test that scrolled fractionally on purpose, because
+that test compared the caret to a click, and both of those are on the
+decoration side of the split: they agreed with each other while both
+disagreed with the text. The test that catches it compares the cursor
+line's gutter number — drawn on the text's baseline, in a colour no
+other row uses — against the highlight band, in pixels.

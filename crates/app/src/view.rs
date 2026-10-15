@@ -1353,7 +1353,10 @@ pub fn caret_point(l: &Layout, editor: &Editor, tab_width: usize) -> (f32, f32) 
     let row = line.saturating_sub(editor.top_line()) as f32;
     (
         l.text_x + caret_x * l.cell.advance,
-        l.tab_h + (row + 1.0) * l.cell.line_height - editor.pixel_offset(l.cell.line_height),
+        // From the top of the text area, not the tab strip: with the
+        // find bar open those differ by its height, and every popup
+        // anchored here was that far out.
+        l.text_y + (row + 1.0) * l.cell.line_height - editor.pixel_offset(l.cell.line_height),
     )
 }
 
@@ -2904,7 +2907,13 @@ fn draw_editor(
             break;
         }
         let Some(slice) = doc.line(line) else { break };
-        let baseline = l.text_y + row as f32 * l.cell.line_height + l.cell.ascent;
+        // Through `row_y`, like every decoration. Computing the text's
+        // own y separately left it the one thing that did not subtract
+        // the fractional scroll, so at any scroll position that was not
+        // a whole number of rows the caret, the current-line highlight
+        // and the selection all sat up to a row away from the text they
+        // belonged to.
+        let baseline = row_y(line) + l.cell.ascent;
 
         scratch.text.clear();
         let _ = write!(scratch.text, "{}", line + 1);
@@ -3615,6 +3624,87 @@ mod tests {
         let y = l.text_y + (line - editor.top_line()) as f32 * l.cell.line_height
             - editor.pixel_offset(l.cell.line_height);
         (x, y)
+    }
+
+    #[test]
+    /// The text must sit inside its own current-line highlight.
+    ///
+    /// Everything drawn behind the text — the highlight, the selection,
+    /// the caret — went through `row_y`, which subtracts the fractional
+    /// scroll. The text computed its own baseline and did not, so at
+    /// any scroll that was not a whole number of rows it sat up to a
+    /// full row away from the highlight and caret that belonged to it.
+    ///
+    /// Checked against the pixels, because the previous caret test
+    /// compared two things that were both on the decoration side of
+    /// that split and so agreed with each other while both were wrong.
+    #[test]
+    fn the_caret_and_the_text_agree_at_any_scroll() {
+        const W: u32 = 700;
+        const H: u32 = 400;
+        let Ok(mut r) = Renderer::offscreen(W, H, 1.0, 16.0) else {
+            return;
+        };
+        let text: String = (0..300).map(|i| format!("line{i}\n")).collect();
+        let theme = Theme::default();
+
+        for scroll in [0.0_f32, 2.0, 3.5, 7.25, 12.75] {
+            let mut editor = Editor::new(TextBuffer::from_text(&text), None, 4);
+            editor.scroll = scroll;
+            // A cursor a few rows down, so the band is not at an edge.
+            let line = editor.top_line() + 3;
+            editor.sel = Selection::single(editor.doc.line_to_char(line) + 2);
+
+            let mut ws = Workspace::empty(None);
+            ws.push(editor);
+            let scene = Scene {
+                tab_width: 4,
+                ..probe_scene(&ws, &theme)
+            };
+            let mut scratch = Scratch::default();
+            draw(&mut r, &scene, &mut scratch);
+            let Ok(buf) = r.read_rgba() else { return };
+            let l = layout(&r, &ws, Chrome::default());
+
+            // Only inside the text area: the tab strip's active
+            // underline is painted in the caret's own colour.
+            let first = l.text_y as u32;
+            let last = (l.text_y + l.text_h) as u32;
+            // Far right of any glyph, where only the highlight paints.
+            let bare = W - 24;
+            let band: Vec<u32> = (first..last)
+                .filter(|y| find(&buf, W, theme.cursor_line, bare..bare + 1, *y..*y + 1).0 > 0)
+                .collect();
+            assert!(!band.is_empty(), "no highlight at scroll {scroll}");
+
+            // The cursor's line number, which is drawn on the text's
+            // own baseline and in a colour no other row uses. Comparing
+            // the caret to the highlight proves nothing: both go
+            // through `row_y` and so always agreed, including while the
+            // text they belonged to did not.
+            let ink: Vec<u32> = (first..last)
+                .filter(|y| {
+                    find(
+                        &buf,
+                        W,
+                        theme.gutter_fg_active,
+                        0..l.text_x as u32,
+                        *y..*y + 1,
+                    )
+                    .0 > 0
+                })
+                .collect();
+            assert!(!ink.is_empty(), "no active line number at scroll {scroll}");
+            assert!(
+                ink.iter().all(|y| band.contains(y)),
+                "scroll {scroll}: the cursor's line is drawn on rows \
+                 {:?} but its highlight covers {}..{} — the text and its \
+                 own decorations are on different rows",
+                (ink[0], ink[ink.len() - 1]),
+                band[0],
+                band[band.len() - 1]
+            );
+        }
     }
 
     #[test]
