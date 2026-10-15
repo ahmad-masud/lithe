@@ -334,6 +334,24 @@ it is editable — became one `Option<DiffKind>`. They only ever made
 sense together, and a test that set the second without the first had
 been passing against a hit test that read only the first.
 
+Cmd-clicking a name jumps to its definition, and nothing said so. The
+name under the pointer is now underlined while the command key is
+held, in the foreground colour rather than a new one, so it reads as a
+link over whatever the grammar already painted the word.
+
+What is underlined is computed from the same conditions the click has
+— over the text, in a buffer whose language is known, on something
+that could be a name — so the two cannot drift apart and offer a jump
+where there is none. `name_at` is the last of those: `word_at` takes
+the run of like characters around a point, which over an operator is a
+run of operators and over a gap is a run of spaces.
+
+It is recomputed wherever the answer can change: the pointer moving,
+the command key going down or coming up, the wheel moving a different
+word under a pointer that has not, and the pointer leaving the window.
+Each of those redraws only when the answer actually changed, because
+every pixel of movement comes through the first of them.
+
 The offscreen snapshot computes those spans too. It did not at first,
 and the still frame it produced showed a plain diff and gave no sign
 anything was missing — a verification tool that silently agrees is worse

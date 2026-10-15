@@ -33,6 +33,7 @@ mod view;
 mod workspace;
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -184,6 +185,10 @@ struct Pane {
     /// The same, for a diff's two sides.
     diff_old_spans: Vec<Span>,
     diff_new_spans: Vec<Span>,
+    /// The identifier the command key has made clickable, if the
+    /// pointer is over one. Underlined, so what a cmd-click would do
+    /// is visible before you do it.
+    cmd_link: Option<Range<usize>>,
     /// Shown in the status bar until the next keystroke.
     status: Option<String>,
     pointer: PhysicalPosition<f64>,
@@ -496,6 +501,48 @@ impl Pane {
         let changed = now != self.hovered;
         self.hovered = now;
         changed
+    }
+
+    /// Recomputes what the command key would make clickable.
+    ///
+    /// Returns whether it changed, because every pixel of pointer
+    /// movement comes through here and only a change is worth a frame.
+    fn refresh_cmd_link(&mut self, cmd: bool, recents: &[&Path]) -> bool {
+        let found = match cmd {
+            true => self.cmd_link_at(recents),
+            false => None,
+        };
+        let changed = found != self.cmd_link;
+        self.cmd_link = found;
+        changed
+    }
+
+    /// The identifier under the pointer that a cmd-click would follow.
+    ///
+    /// The same conditions the click itself has, so the underline and
+    /// the jump cannot drift apart: over the text, in a buffer whose
+    /// language is known, on something that could be a name.
+    fn cmd_link_at(&self, recents: &[&Path]) -> Option<Range<usize>> {
+        let l = self.layout();
+        let (x, y) = (self.pointer.x as f32, self.pointer.y as f32);
+        if !matches!(view::hit_test(&l, &self.panels(recents), x, y), Hit::Text) {
+            return None;
+        }
+        let editor = self.ws.active()?;
+        // A buffer with no grammar has no symbols to go to, so
+        // underlining its words would promise something that is not
+        // there.
+        editor.language_name()?;
+        let under = view::point_to_char_under(
+            &l,
+            &editor.doc,
+            editor.scroll,
+            editor.scroll_x,
+            x,
+            y,
+            TAB_WIDTH,
+        );
+        name_at(&editor.doc, under)
     }
 
     /// Takes down the tooltip, and re-arms the dwell.
@@ -1144,6 +1191,7 @@ impl Pane {
             highlights,
             diff_old_spans,
             diff_new_spans,
+            cmd_link,
             status,
             lsp_state,
             lsp_busy,
@@ -1154,6 +1202,7 @@ impl Pane {
             blame: blame_note.as_deref(),
             recents,
             highlights,
+            cmd_link: cmd_link.as_ref(),
             diff_old: ws.diff().map(|d| &d.old),
             diff_old_spans,
             diff_new_spans,
@@ -2240,6 +2289,7 @@ impl App {
             scratch: Scratch::default(),
             highlights: Vec::new(),
             diff_old_spans: Vec::new(),
+            cmd_link: None,
             diff_new_spans: Vec::new(),
             status: None,
             pointer: PhysicalPosition::new(0.0, 0.0),
@@ -4967,13 +5017,39 @@ impl ApplicationHandler<Wake> for App {
             // Leaving the window is leaving every element in it.
             WindowEvent::CursorLeft { .. } => {
                 if let Some(pane) = self.panes.get_mut(&id) {
-                    if pane.set_hovered(Hit::Elsewhere) {
+                    // The pointer is gone, so nothing is under it.
+                    let gone = pane.cmd_link.take().is_some();
+                    if pane.set_hovered(Hit::Elsewhere) || gone {
                         pane.redraw();
                     }
                 }
             }
 
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            // Holding or letting go of the command key is what makes
+            // the thing under the pointer a link, so the underline is
+            // recomputed here as well as on movement.
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                let cmd = command_held(self.modifiers);
+                let live: Vec<PathBuf> = self
+                    .recents
+                    .live()
+                    .into_iter()
+                    .map(Path::to_path_buf)
+                    .collect();
+                let live: Vec<&Path> = live.iter().map(PathBuf::as_path).collect();
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    if pane.refresh_cmd_link(cmd, &live) {
+                        // A link can only be over text, so those are
+                        // the two icons this can be switching between.
+                        pane.window.set_cursor(match pane.cmd_link.is_some() {
+                            true => winit::window::CursorIcon::Pointer,
+                            false => winit::window::CursorIcon::Text,
+                        });
+                        pane.redraw();
+                    }
+                }
+            }
 
             WindowEvent::Resized(size) => {
                 if let Some(pane) = self.panes.get_mut(&id) {
@@ -5010,6 +5086,7 @@ impl ApplicationHandler<Wake> for App {
                     return;
                 };
                 pane.pointer = position;
+                let cmd = command_held(self.modifiers);
                 let l = pane.layout();
                 let (x, y) = (position.x as f32, position.y as f32);
 
@@ -5020,6 +5097,9 @@ impl ApplicationHandler<Wake> for App {
                 // Moving re-starts the dwell, and takes down a tooltip
                 // once the pointer has left the character it was about.
                 if pane.set_hovered(over) {
+                    pane.redraw();
+                }
+                if pane.refresh_cmd_link(cmd, &live) {
                     pane.redraw();
                 }
                 let was = pane.pointer_over_text;
@@ -5050,7 +5130,7 @@ impl ApplicationHandler<Wake> for App {
                 // whatever it happens to be over.
                 pane.window.set_cursor(if pane.panning.is_some() {
                     winit::window::CursorIcon::AllScroll
-                } else if on_link {
+                } else if on_link || pane.cmd_link.is_some() {
                     winit::window::CursorIcon::Pointer
                 } else {
                     match over {
@@ -5222,7 +5302,20 @@ impl ApplicationHandler<Wake> for App {
                 } else {
                     pane.scroll_text(lines, columns);
                 }
-                pane.redraw();
+                // Scrolling moves a different word under a pointer that
+                // has not moved, so the underline has to follow.
+                let cmd = command_held(self.modifiers);
+                let live: Vec<PathBuf> = self
+                    .recents
+                    .live()
+                    .into_iter()
+                    .map(Path::to_path_buf)
+                    .collect();
+                let live: Vec<&Path> = live.iter().map(PathBuf::as_path).collect();
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.refresh_cmd_link(cmd, &live);
+                    pane.redraw();
+                }
             }
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -5647,6 +5740,17 @@ fn revert_edit(
         text.insert(0, '\n');
     }
     (start..end, text)
+}
+
+/// The name at `at`, if what is there is a name.
+///
+/// `word_at` takes the run of like characters around a point, which
+/// over an operator or a gap is a run of operators or of spaces —
+/// neither of which a jump could follow.
+fn name_at(doc: &TextBuffer, at: usize) -> Option<Range<usize>> {
+    let word = doc.word_at(at);
+    let first = doc.rope().get_char(word.start)?;
+    (first.is_alphanumeric() || first == '_').then_some(word)
 }
 
 /// The row, if the diff row under it is an elision marker.
@@ -6252,6 +6356,18 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         ws.show_settings();
     }
 
+    // A name under the pointer with the command key held.
+    let cmd_link = (overlay == Some("cmdlink"))
+        .then(|| {
+            let doc = &ws.active()?.doc;
+            // The first name on a line with one, so the overlay does
+            // not depend on where a pointer would happen to be.
+            let at = doc.rope().to_string().find("main")?;
+            let start = doc.rope().byte_to_char(at);
+            Some(doc.word_at(start))
+        })
+        .flatten();
+
     // Both sides of a diff, as `refresh_diff_highlights` computes them.
     // A still frame is always at the top, so the window is the first
     // `rows` lines of each document rather than a scrolled slice.
@@ -6403,6 +6519,9 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         search: search.as_ref(),
         find_matches: &find_matches,
         highlights: &highlights,
+        // `--overlay cmdlink` underlines a name the way holding the
+        // command key over it does.
+        cmd_link: cmd_link.as_ref(),
         diff_old: ws.diff().map(|d| &d.old),
         diff_old_spans: &diff_old_spans,
         diff_new_spans: &diff_new_spans,
@@ -7307,5 +7426,68 @@ mod reveal_row_tests {
         let shut = diff(Vec::new());
         assert_eq!(row_sides(&shut, 3, false), (Some(3), Some(3)));
         assert_eq!(row_sides(&shut, shut.lines.len(), false), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod cmd_link_tests {
+    use super::name_at;
+    use lithe_core::TextBuffer;
+
+    fn at(text: &str, needle: &str) -> usize {
+        text.find(needle).expect("the needle is in the text")
+    }
+
+    #[test]
+    fn a_name_is_offered_from_any_character_in_it() {
+        let text = "let total = compute(x);\n";
+        let doc = TextBuffer::from_text(text);
+        let start = at(text, "compute");
+        let want = start..start + "compute".len();
+        for inside in start..want.end {
+            assert_eq!(
+                name_at(&doc, inside),
+                Some(want.clone()),
+                "character {inside} is part of the name"
+            );
+        }
+    }
+
+    #[test]
+    fn operators_and_gaps_are_not_names() {
+        // The run of like characters around these is a run of
+        // punctuation or of spaces, and nothing can be jumped to from
+        // either.
+        let text = "let total = compute(x);\n";
+        let doc = TextBuffer::from_text(text);
+        for needle in ["=", "(", ";"] {
+            assert_eq!(
+                name_at(&doc, at(text, needle)),
+                None,
+                "{needle:?} is not a name"
+            );
+        }
+        // The space before `=`.
+        assert_eq!(name_at(&doc, at(text, " = ")), None, "a gap is not a name");
+    }
+
+    #[test]
+    fn underscores_and_digits_belong_to_a_name() {
+        let text = "let _x1 = 2;\n";
+        let doc = TextBuffer::from_text(text);
+        let start = at(text, "_x1");
+        assert_eq!(name_at(&doc, start), Some(start..start + 3));
+        // A bare number is a name as far as this is concerned; asking
+        // about it is harmless and the alternative is a second rule
+        // about what a language's literals look like.
+        let two = at(text, "2");
+        assert_eq!(name_at(&doc, two), Some(two..two + 1));
+    }
+
+    #[test]
+    fn an_empty_document_has_no_name_anywhere() {
+        let doc = TextBuffer::from_text("");
+        assert_eq!(name_at(&doc, 0), None);
+        assert_eq!(name_at(&doc, 7), None, "past the end");
     }
 }

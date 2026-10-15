@@ -416,6 +416,9 @@ pub struct Scene<'a> {
     /// sides of it.
     pub diff_old: Option<&'a lithe_core::TextBuffer>,
     pub diff_old_spans: &'a [Span],
+    /// The identifier the command key has made clickable, underlined
+    /// so that it looks like what it now is.
+    pub cmd_link: Option<&'a std::ops::Range<usize>>,
     pub diff_new_spans: &'a [Span],
     pub tree: Option<&'a Tree>,
     pub git: Option<&'a GitPanel>,
@@ -3128,6 +3131,27 @@ fn draw_editor(
         }
     }
 
+    // The identifier the command key has made clickable. An underline
+    // rather than a colour, because it has to read as "this is a link
+    // now" over whatever the grammar already painted the word.
+    if let Some(span) = scene.cmd_link {
+        let line = doc.char_to_line(span.start);
+        if line >= top && line <= last_visible {
+            if let Some(slice) = doc.line(line) {
+                let line_start = doc.line_to_char(line);
+                let from = span.start.saturating_sub(line_start);
+                let to = (span.end - line_start).min(doc.line_len_chars(line));
+                let x0 = visual_col(slice, from, tab_width) as f32;
+                let x1 = visual_col(slice, to, tab_width) as f32;
+                if let Some((x, width)) = band(x0, x1.max(x0 + 1.0)) {
+                    let thickness = (l.cell.line_height * 0.06).max(1.0).round();
+                    let y = (row_y(line) + l.cell.ascent + thickness).round();
+                    f.rect(x, y, width, thickness, theme.fg);
+                }
+            }
+        }
+    }
+
     // Search matches, behind the text and above the selection, so a
     // selected match still reads as both.
     for span in scene.find_matches {
@@ -3559,6 +3583,7 @@ mod tests {
             recents: &[],
             highlights: &[],
             diff_old: None,
+            cmd_link: None,
             diff_old_spans: &[],
             diff_new_spans: &[],
             tree: None,
@@ -3961,6 +3986,83 @@ mod tests {
     }
 
     #[test]
+    fn the_cmd_underline_sits_under_the_name_and_nothing_else() {
+        const W: u32 = 700;
+        const H: u32 = 300;
+        let Ok(mut r) = Renderer::offscreen(W, H, 1.0, 16.0) else {
+            return;
+        };
+        let theme = Theme::default();
+        let text = "let total = compute(x);\n";
+        let start = text.find("compute").expect("the name is there");
+        let span = start..start + "compute".len();
+
+        let mut ws = Workspace::empty(None);
+        ws.push(Editor::new(TextBuffer::from_text(text), None, 4));
+        let l = layout(&r, &ws, Chrome::default());
+
+        let mut scratch = Scratch::default();
+        let without = {
+            let scene = Scene {
+                tab_width: 4,
+                ..probe_scene(&ws, &theme)
+            };
+            draw(&mut r, &scene, &mut scratch);
+            let Ok(buf) = r.read_rgba() else { return };
+            buf
+        };
+        let with = {
+            let scene = Scene {
+                tab_width: 4,
+                cmd_link: Some(&span),
+                ..probe_scene(&ws, &theme)
+            };
+            draw(&mut r, &scene, &mut scratch);
+            let Ok(buf) = r.read_rgba() else { return };
+            buf
+        };
+
+        // The row the underline is on: the one row that gained
+        // foreground pixels. Comparing against the same frame without
+        // the link is what keeps the glyphs out of the answer.
+        let first = l.text_y as u32;
+        let last = ((l.text_y + l.cell.line_height * 2.0) as u32).min(H);
+        let gained = |y: u32| {
+            let on = |buf: &[u8]| find(buf, W, theme.fg, 0..W, y..y + 1).0;
+            on(&with).saturating_sub(on(&without))
+        };
+        let rows: Vec<u32> = (first..last).filter(|y| gained(*y) > 0).collect();
+        assert!(!rows.is_empty(), "nothing was underlined");
+
+        // And it spans the name, not the whole line. The bounds come
+        // from the pixels that *appeared*, because the row the
+        // underline is on is also where a descender goes — `compute`
+        // has a `p`, and counting it would widen the answer.
+        let row = rows[0];
+        let appeared: Vec<u32> = (0..W)
+            .filter(|x| {
+                let i = ((row * W + x) * 4) as usize;
+                is(&with[i..i + 4], theme.fg) && !is(&without[i..i + 4], theme.fg)
+            })
+            .collect();
+        let (lo, hi) = (
+            *appeared.first().expect("the underline has pixels"),
+            *appeared.last().expect("the underline has pixels"),
+        );
+        let cell = l.cell.advance;
+        let want_lo = l.text_x + start as f32 * cell;
+        let want_hi = want_lo + "compute".len() as f32 * cell;
+        assert!(
+            (lo as f32 - want_lo).abs() <= cell,
+            "starts at {lo}, expected about {want_lo}"
+        );
+        assert!(
+            (hi as f32 - want_hi).abs() <= cell,
+            "ends at {hi}, expected about {want_hi}"
+        );
+    }
+
+    #[test]
     fn clicking_where_the_caret_is_drawn_lands_back_on_it() {
         let Ok(r) = Renderer::offscreen(900, 500, 1.0, 16.0) else {
             return;
@@ -4113,6 +4215,7 @@ mod tests {
             recents: &[],
             highlights: &[],
             diff_old: None,
+            cmd_link: None,
             diff_old_spans: &[],
             diff_new_spans: &[],
             diagnostics: &[],
@@ -4727,6 +4830,7 @@ mod tests {
         let theme = Theme::default();
         let scene = Scene {
             diff_old: None,
+            cmd_link: None,
             diff_old_spans: &[],
             diff_new_spans: &[],
             blame: None,
