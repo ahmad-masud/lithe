@@ -1023,7 +1023,12 @@ impl<'a> Preview<'a> {
             TagEnd::CodeBlock => self.end_code(),
             TagEnd::List(_) => {
                 self.lists.pop();
-                self.blank();
+                // Only the outermost: a nested list ending in the
+                // middle of its parent is not the end of a block, and
+                // a blank line there broke one list into two.
+                if self.lists.is_empty() {
+                    self.blank();
+                }
             }
             // A tight list's items hold text rather than paragraphs, so
             // this is where they are emitted — and without the blank line
@@ -2118,6 +2123,41 @@ mod tests {
         assert!(
             loose.iter().any(Line::is_blank),
             "a loose list keeps the air its author put there"
+        );
+    }
+
+    /// A sublist ending is not a block ending. Treating it as one put
+    /// a blank line between the nested items and whatever came next,
+    /// and one list read as three.
+    #[test]
+    fn a_nested_list_does_not_break_the_one_it_is_in() {
+        let out = render("- one\n- two\n  - inner\n- three\n", 60);
+        assert!(
+            out.iter().all(|l| !l.is_blank()),
+            "a tight list stays tight through its sublists: {:?}",
+            out.iter().map(text_of).collect::<Vec<_>>()
+        );
+        let joined: String = out.iter().map(text_of).collect::<Vec<_>>().join("|");
+        assert!(joined.contains("inner"), "the sublist is still there");
+        assert!(joined.contains("three"), "and so is what follows it");
+    }
+
+    #[test]
+    fn a_nested_list_is_indented_further_than_its_parent() {
+        let out = render("- one\n  - inner\n", 60);
+        let outer = out
+            .iter()
+            .find(|l| text_of(l).contains("one"))
+            .expect("the outer item");
+        let inner = out
+            .iter()
+            .find(|l| text_of(l).contains("inner"))
+            .expect("the inner item");
+        assert!(
+            inner.indent > outer.indent,
+            "depth is what says which list an item is in: {} vs {}",
+            inner.indent,
+            outer.indent
         );
     }
 

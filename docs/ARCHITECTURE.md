@@ -436,6 +436,12 @@ source node; a maximal run cannot, and it also handles the
 `A -- label --> B` form, where the real arrow is the second run and the
 label sits between them.
 
+A sublist ending is not a block ending. The blank line that separates
+one block from the next was emitted whenever any list closed, so a
+nested list put a gap between its own items and whatever followed in
+the parent, and one list read as three. Only the outermost closes a
+block now.
+
 A fenced block carries its own source on every one of its rows, so a
 click anywhere in it copies the block without a walk back to find
 where it started; an `Arc` means a row still costs a refcount to
