@@ -278,6 +278,37 @@ Both queries are bounded to the visible rows, like the editor's. The
 mapping is the diff row's line number, which the editable diff already
 had to carry for the caret.
 
+A change in a diff can be put back on its own, from a right-click on
+either column. Two things make that cheap. The first is that a change
+is already a run of added and removed lines in the list the diff is
+drawn from, so finding the one under the pointer is finding the run
+that row is in — and reverting takes the whole run, because the two
+halves of a replacement are one edit and undoing half of it would
+leave the file in a state neither version ever had.
+
+The second is that it goes through the buffer rather than through git.
+`revert_at` says which lines of the working copy to replace and what to
+put there, in lines, knowing nothing about any buffer; `revert_edit`
+turns that into one character span, which `replace_span` applies as an
+ordinary edit. So it lands in the undo history, the diff rebuilds
+itself from the result the way it does after any keystroke, and nothing
+reaches disk until the file is saved. That is also why it is not asked
+for twice the way discarding a whole file is: one `cmd+Z` takes it
+back.
+
+The line arithmetic is its own function because it is where this is
+easy to get wrong. `line_to_char` clamps to the last line, so a range
+that runs past the end has to be recognised rather than converted, and
+putting lines back at the end of a file that does not end in a newline
+has to supply one or the first of them is glued to the line already
+there.
+
+Hit-testing a diff learned the committed column at the same time, and
+the two bools that described a diff — whether one is open, and whether
+it is editable — became one `Option<DiffKind>`. They only ever made
+sense together, and a test that set the second without the first had
+been passing against a hit test that read only the first.
+
 The offscreen snapshot computes those spans too. It did not at first,
 and the still frame it produced showed a plain diff and gave no sign
 anything was missing — a verification tool that silently agrees is worse

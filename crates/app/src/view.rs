@@ -137,6 +137,16 @@ pub struct ButtonSlot {
     pub active: bool,
 }
 
+/// Which kind of diff a pane is showing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffKind {
+    /// Of a working file: the new side is the live buffer, so a click
+    /// there places the caret in it.
+    Editable,
+    /// Of a commit: there is nothing behind it to type into.
+    ReadOnly,
+}
+
 /// Which surfaces are open. Shared by drawing and hit-testing so the two
 /// cannot disagree about what is on screen — and small enough that the
 /// click path, which has no theme, can build one.
@@ -150,9 +160,14 @@ pub struct Panels<'a> {
     pub preview_open: bool,
     pub settings_open: bool,
     pub context: Option<&'a ContextMenu>,
-    /// An open diff of the working copy, whose new side is the live
-    /// buffer and so takes clicks as text rather than as decoration.
-    pub diff_editable: bool,
+    /// The diff filling the text area, if one is.
+    ///
+    /// One field rather than "is there one" and "is it editable",
+    /// because the second says nothing unless the first is true and two
+    /// bools that have to agree are a bug waiting to be written. One
+    /// already was: a test set only the second and went on passing
+    /// while the hit test read only the first.
+    pub diff: Option<DiffKind>,
     /// How far that diff is scrolled, so a click can name the row it
     /// landed on rather than the row it would have landed on unscrolled.
     pub diff_scroll: f32,
@@ -642,6 +657,11 @@ pub enum Hit {
         row: usize,
         column: usize,
     },
+    /// A row of a diff anywhere the caret cannot go: the committed
+    /// column, and any row of a commit's read-only diff. It carries no
+    /// column because there is nothing to put a caret at — it exists so
+    /// a right-click on either side finds the change it is over.
+    DiffRow(usize),
     /// A row in the source control panel.
     GitRow(usize),
     /// The stage/unstage box at the end of a source control row.
@@ -790,15 +810,23 @@ pub fn hit_test(l: &Layout, panels: &Panels<'_>, x: f32, y: f32) -> Hit {
     // The new side of a working-copy diff is the buffer, so a click there
     // places the caret in it. The old side is a committed version, which
     // is not a thing that can be typed into.
-    if panels.diff_editable {
+    if let Some(kind) = panels.diff {
         let frame = diff_frame(l, panels.diff_side_by_side);
-        let in_body = y >= frame.body_y && x >= frame.new_text_x && x < l.width - SCROLLBAR_W;
-        if in_body && x >= l.tree_w {
-            let row = (y - frame.body_y) / l.cell.line_height + panels.diff_scroll.max(0.0);
-            let column = ((x - frame.new_text_x) / l.cell.advance).max(0.0);
-            return Hit::DiffText {
-                row: row.max(0.0) as usize,
-                column: column.round() as usize,
+        let in_body =
+            y >= frame.body_y && x >= l.tree_w && x < l.width - SCROLLBAR_W && y >= l.text_y;
+        if in_body {
+            let row = ((y - frame.body_y) / l.cell.line_height + panels.diff_scroll.max(0.0))
+                .max(0.0) as usize;
+            // Only the new side of an editable diff takes a caret; the
+            // rest of the body is still a row, so a right-click there
+            // knows which change it is over.
+            return if kind == DiffKind::Editable && x >= frame.new_text_x {
+                Hit::DiffText {
+                    row,
+                    column: ((x - frame.new_text_x) / l.cell.advance).max(0.0).round() as usize,
+                }
+            } else {
+                Hit::DiffRow(row)
             };
         }
     }
@@ -928,7 +956,10 @@ impl<'a> Scene<'a> {
             preview_open: self.preview.is_some() || self.image.is_some(),
             settings_open: self.settings.is_some(),
             context: self.context,
-            diff_editable: self.diff.is_some() && self.diff_editable,
+            diff: self.diff.map(|_| match self.diff_editable {
+                true => DiffKind::Editable,
+                false => DiffKind::ReadOnly,
+            }),
             diff_scroll: self.diff_scroll,
             diff_side_by_side: self.diff_side_by_side,
             preview: self.preview,
@@ -3590,7 +3621,7 @@ mod tests {
             preview_open: false,
             settings_open: false,
             context: None,
-            diff_editable: false,
+            diff: None,
             diff_scroll: 0.0,
             diff_side_by_side: false,
             preview: None,
@@ -4222,7 +4253,7 @@ mod tests {
         );
         for side_by_side in [false, true] {
             let panels = Panels {
-                diff_editable: true,
+                diff: Some(DiffKind::Editable),
                 diff_side_by_side: side_by_side,
                 diff_scroll: 7.0,
                 ..probe_panels(&ws)
@@ -4238,11 +4269,14 @@ mod tests {
                 "side_by_side={side_by_side}: the scroll is part of the row"
             );
 
-            // The old side is a committed version, so it is not text.
+            // The old side is a committed version, so it is not text —
+            // but it is still a row, so a right click on it knows which
+            // change it is over.
             let old = frame.new_text_x - 4.0 * l.cell.advance;
-            assert!(
-                !matches!(hit_test(&l, &panels, old, y), Hit::DiffText { .. }),
-                "side_by_side={side_by_side}: the left column takes no caret"
+            assert_eq!(
+                hit_test(&l, &panels, old, y),
+                Hit::DiffRow(9),
+                "side_by_side={side_by_side}: the committed column is a row, not text"
             );
         }
     }
@@ -4263,17 +4297,24 @@ mod tests {
             },
         );
         let frame = diff_frame(&l, true);
-        let panels = probe_panels(&ws);
-        let hit = hit_test(
-            &l,
-            &panels,
+        let panels = Panels {
+            diff: Some(DiffKind::ReadOnly),
+            diff_side_by_side: true,
+            ..probe_panels(&ws)
+        };
+        // Both columns: a commit's diff has no buffer behind either of
+        // them, so neither can take a caret, and both are still rows.
+        for x in [
             frame.new_text_x + 2.0 * l.cell.advance,
-            frame.body_y + l.cell.line_height,
-        );
-        assert!(
-            !matches!(hit, Hit::DiffText { .. }),
-            "a commit's diff has no buffer behind it, got {hit:?}"
-        );
+            frame.new_text_x - 4.0 * l.cell.advance,
+        ] {
+            let hit = hit_test(&l, &panels, x, frame.body_y + l.cell.line_height);
+            assert_eq!(
+                hit,
+                Hit::DiffRow(1),
+                "a commit's diff has no buffer behind it, got {hit:?}"
+            );
+        }
     }
 
     #[test]

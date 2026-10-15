@@ -15,6 +15,7 @@
 //! subprocess is invisible, and `git` is the reference implementation.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -282,6 +283,84 @@ pub fn unified(before: &str, after: &str, context: usize) -> Vec<DiffLine> {
         });
     }
     out
+}
+
+/// One change in a diff, expressed as the edit that puts the committed
+/// text back.
+///
+/// Lines rather than bytes, because that is the unit a diff is in: the
+/// caller knows where its own lines start and we do not need to know
+/// anything about its buffer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Revert {
+    /// Lines of the working copy to replace: 0-based, end-exclusive.
+    /// Empty for a change that only deleted — there is nothing there
+    /// now, so putting it back is an insertion at this point.
+    pub lines: Range<usize>,
+    /// The committed lines to put there, without line endings. Empty
+    /// for a change that only added, which is undone by deleting.
+    pub text: Vec<String>,
+}
+
+/// The edit that undoes whichever change row `index` belongs to.
+///
+/// A change is the whole run of added and removed lines around that
+/// row, not the single line clicked: the two halves of one edit are the
+/// same edit, and reverting half of a replacement would leave the file
+/// in a state neither version ever had.
+///
+/// `None` for a row that is not part of a change — a context line, an
+/// elision marker, or an index past the end — because there is nothing
+/// there to undo.
+pub fn revert_at(lines: &[DiffLine], index: usize) -> Option<Revert> {
+    let changed = |line: &DiffLine| matches!(line.kind, LineKind::Added | LineKind::Removed);
+    if !lines.get(index).is_some_and(changed) {
+        return None;
+    }
+
+    let mut start = index;
+    while start > 0 && changed(&lines[start - 1]) {
+        start -= 1;
+    }
+    let mut end = index + 1;
+    while end < lines.len() && changed(&lines[end]) {
+        end += 1;
+    }
+    let run = &lines[start..end];
+
+    let text: Vec<String> = run
+        .iter()
+        .filter(|line| line.kind == LineKind::Removed)
+        .map(|line| line.text.clone())
+        .collect();
+
+    // The added lines are contiguous in the working copy, so the first
+    // and the last of them bound what this change put there.
+    let mut added = run
+        .iter()
+        .filter(|line| line.kind == LineKind::Added)
+        .filter_map(|line| line.new);
+    let first = added.next();
+    let last = added.next_back().or(first);
+
+    let lines = match (first, last) {
+        (Some(first), Some(last)) => first.saturating_sub(1)..last,
+        // Nothing was added, so the change was a deletion and there is
+        // no span to replace — only a point to put the lines back at.
+        // That point is just before the next line that still exists,
+        // and failing that just after the last one that does, which is
+        // a deletion off the end of the file.
+        _ => {
+            let at = lines[end..]
+                .iter()
+                .find_map(|line| line.new)
+                .map(|line| line.saturating_sub(1))
+                .or_else(|| lines[..start].iter().rev().find_map(|line| line.new))
+                .unwrap_or(0);
+            at..at
+        }
+    };
+    Some(Revert { lines, text })
 }
 
 /// Pairs a unified diff into two columns.
@@ -1251,5 +1330,140 @@ filename notes.txt
         let blame = parse_blame("");
         assert!(blame.is_empty());
         assert!(blame.line(0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod revert_tests {
+    use super::*;
+
+    #[test]
+    fn reverting_a_replacement_puts_the_committed_lines_back() {
+        let lines = unified("a\nb\nc\n", "a\nB\nc\n", 1);
+        let removed = lines
+            .iter()
+            .position(|l| l.kind == LineKind::Removed)
+            .expect("a replacement has a removed line");
+        let added = lines
+            .iter()
+            .position(|l| l.kind == LineKind::Added)
+            .expect("a replacement has an added line");
+
+        let from_removed = revert_at(&lines, removed).expect("the removed half is a change");
+        let from_added = revert_at(&lines, added).expect("the added half is the same change");
+        assert_eq!(
+            from_removed, from_added,
+            "both halves of one replacement must revert as one edit"
+        );
+        assert_eq!(from_added.lines, 1..2, "line 2 of the working copy");
+        assert_eq!(from_added.text, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn reverting_an_addition_deletes_it_and_puts_nothing_back() {
+        let lines = unified("a\nc\n", "a\nb1\nb2\nc\n", 1);
+        let added = lines
+            .iter()
+            .position(|l| l.kind == LineKind::Added)
+            .expect("an added line");
+        let revert = revert_at(&lines, added).expect("an addition is a change");
+        assert_eq!(revert.lines, 1..3, "both added lines, together");
+        assert!(
+            revert.text.is_empty(),
+            "nothing was removed, so nothing goes back"
+        );
+    }
+
+    #[test]
+    fn reverting_a_deletion_is_an_insertion_where_the_lines_were() {
+        let lines = unified("a\nb\nc\n", "a\nc\n", 1);
+        let removed = lines
+            .iter()
+            .position(|l| l.kind == LineKind::Removed)
+            .expect("a removed line");
+        let revert = revert_at(&lines, removed).expect("a deletion is a change");
+        assert!(
+            revert.lines.is_empty(),
+            "there is no line there now to replace, got {:?}",
+            revert.lines
+        );
+        assert_eq!(revert.lines.start, 1, "just before what is now line 2");
+        assert_eq!(revert.text, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn reverting_a_deletion_off_the_end_lands_after_the_last_line() {
+        let lines = unified("a\nb\n", "a\n", 1);
+        let removed = lines
+            .iter()
+            .position(|l| l.kind == LineKind::Removed)
+            .expect("a removed line");
+        let revert = revert_at(&lines, removed).expect("a deletion is a change");
+        // Nothing follows it in the working copy, so the only place the
+        // line can go back to is after the line that is still there.
+        assert_eq!(revert.lines, 1..1);
+        assert_eq!(revert.text, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn context_and_elision_rows_are_not_changes() {
+        // A gap wide enough to be elided, so both kinds of non-change
+        // row are in the same diff.
+        let before: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let after = before.replace("line 0\n", "LINE 0\n");
+        let lines = unified(&before, &after, 1);
+        for (i, line) in lines.iter().enumerate() {
+            match line.kind {
+                LineKind::Context | LineKind::Skipped => assert!(
+                    revert_at(&lines, i).is_none(),
+                    "row {i} is {:?} and has nothing to revert",
+                    line.kind
+                ),
+                LineKind::Added | LineKind::Removed => assert!(
+                    revert_at(&lines, i).is_some(),
+                    "row {i} is {:?} and must be revertible",
+                    line.kind
+                ),
+            }
+        }
+        assert!(
+            lines.iter().any(|l| l.kind == LineKind::Skipped),
+            "the gap must actually be elided or this proves nothing"
+        );
+        assert!(revert_at(&lines, lines.len()).is_none(), "past the end");
+    }
+
+    #[test]
+    fn every_revert_in_a_diff_reproduces_the_committed_file() {
+        // Applying them all, back to front so earlier line numbers stay
+        // valid, must land exactly on the committed text. That is the
+        // property the whole thing exists for.
+        let before = "one\ntwo\nthree\nfour\nfive\nsix\n";
+        let after = "one\nTWO\nthree\nfive\nextra\nsix\nseven\n";
+        let lines = unified(before, after, 1);
+
+        let mut edits: Vec<Revert> = Vec::new();
+        for i in 0..lines.len() {
+            if let Some(revert) = revert_at(&lines, i) {
+                if !edits.contains(&revert) {
+                    edits.push(revert);
+                }
+            }
+        }
+        edits.sort_by_key(|e| std::cmp::Reverse(e.lines.start));
+
+        let mut working: Vec<String> = after.lines().map(str::to_string).collect();
+        for edit in &edits {
+            working.splice(edit.lines.clone(), edit.text.iter().cloned());
+        }
+        let rebuilt: String = working.iter().map(|l| format!("{l}\n")).collect();
+        assert_eq!(rebuilt, before, "reverting every change undoes the diff");
+    }
+
+    #[test]
+    fn a_file_with_no_changes_offers_no_reverts() {
+        let lines = unified("a\nb\n", "a\nb\n", 1);
+        assert!(lines.is_empty(), "no diff at all, so no row to revert");
+        assert!(revert_at(&lines, 0).is_none());
     }
 }

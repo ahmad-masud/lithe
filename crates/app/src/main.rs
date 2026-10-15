@@ -220,7 +220,10 @@ impl Pane {
             preview_open: self.preview.is_some() || self.image.is_some(),
             settings_open: self.ws.showing_settings(),
             context: self.context.as_ref(),
-            diff_editable: self.ws.diff().is_some_and(workspace::Diff::editable),
+            diff: self.ws.diff().map(|diff| match diff.editable() {
+                true => view::DiffKind::Editable,
+                false => view::DiffKind::ReadOnly,
+            }),
             diff_scroll: self.ws.diff().map_or(0.0, |d| d.scroll),
             preview: self.preview.as_deref(),
             preview_scroll: self.preview_scroll,
@@ -2790,7 +2793,7 @@ impl App {
     /// `target` is what the menu was opened on; it is passed in rather
     /// than read back off the pane because choosing an entry closes the
     /// menu, and the menu is where the target lived.
-    fn run_context(&mut self, action: CtxAction, target: Option<PathBuf>) {
+    fn run_context(&mut self, action: CtxAction, target: Option<PathBuf>, row: Option<usize>) {
         use tree::Editing;
 
         let root = self.pane().map(Pane::search_root);
@@ -2844,6 +2847,8 @@ impl App {
             CtxAction::StageFile => self.stage_path(target, true),
             CtxAction::UnstageFile => self.stage_path(target, false),
             CtxAction::DiscardFile => self.discard_path(target),
+            CtxAction::RevertHunk => self.revert_hunk(row),
+            CtxAction::CopyDiffLine => self.copy_diff_line(row),
             CtxAction::RevealInFinder => self.reveal(target),
             CtxAction::OpenInDefaultApp => self.open_in_default_app(target),
             CtxAction::OpenInTerminal => {
@@ -3395,6 +3400,23 @@ impl App {
                 };
                 ContextMenu::for_change(at, path, staged)
             }
+            // A row of an open diff, on either side: the menu is about
+            // the change it is part of.
+            Hit::DiffRow(row) | Hit::DiffText { row, .. } => {
+                let side_by_side = pane.preview_defaults.side_by_side_diff;
+                let Some(diff) = pane.ws.diff() else { return };
+                let Some(path) = pane.ws.active().and_then(|e| e.path.clone()) else {
+                    // A commit's diff is of no file you have open, so
+                    // none of these entries would have anything to act
+                    // on.
+                    return;
+                };
+                let (left, right) = row_sides(diff, row, side_by_side);
+                let revertible = left
+                    .or(right)
+                    .is_some_and(|i| lithe_vcs::revert_at(&diff.lines, i).is_some());
+                ContextMenu::for_diff(at, path, row, revertible)
+            }
             // Empty space in the sidebar acts on the project root.
             Hit::Elsewhere if x < l.tree_w && pane.tree.is_some() => {
                 ContextMenu::for_explorer(at, None, true, &state)
@@ -3419,6 +3441,55 @@ impl App {
             _ => return,
         };
         pane.context = Some(menu);
+    }
+
+    /// Puts the committed text back for one change in the open diff.
+    ///
+    /// Through the buffer rather than through git, which is what makes
+    /// it an ordinary edit: it joins the undo history, the diff rebuilds
+    /// itself from the result the way it does after any keystroke, and
+    /// nothing is written to disk until the file is saved. That is also
+    /// why it is not asked for twice the way discarding a whole file is
+    /// — this one `cmd+Z` takes back.
+    fn revert_hunk(&mut self, row: Option<usize>) {
+        let Some(row) = row else { return };
+        let Some(pane) = self.pane_mut() else { return };
+        let side_by_side = pane.preview_defaults.side_by_side_diff;
+
+        let revert = pane.ws.diff().and_then(|diff| {
+            let (left, right) = row_sides(diff, row, side_by_side);
+            lithe_vcs::revert_at(&diff.lines, left.or(right)?)
+        });
+        let Some(revert) = revert else {
+            pane.status = Some("no change on that line".into());
+            return;
+        };
+        let Some(editor) = pane.ws.active_mut() else {
+            return;
+        };
+
+        let (span, text) = revert_edit(&editor.doc, &revert);
+        editor.replace_span(span.start, span.end, &text);
+        pane.status = Some("reverted the change".into());
+        pane.git_stale = true;
+        pane.hunks_for = None;
+    }
+
+    /// Copies the text of one diff row.
+    ///
+    /// The working side where the row has one, because that is what the
+    /// file says now and so what is worth pasting somewhere else.
+    fn copy_diff_line(&mut self, row: Option<usize>) {
+        let Some(row) = row else { return };
+        let Some(pane) = self.pane() else { return };
+        let side_by_side = pane.preview_defaults.side_by_side_diff;
+        let text = pane.ws.diff().and_then(|diff| {
+            let (left, right) = row_sides(diff, row, side_by_side);
+            let line = diff.lines.get(right.or(left)?)?;
+            // An elision marker is a count, not a line of the file.
+            (line.kind != lithe_vcs::LineKind::Skipped).then(|| line.text.clone())
+        });
+        self.put_on_clipboard(text, "line");
     }
 
     /// Stages or unstages one file by path.
@@ -3553,14 +3624,16 @@ impl App {
                 Key::Named(NamedKey::ArrowDown) => menu.move_selection(1),
                 Key::Named(NamedKey::ArrowUp) => menu.move_selection(-1),
                 Key::Named(NamedKey::Enter) => {
-                    chosen = menu.chosen().map(|action| (action, menu.target.clone()));
+                    chosen = menu
+                        .chosen()
+                        .map(|action| (action, menu.target.clone(), menu.row));
                     pane.context = None;
                 }
                 _ => {}
             }
         }
-        if let Some((action, target)) = chosen {
-            self.run_context(action, target);
+        if let Some((action, target, row)) = chosen {
+            self.run_context(action, target, row);
         }
         true
     }
@@ -4373,6 +4446,10 @@ impl App {
             }
             // A click on the new side of an editable diff places the
             // caret in the buffer, at the line that row shows.
+            // The committed column takes no caret, so a left click on
+            // it does nothing. It is a hit so that a right click can
+            // name the change it is over.
+            Hit::DiffRow(_) => {}
             Hit::DiffText { row, column } => {
                 let side_by_side = pane.preview_defaults.side_by_side_diff;
                 let line = pane
@@ -4478,7 +4555,7 @@ impl App {
                 // the entries that were on screen when it was clicked.
                 context_choice = menu_choice
                     .as_ref()
-                    .and_then(|m| Some((m.entries.get(row)?.action?, m.target.clone())));
+                    .and_then(|m| Some((m.entries.get(row)?.action?, m.target.clone(), m.row)));
             }
             Hit::Setting(setting) => setting_click = Some(setting),
             Hit::GitMode(mode) => {
@@ -4587,8 +4664,8 @@ impl App {
         if jump {
             self.ask_lsp(Awaiting::Definition);
         }
-        if let Some((action, target)) = context_choice {
-            self.run_context(action, target);
+        if let Some((action, target, row)) = context_choice {
+            self.run_context(action, target, row);
         }
         if let Some(setting) = setting_click {
             setting.toggle(&mut self.settings);
@@ -5452,6 +5529,63 @@ fn name_of(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// One revert as a buffer edit: the characters to replace, and what to
+/// put there.
+///
+/// Separate from the editor so the line arithmetic can be tested on its
+/// own, which is where this is easy to get wrong.
+fn revert_edit(
+    doc: &lithe_core::TextBuffer,
+    revert: &lithe_vcs::Revert,
+) -> (std::ops::Range<usize>, String) {
+    // Past the last line means the end of the document, which
+    // `line_to_char` cannot say on its own: it clamps to the last
+    // line's start instead.
+    let total = doc.len_lines();
+    let at = |line: usize| match line >= total {
+        true => doc.len_chars(),
+        false => doc.line_to_char(line),
+    };
+    let start = at(revert.lines.start);
+    let end = at(revert.lines.end).max(start);
+
+    let mut text: String = revert.text.iter().map(|line| format!("{line}\n")).collect();
+    // Putting lines back at the end of a file that does not end in a
+    // newline would otherwise glue the first of them onto the last
+    // line there.
+    if !text.is_empty()
+        && start == doc.len_chars()
+        && start > 0
+        && doc.slice_to_string(start - 1..start) != "\n"
+    {
+        text.insert(0, '\n');
+    }
+    (start..end, text)
+}
+
+/// Which lines of the diff a row shows, as indices into `lines`: the
+/// committed side and the working side.
+///
+/// A unified row is one diff line and is both sides of itself; a split
+/// row is a pair. Which half a caller wants depends on what it is for —
+/// reverting takes either, since both halves of a change revert as one
+/// edit, and copying takes what the file says now.
+fn row_sides(
+    view: &workspace::Diff,
+    row: usize,
+    side_by_side: bool,
+) -> (Option<usize>, Option<usize>) {
+    if side_by_side {
+        lithe_vcs::pair_columns(&view.lines)
+            .get(row)
+            .copied()
+            .unwrap_or((None, None))
+    } else {
+        let index = (row < view.lines.len()).then_some(row);
+        (index, index)
+    }
+}
+
 /// Which line of the working copy a diff row shows.
 ///
 /// In the split view a row is a pair of sides and only the right one is
@@ -5963,7 +6097,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
     // A diff of the active file, for eyeballing the view.
     // Through the workspace, as the real pane does, so the snapshot
     // shows the tab a diff opens in rather than a diff with no tab.
-    if matches!(overlay, Some("diff") | Some("split")) {
+    if matches!(overlay, Some("diff") | Some("split") | Some("diff-menu")) {
         if let (Some(repo), Some(path)) = (repo.as_ref(), ws.active().and_then(|e| e.path.clone()))
         {
             let committed = repo.committed(&path).unwrap_or_default();
@@ -6074,6 +6208,12 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
             Some(false),
             context::GoesTo::ALL,
         )),
+        Some("diff-menu") => Some(ContextMenu::for_diff(
+            (420.0, 300.0),
+            ws.active().and_then(|e| e.path.clone()).unwrap_or_default(),
+            5,
+            true,
+        )),
         Some("explorer-menu") => Some(ContextMenu::for_explorer(
             (120.0, 260.0),
             tree.as_ref()
@@ -6137,7 +6277,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         diff: ws.diff().map(|d| d.lines.as_slice()),
         diff_title: ws.diff().map(|d| d.title.as_str()),
         diff_scroll: 0.0,
-        diff_side_by_side: overlay == Some("split"),
+        diff_side_by_side: matches!(overlay, Some("split") | Some("diff-menu")),
         // Both overlays build a diff of the active working file, which
         // is the editable kind. History's read-only diff is a different
         // thing and is not what either one shows.
@@ -6838,5 +6978,97 @@ mod hover_highlight_tests {
         ] {
             assert_eq!(hoverable(hit), Some(hit), "{hit:?} should highlight");
         }
+    }
+}
+
+#[cfg(test)]
+mod revert_edit_tests {
+    use super::revert_edit;
+    use lithe_core::TextBuffer;
+    use lithe_vcs::Revert;
+
+    /// Applies a revert the way `revert_hunk` does, and returns the
+    /// text that results.
+    fn apply(text: &str, lines: std::ops::Range<usize>, put: &[&str]) -> String {
+        let doc = TextBuffer::from_text(text);
+        let revert = Revert {
+            lines,
+            text: put.iter().map(|s| s.to_string()).collect(),
+        };
+        let (span, inserted) = revert_edit(&doc, &revert);
+        let mut out = doc.slice_to_string(0..span.start);
+        out.push_str(&inserted);
+        out.push_str(&doc.slice_to_string(span.end..doc.len_chars()));
+        out
+    }
+
+    #[test]
+    fn a_replacement_swaps_whole_lines() {
+        assert_eq!(apply("a\nB\nc\n", 1..2, &["b"]), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn an_empty_range_inserts_without_removing() {
+        assert_eq!(apply("a\nc\n", 1..1, &["b"]), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn an_empty_text_removes_without_inserting() {
+        assert_eq!(apply("a\nb\nc\n", 1..2, &[]), "a\nc\n");
+    }
+
+    #[test]
+    fn a_range_past_the_end_means_the_end() {
+        // `line_to_char` clamps to the last line's start, so a naive
+        // conversion would insert before the last line rather than
+        // after it.
+        assert_eq!(apply("a\n", 1..1, &["b"]), "a\nb\n");
+        assert_eq!(apply("a\nb\n", 9..9, &["c"]), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn appending_to_a_file_with_no_final_newline_does_not_glue() {
+        // The last line has no newline after it, so putting a line
+        // back at the end has to supply one or the two run together.
+        assert_eq!(apply("a", 1..1, &["b"]), "a\nb\n");
+        assert_ne!(apply("a", 1..1, &["b"]), "ab\n");
+    }
+
+    #[test]
+    fn replacing_the_last_line_of_a_file_with_no_final_newline() {
+        assert_eq!(apply("a\nB", 1..2, &["b"]), "a\nb\n");
+    }
+
+    #[test]
+    fn an_empty_document_takes_the_lines_as_they_are() {
+        assert_eq!(apply("", 0..0, &["a", "b"]), "a\nb\n");
+    }
+
+    /// The whole chain, minus the menu: diff a pair of files, revert
+    /// the change on one row, and check the buffer says what the
+    /// committed version says on that line and nothing else moved.
+    #[test]
+    fn reverting_one_row_changes_only_that_change() {
+        let committed = "one\ntwo\nthree\nfour\n";
+        let working = "one\nTWO\nthree\nFOUR\n";
+        let lines = lithe_vcs::unified(committed, working, 1);
+
+        // The first change, found the way the menu finds it.
+        let row = lines
+            .iter()
+            .position(|l| l.kind == lithe_vcs::LineKind::Added)
+            .expect("the diff has an added line");
+        let revert = lithe_vcs::revert_at(&lines, row).expect("that row is a change");
+
+        let doc = TextBuffer::from_text(working);
+        let (span, text) = revert_edit(&doc, &revert);
+        let mut out = doc.slice_to_string(0..span.start);
+        out.push_str(&text);
+        out.push_str(&doc.slice_to_string(span.end..doc.len_chars()));
+
+        assert_eq!(
+            out, "one\ntwo\nthree\nFOUR\n",
+            "the first change goes back and the second is left alone"
+        );
     }
 }

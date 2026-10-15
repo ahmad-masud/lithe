@@ -27,6 +27,12 @@ pub enum Action {
     StageFile,
     UnstageFile,
     DiscardFile,
+    // --- diff ---
+    /// Put the committed text back for one change, as an undoable edit
+    /// in the buffer rather than through git.
+    RevertHunk,
+    /// Copy the text of the diff row the menu was opened on.
+    CopyDiffLine,
     OpenChange,
     ShowDiff,
     CopyPath,
@@ -181,6 +187,8 @@ pub struct ContextMenu {
     pub selected: usize,
     /// The path the menu was opened on, for the entries that need one.
     pub target: Option<PathBuf>,
+    /// The diff row it was opened on, for the entries that act on one.
+    pub row: Option<usize>,
 }
 
 impl ContextMenu {
@@ -193,6 +201,7 @@ impl ContextMenu {
             at,
             selected,
             target,
+            row: None,
         }
     }
 
@@ -223,6 +232,43 @@ impl ContextMenu {
             Entry::item("Reveal in Finder", "", Action::RevealInFinder),
         ];
         Self::new(entries, at, Some(target))
+    }
+
+    /// The menu for a row in an open diff.
+    ///
+    /// A diff is a list of changes, so the entry that matters is the
+    /// one that undoes the change under the pointer. It is offered only
+    /// on a row that is part of one — a context line has nothing to
+    /// revert, and an entry that would quietly do nothing is worse than
+    /// no entry.
+    ///
+    /// Reverting goes through the buffer, not through git, so it joins
+    /// the undo history: a change put back by mistake is one `cmd+Z`
+    /// away. That is also why it needs no confirmation, unlike
+    /// discarding the whole file, which does not.
+    pub fn for_diff(at: (f32, f32), target: PathBuf, row: usize, revertible: bool) -> Self {
+        let mut entries = Vec::new();
+        if revertible {
+            entries.extend([
+                Entry::item("Revert This Change", "", Action::RevertHunk),
+                Entry::separator(),
+            ]);
+        }
+        entries.extend([
+            Entry::item("Copy Line", "", Action::CopyDiffLine),
+            Entry::separator(),
+            Entry::item("Open File", "", Action::OpenChange),
+            Entry::separator(),
+            Entry::item("Discard All Changes…", "", Action::DiscardFile),
+            Entry::separator(),
+            Entry::item("Copy Path", "", Action::CopyPath),
+            Entry::item("Copy Relative Path", "", Action::CopyRelativePath),
+            Entry::item("Reveal in Finder", "", Action::RevealInFinder),
+        ]);
+        Self {
+            row: Some(row),
+            ..Self::new(entries, at, Some(target))
+        }
     }
 
     pub fn for_explorer(
@@ -720,5 +766,66 @@ mod change_menu_tests {
             menu.target.as_deref(),
             Some(std::path::Path::new("src/a.rs"))
         );
+    }
+}
+
+#[cfg(test)]
+mod diff_menu_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn menu(revertible: bool) -> ContextMenu {
+        ContextMenu::for_diff((0.0, 0.0), PathBuf::from("/w/a.rs"), 4, revertible)
+    }
+
+    fn actions(menu: &ContextMenu) -> Vec<Action> {
+        menu.entries.iter().filter_map(|e| e.action).collect()
+    }
+
+    #[test]
+    fn a_change_can_be_reverted_and_a_context_line_cannot() {
+        assert!(
+            actions(&menu(true)).contains(&Action::RevertHunk),
+            "a row that is part of a change offers to put it back"
+        );
+        assert!(
+            !actions(&menu(false)).contains(&Action::RevertHunk),
+            "a context line has nothing to revert, so the entry is not there"
+        );
+    }
+
+    #[test]
+    fn the_row_travels_with_the_menu() {
+        // Choosing an entry closes the menu, so whatever acts on the
+        // row has to read it from here rather than from the pointer.
+        assert_eq!(menu(true).row, Some(4));
+        assert_eq!(
+            menu(true).target.as_deref(),
+            Some(Path::new("/w/a.rs")),
+            "the file is still what the whole-file entries act on"
+        );
+    }
+
+    #[test]
+    fn reverting_is_offered_before_discarding_the_lot() {
+        let menu = menu(true);
+        let list = actions(&menu);
+        let revert = list.iter().position(|a| *a == Action::RevertHunk);
+        let discard = list.iter().position(|a| *a == Action::DiscardFile);
+        assert!(
+            revert < discard,
+            "the narrow, undoable entry comes before the wide, permanent one"
+        );
+    }
+
+    #[test]
+    fn the_menu_never_opens_on_a_separator() {
+        for revertible in [true, false] {
+            let menu = menu(revertible);
+            assert!(
+                !menu.entries[menu.selected].is_separator(),
+                "revertible={revertible}"
+            );
+        }
     }
 }
