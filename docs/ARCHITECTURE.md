@@ -334,6 +334,34 @@ it is editable — became one `Option<DiffKind>`. They only ever made
 sense together, and a test that set the second without the first had
 been passing against a hit test that read only the first.
 
+The preview can be selected and copied. It is drawn rather than typed
+into, so it has no buffer and no cursor — its selection model is two
+places in the laid-out lines, a line index and a character offset into
+that line's text, moved by the pointer and read back when something
+asks to copy. Characters of the whole line rather than of a span,
+because a selection runs across the runs a line is broken into and
+does not care where one style ends.
+
+Both halves measure, and measure the same way the drawing does: a
+proportional face has no column to divide by, so finding the character
+under a point walks the runs and then the characters of the one it
+lands in, and drawing the band asks the same walk where a boundary
+sits. A round-trip test pins them together — a point taken from where
+a character is drawn has to come back as that character, which is
+exactly where two separate walks could drift.
+
+Running off the edge clamps rather than returning nothing, because a
+drag past the bottom means "to the end" and anything else makes
+dragging feel broken. Clicking a fenced block still copies it, but now
+on release and only when nothing was dragged: selecting code would
+otherwise copy the block out from under the selection. The pointer is
+an I-beam over a preview, which is the only thing that says a drawn
+document can be selected at all.
+
+The selection is taken down whenever the lines it points at stop
+meaning the same thing: a re-render after an edit or a resize, the
+preview closing, a click outside it, and Escape.
+
 Cmd-clicking a name jumps to its definition, and nothing said so. The
 name under the pointer is now underlined while the command key is
 held, in the foreground colour rather than a new one, so it reads as a

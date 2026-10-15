@@ -189,6 +189,13 @@ struct Pane {
     /// pointer is over one. Underlined, so what a cmd-click would do
     /// is visible before you do it.
     cmd_link: Option<Range<usize>>,
+    /// Selected text in the preview, as the place the drag started and
+    /// the place it is now. Not ordered: which end moves is which end
+    /// the pointer is, and swapping them as the drag crosses its own
+    /// start would make the selection jump.
+    preview_sel: Option<(view::PreviewPos, view::PreviewPos)>,
+    /// Whether the button is still down on a preview selection.
+    preview_dragging: bool,
     /// Shown in the status bar until the next keystroke.
     status: Option<String>,
     pointer: PhysicalPosition<f64>,
@@ -545,6 +552,115 @@ impl Pane {
         name_at(&editor.doc, under)
     }
 
+    /// Starts a text selection in the preview.
+    ///
+    /// The preview is drawn, not a buffer, so this is the whole of its
+    /// selection model: two places in the laid-out lines, moved by the
+    /// pointer and read back when something asks to copy.
+    fn begin_preview_selection(&mut self, x: f32, y: f32) {
+        let Some(at) = self.preview_pos(x, y) else {
+            self.preview_sel = None;
+            return;
+        };
+        self.preview_sel = Some((at, at));
+        self.preview_dragging = true;
+    }
+
+    /// Moves the end of a selection being dragged.
+    ///
+    /// Returns whether anything changed, since this runs on every pixel
+    /// of pointer movement.
+    fn drag_preview_selection(&mut self, x: f32, y: f32) -> bool {
+        if !self.preview_dragging {
+            return false;
+        }
+        let Some((anchor, head)) = self.preview_sel else {
+            return false;
+        };
+        let Some(at) = self.preview_pos(x, y) else {
+            return false;
+        };
+        if at == head {
+            return false;
+        }
+        self.preview_sel = Some((anchor, at));
+        true
+    }
+
+    /// Ends a drag, and says what a plain click meant.
+    ///
+    /// A press and a release in the same place is a click, not a
+    /// selection: it clears the selection, and over a fenced block it
+    /// copies the block, which is how code gets out of a drawn
+    /// document and has to keep working.
+    fn end_preview_selection(&mut self) -> Option<(String, &'static str)> {
+        if !std::mem::take(&mut self.preview_dragging) {
+            return None;
+        }
+        let (anchor, head) = self.preview_sel?;
+        if anchor != head {
+            return None;
+        }
+        self.preview_sel = None;
+        let text = self
+            .preview
+            .as_ref()?
+            .get(anchor.line)
+            .and_then(|line| line.code.clone())?;
+        let rows = text.lines().count();
+        Some((
+            text.to_string(),
+            if rows == 1 { "1 line" } else { "the block" },
+        ))
+    }
+
+    /// Where a point lands in the preview.
+    fn preview_pos(&self, x: f32, y: f32) -> Option<view::PreviewPos> {
+        let lines = self.preview.as_deref()?;
+        let mut measure = Measured {
+            renderer: &self.renderer,
+        };
+        view::preview_char_at(
+            &self.layout(),
+            lines,
+            self.preview_scroll,
+            x,
+            y,
+            &mut measure,
+        )
+    }
+
+    /// The selected text of the preview, as it would be pasted.
+    fn preview_selection(&self) -> Option<String> {
+        let lines = self.preview.as_deref()?;
+        let (a, b) = self.preview_sel?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = String::new();
+        for index in start.line..=end.line.min(lines.len().saturating_sub(1)) {
+            let line = lines.get(index)?;
+            let text: Vec<char> = line.text().chars().collect();
+            let from = if index == start.line { start.char } else { 0 };
+            let to = if index == end.line {
+                end.char
+            } else {
+                text.len()
+            };
+            if index > start.line {
+                out.push('\n');
+            }
+            let (from, to) = (from.min(text.len()), to.min(text.len()));
+            out.extend(&text[from.min(to)..to]);
+        }
+        // Trailing spaces on wrapped lines are the layout's, not the
+        // document's.
+        let text: String = out
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     /// Takes down the tooltip, and re-arms the dwell.
     ///
     /// Called from everything that means the pointer is no longer just
@@ -875,12 +991,14 @@ impl Pane {
         if !self.active_is_previewable() {
             self.preview = None;
             self.preview_for = None;
+            self.preview_sel = None;
             return;
         }
         let columns = view::preview_columns(&self.layout());
         let Some(editor) = self.ws.active() else {
             self.preview = None;
             self.preview_for = None;
+            self.preview_sel = None;
             return;
         };
         let path = editor.path.clone().unwrap_or_default();
@@ -896,6 +1014,9 @@ impl Pane {
         };
         self.preview = Some(markdown::render_with(&source, columns, &mut measure));
         self.preview_for = Some(key);
+        // The lines are laid out again, so a selection in the old ones
+        // points at rows that no longer mean the same thing.
+        self.preview_sel = None;
     }
 
     /// Works out the blame note for the cursor's line.
@@ -1173,6 +1294,7 @@ impl Pane {
             sidebar_cols,
             preview,
             preview_scroll,
+            preview_sel,
             image,
             preview_defaults,
             context,
@@ -1224,6 +1346,7 @@ impl Pane {
             sidebar_cols: *sidebar_cols,
             preview: preview.as_deref(),
             preview_scroll: *preview_scroll,
+            preview_sel: *preview_sel,
             diff: ws.diff().map(|d| d.lines.as_slice()),
             diff_title: ws.diff().map(|d| d.title.as_str()),
             diff_scroll: ws.diff().map_or(0.0, |d| d.scroll),
@@ -2290,6 +2413,8 @@ impl App {
             highlights: Vec::new(),
             diff_old_spans: Vec::new(),
             cmd_link: None,
+            preview_sel: None,
+            preview_dragging: false,
             diff_new_spans: Vec::new(),
             status: None,
             pointer: PhysicalPosition::new(0.0, 0.0),
@@ -2313,6 +2438,13 @@ impl App {
     }
 
     fn copy(&mut self, cut: bool) {
+        // A showing preview is what the window is about, so a selection
+        // in it is the selection. There is nothing to cut from a drawn
+        // document, so a cut there copies.
+        if let Some(text) = self.pane().and_then(Pane::preview_selection) {
+            self.put_on_clipboard(Some(text), "the selection");
+            return;
+        }
         let Some(text) = self.pane().and_then(|p| p.ws.active()?.selected_text()) else {
             return;
         };
@@ -2787,11 +2919,23 @@ impl App {
                     e.unindent();
                 }
             }
-            Command::SelectAll => {
-                if let Some(e) = pane.ws.active_mut() {
-                    e.select_all();
+            Command::SelectAll => match pane.preview.as_deref() {
+                Some(lines) if !lines.is_empty() => {
+                    let last = lines.len() - 1;
+                    pane.preview_sel = Some((
+                        view::PreviewPos { line: 0, char: 0 },
+                        view::PreviewPos {
+                            line: last,
+                            char: lines[last].len_chars(),
+                        },
+                    ));
                 }
-            }
+                _ => {
+                    if let Some(e) = pane.ws.active_mut() {
+                        e.select_all();
+                    }
+                }
+            },
             Command::Find | Command::Replace => {
                 let replacing = command == Command::Replace;
                 // Seed the query from the selection, which is what you
@@ -4257,6 +4401,16 @@ impl App {
         let alt = self.modifiers.alt_key();
         let control = self.modifiers.control_key();
 
+        // Escape takes down a selection in the preview before anything
+        // else looks at it, the way it collapses one in the buffer.
+        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+            if let Some(pane) = self.pane_mut() {
+                if pane.preview_sel.take().is_some() {
+                    return true;
+                }
+            }
+        }
+
         // The two bindings that are on Control everywhere, including where
         // Control is also the command modifier — so they are read before
         // the command layer rather than after it, which is where they used
@@ -4527,6 +4681,11 @@ impl App {
                 link = view::preview_link_at(&l, lines, pane.preview_scroll, x, y, &mut measure);
             }
         }
+        // A click anywhere but the preview takes its selection down,
+        // the way clicking away from selected text always does.
+        if !matches!(hit, Hit::Elsewhere | Hit::PreviewCode(_)) {
+            pane.preview_sel = None;
+        }
         // Any click closes the menu, whether or not it chose something:
         // while one is open `hit_test` answers only about the menu, so a
         // click outside it would otherwise land nowhere and leave it up.
@@ -4698,20 +4857,16 @@ impl App {
             // Clicking a fenced block in the preview copies it. A drawn
             // preview has no selection to drag, so this is the only way
             // the code in it gets out.
-            Hit::PreviewCode(row) => {
-                let text = pane
-                    .preview
-                    .as_ref()
-                    .and_then(|lines| lines.get(row))
-                    .and_then(|line| line.code.clone());
-                let Some(text) = text else { return };
-                let lines = text.lines().count();
-                self.put_on_clipboard(
-                    Some(text.to_string()),
-                    if lines == 1 { "1 line" } else { "the block" },
-                );
-                return;
+            // A press in the preview starts a selection. A fenced
+            // block is still copied by clicking it, but on release and
+            // only when nothing was dragged — otherwise selecting code
+            // would copy the block out from under the selection.
+            Hit::PreviewCode(_) | Hit::Elsewhere if pane.preview.is_some() => {
+                pane.begin_preview_selection(x, y);
             }
+            // With no preview behind it, a fenced row is not a row of
+            // anything.
+            Hit::PreviewCode(_) => {}
             Hit::GitInit => {
                 let root = pane.search_root();
                 match lithe_vcs::Repo::init(&root) {
@@ -5102,6 +5257,9 @@ impl ApplicationHandler<Wake> for App {
                 if pane.refresh_cmd_link(cmd, &live) {
                     pane.redraw();
                 }
+                if pane.drag_preview_selection(x, y) {
+                    pane.redraw();
+                }
                 let was = pane.pointer_over_text;
                 pane.pointer_over_text = matches!(over, Hit::Text);
                 let moved_away = pane
@@ -5137,6 +5295,13 @@ impl ApplicationHandler<Wake> for App {
                         // The new side of an editable diff is the buffer,
                         // so it gets the buffer's cursor.
                         Hit::Text | Hit::DiffText { .. } => winit::window::CursorIcon::Text,
+                        // A drawn document is still text you can select,
+                        // and the pointer is the only thing that says so.
+                        Hit::PreviewCode(_) | Hit::Elsewhere
+                            if pane.preview.is_some() && y >= l.text_y && x >= l.tree_w =>
+                        {
+                            winit::window::CursorIcon::Text
+                        }
                         Hit::Landing(_)
                         | Hit::Tab(_)
                         | Hit::TabClose(_)
@@ -5252,11 +5417,18 @@ impl ApplicationHandler<Wake> for App {
                         }
                     }
                     ElementState::Released => {
+                        let copy = self
+                            .panes
+                            .get_mut(&id)
+                            .and_then(Pane::end_preview_selection);
                         if let Some(pane) = self.panes.get_mut(&id) {
                             pane.dragging = false;
                             pane.scrubbing = false;
                             pane.scrubbing_x = false;
                             pane.resizing = false;
+                        }
+                        if let Some((text, what)) = copy {
+                            self.put_on_clipboard(Some(text), what);
                         }
                     }
                 }
@@ -6400,7 +6572,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
     // Laid out exactly as the running editor lays it out: the pane it
     // has, and the faces it will be drawn in. A snapshot wrapped to a
     // number picked here would be a picture of a preview nobody sees.
-    let md = (overlay == Some("preview"))
+    let md = matches!(overlay, Some("preview") | Some("selected"))
         .then(|| {
             let editor = ws.active()?;
             let l = view::layout(
@@ -6530,6 +6702,11 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         sidebar_cols: view::TREE_COLS,
         preview: md.as_deref(),
         preview_scroll: 0.0,
+        // `--overlay selected` shows a dragged selection.
+        preview_sel: (overlay == Some("selected")).then_some((
+            view::PreviewPos { line: 2, char: 4 },
+            view::PreviewPos { line: 4, char: 12 },
+        )),
         diff: ws.diff().map(|d| d.lines.as_slice()),
         diff_title: ws.diff().map(|d| d.title.as_str()),
         diff_scroll: 0.0,

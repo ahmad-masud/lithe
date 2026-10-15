@@ -427,6 +427,9 @@ pub struct Scene<'a> {
     /// Rendered Markdown, shown instead of the file when open.
     pub preview: Option<&'a [MdLine]>,
     pub preview_scroll: f32,
+    /// Selected text in the preview: where the drag began and where it
+    /// is now, in either order.
+    pub preview_sel: Option<(PreviewPos, PreviewPos)>,
     /// A unified diff, shown instead of the file.
     pub diff: Option<&'a [lithe_vcs::DiffLine]>,
     pub diff_title: Option<&'a str>,
@@ -1232,7 +1235,14 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
     } else if let Some(lines) = scene.diff {
         draw_diff(&mut f, &l, lines, scene, theme, scratch);
     } else if let Some(lines) = scene.preview {
-        draw_preview(&mut f, &l, lines, scene.preview_scroll, theme);
+        draw_preview(
+            &mut f,
+            &l,
+            lines,
+            scene.preview_scroll,
+            scene.preview_sel,
+            theme,
+        );
     } else if showing_landing(scene.workspace) {
         draw_landing(&mut f, &l, scene, scratch);
     } else {
@@ -2536,6 +2546,172 @@ pub fn preview_link_at(
     None
 }
 
+/// A place in the preview: which laid-out line, and how many
+/// characters into it.
+///
+/// Characters of [`MdLine::text`] rather than of a span, because a
+/// selection runs across the runs a line is broken into and does not
+/// care where one style ends.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub struct PreviewPos {
+    pub line: usize,
+    pub char: usize,
+}
+
+/// Where in the preview a point lands.
+///
+/// Clamped rather than optional past the edges: a drag that runs off
+/// the bottom of the column means "to the end", which is what every
+/// other text selection does and what makes dragging feel like
+/// dragging. `None` only when the pointer is outside the preview
+/// altogether, or there is no preview.
+pub fn preview_char_at(
+    l: &Layout,
+    lines: &[MdLine],
+    scroll: f32,
+    x: f32,
+    y: f32,
+    measure: &mut dyn crate::markdown::Measure,
+) -> Option<PreviewPos> {
+    if lines.is_empty() || x < l.tree_w {
+        return None;
+    }
+    let end = |line: usize| PreviewPos {
+        line,
+        char: lines[line].len_chars(),
+    };
+    if y < l.text_y {
+        return Some(PreviewPos {
+            line: scroll.max(0.0) as usize,
+            char: 0,
+        });
+    }
+
+    let page = preview_page(l, measure);
+    let top = (scroll.max(0.0) as usize).min(lines.len() - 1);
+    let slip = (scroll.max(0.0).fract() * l.cell.line_height).round();
+    let mut row_y = l.text_y + l.cell.line_height - slip;
+    let mut last = top;
+    for (offset, line) in lines.iter().enumerate().skip(top) {
+        let height = line.rows() as f32 * l.cell.line_height;
+        if y >= row_y && y < row_y + height {
+            return Some(PreviewPos {
+                line: offset,
+                char: preview_column(l, line, &page, x, measure),
+            });
+        }
+        last = offset;
+        row_y += height;
+        if row_y > l.text_y + l.text_h {
+            break;
+        }
+    }
+    // Below the last row drawn: the end of it.
+    Some(end(last))
+}
+
+/// How many characters into a line a point is, horizontally.
+///
+/// Walks the runs and then the characters of the one it lands in,
+/// because a proportional face has no column to divide by. Both walks
+/// are over one line of one visible row, so the cost is bounded by the
+/// window rather than by the document.
+fn preview_column(
+    l: &Layout,
+    line: &MdLine,
+    page: &Page,
+    x: f32,
+    measure: &mut dyn crate::markdown::Measure,
+) -> usize {
+    let indent = line.indent;
+    let start = page.origin(line);
+    if x <= start {
+        return 0;
+    }
+    let mut at = start + indent as f32 * l.cell.advance;
+    if x < at {
+        // Inside the indent: the nearest edge of it.
+        let into = ((x - start) / l.cell.advance).round() as usize;
+        return into.min(indent);
+    }
+    let mut passed = indent;
+    for span in &line.spans {
+        let width = run_cells(line, span, measure) * l.cell.advance;
+        if x < at + width {
+            // Inside this run: the character boundary nearest `x`.
+            let chars: Vec<char> = span.text.chars().collect();
+            let mut best = (f32::MAX, 0usize);
+            for taken in 0..=chars.len() {
+                let prefix: String = chars[..taken].iter().collect();
+                let edge = at
+                    + run_cells(
+                        line,
+                        &crate::markdown::Span::plain(prefix, span.style),
+                        measure,
+                    ) * l.cell.advance;
+                let gap = (edge - x).abs();
+                if gap < best.0 {
+                    best = (gap, taken);
+                }
+            }
+            return passed + best.1;
+        }
+        at += width;
+        passed += span.text.chars().count();
+    }
+    passed
+}
+
+/// Which characters of `line` a selection covers, if any.
+///
+/// The ends are whole lines except where the selection starts or stops,
+/// which is what makes a multi-line drag look like one block rather
+/// than three ragged ones.
+fn selected_chars(
+    line: &MdLine,
+    index: usize,
+    start: PreviewPos,
+    end: PreviewPos,
+) -> Option<(usize, usize)> {
+    if index < start.line || index > end.line {
+        return None;
+    }
+    let chars = line.len_chars();
+    let from = if index == start.line { start.char } else { 0 };
+    let to = if index == end.line { end.char } else { chars };
+    let (from, to) = (from.min(chars), to.min(chars));
+    // A line wholly inside the selection is covered even when it is
+    // empty; one that only touches it at a point is not selected.
+    (from < to || index > start.line).then_some((from, to.max(from)))
+}
+
+/// Where a character boundary of a preview line sits horizontally.
+fn preview_x_at(
+    l: &Layout,
+    line: &MdLine,
+    page: &Page,
+    index: usize,
+    measure: &mut dyn crate::markdown::Measure,
+) -> f32 {
+    let origin = page.origin(line);
+    if index <= line.indent {
+        return origin + index as f32 * l.cell.advance;
+    }
+    let mut at = origin + line.indent as f32 * l.cell.advance;
+    let mut passed = line.indent;
+    for span in &line.spans {
+        let count = span.text.chars().count();
+        if index <= passed + count {
+            let taken: String = span.text.chars().take(index - passed).collect();
+            let run = crate::markdown::Span::plain(taken, span.style);
+            return at + run_cells(line, &run, measure) * l.cell.advance;
+        }
+        at += run_cells(line, span, measure) * l.cell.advance;
+        passed += count;
+    }
+    at
+}
+
 /// How wide one run is, in cells.
 ///
 /// A line that is set on the grid is drawn in the grid's own face, one
@@ -2557,6 +2733,7 @@ fn draw_preview(
     l: &Layout,
     lines: &[MdLine],
     scroll: f32,
+    sel: Option<(PreviewPos, PreviewPos)>,
     theme: &Theme,
 ) {
     use lithe_gpu::Size;
@@ -2578,10 +2755,15 @@ fn draw_preview(
     let mut y = l.text_y + top_margin - slip;
     let bottom = l.text_y + l.text_h;
 
+    // Ordered, because which end of a selection is the anchor depends
+    // on which way it was dragged and the drawing does not care.
+    let span = sel.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+
     for (drawn, line) in lines.iter().skip(top).enumerate() {
         if y >= bottom {
             break;
         }
+        let index = top + drawn;
         let height = line.rows() as f32 * l.cell.line_height;
         let scale = match line.scale {
             MdScale::Body => Size::Body,
@@ -2641,6 +2823,23 @@ fn draw_preview(
             ),
             // The frame draws itself, in characters.
             MdBlock::Table | MdBlock::Plain => {}
+        }
+
+        // Selected text, behind everything the line draws. Measured in
+        // its own scope because the measurer borrows the frame, which
+        // the rect that follows also needs.
+        if let Some((from, to)) = span.and_then(|(a, b)| selected_chars(line, index, a, b)) {
+            let (x0, x1) = {
+                let mut measure = Measured { frame: f };
+                (
+                    preview_x_at(l, line, &page, from, &mut measure),
+                    preview_x_at(l, line, &page, to, &mut measure),
+                )
+            };
+            // A blank line inside a selection still reads as selected,
+            // which a zero-width band would not.
+            let width = (x1 - x0).max(l.cell.advance * 0.4);
+            f.rect(x0, y, width, height, theme.selection);
         }
 
         // `copy` on the first row of a fenced block, so it is discoverable
@@ -3591,6 +3790,7 @@ mod tests {
             sidebar_cols: TREE_COLS,
             preview: None,
             preview_scroll: 0.0,
+            preview_sel: None,
             diff: None,
             diff_title: None,
             diff_scroll: 0.0,
@@ -4236,6 +4436,7 @@ mod tests {
             sidebar_cols: TREE_COLS,
             preview: None,
             preview_scroll: 0.0,
+            preview_sel: None,
             diff: None,
             diff_title: None,
             diff_scroll: 0.0,
@@ -4855,6 +5056,7 @@ mod tests {
             sidebar_cols: TREE_COLS,
             preview: None,
             preview_scroll: 0.0,
+            preview_sel: None,
             diff: None,
             diff_title: None,
             diff_scroll: 0.0,
@@ -5004,5 +5206,143 @@ mod tests {
         );
         // And not when it is scrolled past.
         assert!(preview_link_at(&l, &lines, at as f32 + 1.0, x, y, &mut measure).is_none());
+    }
+}
+
+#[cfg(test)]
+mod preview_selection_tests {
+    use super::*;
+    use crate::markdown::{Line as MdLine, Span as MdSpan, Style};
+
+    fn line(indent: usize, text: &str) -> MdLine {
+        MdLine {
+            spans: vec![MdSpan::plain(text, Style::Body)],
+            indent,
+            ..Default::default()
+        }
+    }
+
+    fn at(line: usize, char: usize) -> PreviewPos {
+        PreviewPos { line, char }
+    }
+
+    #[test]
+    fn a_selection_inside_one_line_covers_just_that_run() {
+        let l = line(0, "hello world");
+        assert_eq!(selected_chars(&l, 3, at(3, 2), at(3, 7)), Some((2, 7)));
+    }
+
+    #[test]
+    fn lines_outside_the_selection_are_not_covered() {
+        let l = line(0, "hello");
+        assert_eq!(selected_chars(&l, 1, at(2, 0), at(4, 3)), None);
+        assert_eq!(selected_chars(&l, 5, at(2, 0), at(4, 3)), None);
+    }
+
+    #[test]
+    fn a_middle_line_is_covered_end_to_end() {
+        // What makes a multi-line drag read as one block rather than
+        // three ragged ones.
+        let l = line(0, "hello");
+        assert_eq!(selected_chars(&l, 3, at(2, 4), at(4, 1)), Some((0, 5)));
+    }
+
+    #[test]
+    fn the_first_and_last_lines_are_cut_where_the_drag_is() {
+        let l = line(0, "hello world");
+        assert_eq!(selected_chars(&l, 2, at(2, 6), at(4, 1)), Some((6, 11)));
+        assert_eq!(selected_chars(&l, 4, at(2, 6), at(4, 3)), Some((0, 3)));
+    }
+
+    #[test]
+    fn a_caret_with_no_width_selects_nothing() {
+        let l = line(0, "hello");
+        assert_eq!(selected_chars(&l, 2, at(2, 3), at(2, 3)), None);
+    }
+
+    #[test]
+    fn a_blank_line_in_the_middle_is_still_covered() {
+        // Zero characters, but it is inside the selection, so it has
+        // to read as selected rather than as a hole in it.
+        let l = line(0, "");
+        assert_eq!(selected_chars(&l, 3, at(2, 0), at(4, 2)), Some((0, 0)));
+    }
+
+    #[test]
+    fn an_indent_counts_as_characters_of_the_line() {
+        // The indent is drawn, so a selection across the line has to
+        // cover it or the band starts in the wrong place.
+        let l = line(4, "item");
+        assert_eq!(l.len_chars(), 8);
+        assert_eq!(l.text(), "    item");
+        assert_eq!(selected_chars(&l, 3, at(2, 0), at(4, 0)), Some((0, 8)));
+    }
+
+    /// Where the renderer is available: that a point taken from where
+    /// a character is drawn comes back as that character. The two
+    /// walks are separate code, and a proportional face is exactly
+    /// where they could disagree.
+    #[test]
+    fn a_point_where_a_character_is_drawn_maps_back_to_it() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(&r, &ws, Chrome::default());
+        let lines = vec![
+            line(0, "a paragraph of proportional prose"),
+            line(4, "an indented one"),
+        ];
+        let mut measure = crate::Measured { renderer: &r };
+        let page = preview_page(&l, &mut measure);
+
+        let mut row_y = l.text_y + l.cell.line_height;
+        for (index, md) in lines.iter().enumerate() {
+            let y = row_y + l.cell.line_height / 2.0;
+            for want in 0..=md.len_chars() {
+                let x = preview_x_at(&l, md, &page, want, &mut measure);
+                // Half a cell in, so the point is inside the character
+                // rather than exactly on a boundary either side.
+                let inside = x + l.cell.advance * 0.1;
+                let got = preview_char_at(&l, &lines, 0.0, inside, y, &mut measure)
+                    .expect("inside the preview");
+                assert_eq!(got.line, index, "row {index}, character {want}");
+                assert_eq!(
+                    got.char, want,
+                    "row {index}: the point where character {want} starts came back as {}",
+                    got.char
+                );
+            }
+            row_y += md.rows() as f32 * l.cell.line_height;
+        }
+    }
+
+    #[test]
+    fn a_drag_below_the_last_line_lands_at_its_end() {
+        let Ok(r) = Renderer::offscreen(900, 400, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(&r, &ws, Chrome::default());
+        let lines = vec![line(0, "one"), line(0, "two")];
+        let mut measure = crate::Measured { renderer: &r };
+
+        let below = l.text_y + l.text_h - 1.0;
+        let got = preview_char_at(&l, &lines, 0.0, l.width / 2.0, below, &mut measure);
+        assert_eq!(
+            got,
+            Some(at(1, 3)),
+            "a drag off the bottom means to the end, not nowhere"
+        );
+    }
+
+    #[test]
+    fn a_drag_past_the_end_of_a_line_stops_at_it() {
+        let l = line(0, "hi");
+        assert_eq!(
+            selected_chars(&l, 2, at(2, 0), at(2, 99)),
+            Some((0, 2)),
+            "the selection cannot run past the characters there are"
+        );
     }
 }

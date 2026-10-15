@@ -217,6 +217,32 @@ impl Line {
         self.scale.rows()
     }
 
+    /// Everything on this line, as one string.
+    ///
+    /// The spans are a line broken up by style, so a selection that
+    /// covers part of one has to index into the whole rather than into
+    /// whichever run it happens to start in.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for _ in 0..self.indent {
+            out.push(' ');
+        }
+        for span in &self.spans {
+            out.push_str(&span.text);
+        }
+        out
+    }
+
+    /// How many characters [`Line::text`] has.
+    pub fn len_chars(&self) -> usize {
+        self.indent
+            + self
+                .spans
+                .iter()
+                .map(|s| s.text.chars().count())
+                .sum::<usize>()
+    }
+
     /// Whether this line is set on the grid rather than as prose.
     ///
     /// Code, a drawn diagram and a table all mean what they mean because
