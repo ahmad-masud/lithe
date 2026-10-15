@@ -121,7 +121,7 @@ itself prints there.
 | history | `cmd+Z`, `cmd+shift+Z` |
 | quit | `Esc` on a bare cursor |
 | menus | **right-click** the text, a tab or the file tree |
-| hover | tabs, tree rows, buttons and menu entries light up under the pointer |
+| hover | tabs, tree rows, buttons and settings light up under the pointer |
 
 ## Right-click
 

@@ -391,11 +391,8 @@ pub struct Scene<'a> {
     pub lsp_busy: Option<&'a str>,
     /// Whether autosave is on, for the status bar.
     pub autosave: bool,
-    /// What the pointer is over, what it just left, and how far the
-    /// highlight has faded between them.
+    /// What the pointer is over, so it can be highlighted.
     pub hovered: Option<Hit>,
-    pub hover_was: Option<Hit>,
-    pub hover_fade: f32,
     /// Projects offered on the landing page, newest first.
     pub recents: &'a [&'a Path],
     /// Highlight spans for the visible byte range, in paint order.
@@ -678,9 +675,11 @@ pub fn context_bounds(l: &Layout, menu: &ContextMenu) -> (f32, f32, f32, f32) {
 
 /// The hit, if it names something worth highlighting under the pointer.
 ///
-/// Discrete things only. The text and the scrollbar carry a position,
-/// so every pixel of movement would read as a different element and
-/// restart the fade without ever finishing it.
+/// Discrete things only. The text, the scrollbar and a diff row carry a
+/// position, so every pixel of movement over them would read as a
+/// different element and ask for a frame that would draw the same
+/// thing. Narrowing to what can actually light up is what keeps moving
+/// the pointer across a file free.
 pub fn hoverable(hit: Hit) -> Option<Hit> {
     matches!(
         hit,
@@ -700,22 +699,6 @@ pub fn hoverable(hit: Hit) -> Option<Hit> {
     .then_some(hit)
 }
 
-/// How strongly to tint `what`, given what the pointer is on and how
-/// far the fade has got.
-///
-/// The one leaving and the one arriving are both drawn, crossing over,
-/// so a pointer swept along a row of tabs leaves a trail that settles
-/// rather than a highlight that jumps.
-pub fn hover_alpha(scene: &Scene<'_>, what: Hit) -> f32 {
-    let into = scene.hovered == Some(what);
-    let outof = scene.hover_was == Some(what);
-    match (into, outof) {
-        (true, _) => scene.hover_fade,
-        (false, true) => 1.0 - scene.hover_fade,
-        _ => 0.0,
-    }
-}
-
 /// Paints the hover tint over a row or button, if it is the one under
 /// the pointer. Over whatever is already there, so a selected row and a
 /// bare one both read the same when hovered.
@@ -728,10 +711,8 @@ fn tint(
     w: f32,
     h: f32,
 ) {
-    let a = hover_alpha(scene, what);
-    if a > 0.0 {
-        let c = scene.theme.hover;
-        f.rect(x, y, w, h, c.alpha(c.0[3] * a));
+    if scene.hovered == Some(what) {
+        f.rect(x, y, w, h, scene.theme.hover);
     }
 }
 
@@ -3432,8 +3413,6 @@ mod tests {
             lsp_busy: None,
             autosave: false,
             hovered: None,
-            hover_was: None,
-            hover_fade: 1.0,
             prompt: None,
             caret_visible: true,
             recents: &[],
@@ -3997,8 +3976,6 @@ mod tests {
             lsp_busy: None,
             autosave: false,
             hovered: None,
-            hover_was: None,
-            hover_fade: 1.0,
             prompt: None,
             caret_visible: true,
             find: None,
@@ -4605,8 +4582,6 @@ mod tests {
             lsp_busy: None,
             autosave: false,
             hovered: None,
-            hover_was: None,
-            hover_fade: 1.0,
             prompt: None,
             caret_visible: true,
             recents: &[],
