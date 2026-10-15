@@ -598,15 +598,16 @@ impl Pane {
             Some(editor) => editor.doc.rope().to_string(),
             None => std::fs::read_to_string(path).unwrap_or_default(),
         };
-        let lines = lithe_vcs::unified(&committed, &current, 3);
-
         // The committed side is parsed once. It cannot change while
         // the diff is open, so a rebuild on every keystroke carries the
-        // existing tree across rather than making another.
-        let (old, old_syntax) = match self.ws.diff_mut() {
+        // existing tree across rather than making another. Which gaps
+        // have been expanded comes across with it, for the same reason
+        // and so a keystroke does not shut them.
+        let (old, old_syntax, revealed) = match self.ws.diff_mut() {
             Some(existing) if existing.path == path && existing.old.len_bytes() > 0 => (
                 std::mem::take(&mut existing.old),
                 existing.old_syntax.take(),
+                std::mem::take(&mut existing.revealed),
             ),
             _ => {
                 let doc = lithe_core::TextBuffer::from_text(&committed);
@@ -614,9 +615,10 @@ impl Pane {
                 if let Some(syntax) = syntax.as_mut() {
                     syntax.parse(&doc);
                 }
-                (doc, syntax)
+                (doc, syntax, Vec::new())
             }
         };
+        let lines = lithe_vcs::unified_revealing(&committed, &current, 3, &revealed);
 
         self.ws.show_diff(
             path,
@@ -629,10 +631,35 @@ impl Pane {
                 title,
                 path: path.to_path_buf(),
                 lines,
+                revealed,
                 revision,
                 scroll,
             },
         );
+    }
+
+    /// Puts the caret where a click on an editable diff's new side
+    /// landed.
+    ///
+    /// The mapping is the line number the row carries: the new column
+    /// *is* the buffer, so a click there is a click in the buffer and
+    /// the row only says which line of it.
+    fn place_diff_caret(&mut self, row: usize, column: usize) {
+        let side_by_side = self.preview_defaults.side_by_side_diff;
+        let line = self
+            .ws
+            .diff()
+            .and_then(|diff| row_line(diff, row, side_by_side));
+        let Some(line) = line else { return };
+        let Some(editor) = self.ws.active_mut() else {
+            return;
+        };
+        // Diff line numbers are 1-based; buffer lines are not.
+        let line = line.saturating_sub(1).min(editor.doc.len_lines() - 1);
+        let start = editor.doc.line_to_char(line);
+        let at = (start + column).min(start + editor.doc.line_len_chars(line));
+        editor.sel.collapse_to(Cursor::at(at));
+        self.last_text_click = None;
     }
 
     /// Rebuilds the diff when the file it shows has been edited here.
@@ -2849,6 +2876,8 @@ impl App {
             CtxAction::DiscardFile => self.discard_path(target),
             CtxAction::RevertHunk => self.revert_hunk(row),
             CtxAction::CopyDiffLine => self.copy_diff_line(row),
+            CtxAction::ExpandUnchanged => self.reveal_gap(row),
+            CtxAction::CollapseUnchanged => self.collapse_gap(row),
             CtxAction::RevealInFinder => self.reveal(target),
             CtxAction::OpenInDefaultApp => self.open_in_default_app(target),
             CtxAction::OpenInTerminal => {
@@ -3412,10 +3441,14 @@ impl App {
                     return;
                 };
                 let (left, right) = row_sides(diff, row, side_by_side);
-                let revertible = left
-                    .or(right)
-                    .is_some_and(|i| lithe_vcs::revert_at(&diff.lines, i).is_some());
-                ContextMenu::for_diff(at, path, row, revertible)
+                let index = left.or(right);
+                let on = context::DiffRow {
+                    revertible: index
+                        .is_some_and(|i| lithe_vcs::revert_at(&diff.lines, i).is_some()),
+                    elided: index.is_some_and(|i| lithe_vcs::elided_at(&diff.lines, i).is_some()),
+                    expanded: index.is_some_and(|i| revealed_at(diff, i).is_some()),
+                };
+                ContextMenu::for_diff(at, path, row, on)
             }
             // Empty space in the sidebar acts on the project root.
             Hit::Elsewhere if x < l.tree_w && pane.tree.is_some() => {
@@ -3473,6 +3506,62 @@ impl App {
         pane.status = Some("reverted the change".into());
         pane.git_stale = true;
         pane.hunks_for = None;
+    }
+
+    /// Shows the unchanged lines an elision marker stands in for.
+    ///
+    /// The whole run, not a window onto it: the marker says how many
+    /// lines it is hiding, so expanding it gives you what it said. The
+    /// rows below move down and the rows above do not, so the scroll
+    /// position still points at the same place.
+    fn reveal_gap(&mut self, row: Option<usize>) {
+        let Some(row) = row else { return };
+        let Some(pane) = self.pane_mut() else { return };
+        let side_by_side = pane.preview_defaults.side_by_side_diff;
+
+        let found = pane.ws.diff().and_then(|diff| {
+            let (left, right) = row_sides(diff, row, side_by_side);
+            let range = lithe_vcs::elided_at(&diff.lines, left.or(right)?)?;
+            Some((diff.path.clone(), diff.scroll, range))
+        });
+        let Some((path, scroll, range)) = found else {
+            return;
+        };
+        if let Some(diff) = pane.ws.diff_mut() {
+            diff.revealed.push(range);
+        }
+        self.rebuild_diff(&path, scroll);
+    }
+
+    /// Elides an expanded run again.
+    fn collapse_gap(&mut self, row: Option<usize>) {
+        let Some(row) = row else { return };
+        let Some(pane) = self.pane_mut() else { return };
+        let side_by_side = pane.preview_defaults.side_by_side_diff;
+
+        let found = pane.ws.diff().and_then(|diff| {
+            let (left, right) = row_sides(diff, row, side_by_side);
+            let which = revealed_at(diff, left.or(right)?)?;
+            Some((diff.path.clone(), diff.scroll, which))
+        });
+        let Some((path, scroll, which)) = found else {
+            return;
+        };
+        if let Some(diff) = pane.ws.diff_mut() {
+            diff.revealed.remove(which);
+        }
+        self.rebuild_diff(&path, scroll);
+    }
+
+    /// Rebuilds the open diff in place.
+    ///
+    /// `build_diff` lives on the pane and needs the repository, which
+    /// is where the pane keeps it, so this is the one-line hop from an
+    /// action on the app to a rebuild on the pane.
+    fn rebuild_diff(&mut self, path: &Path, scroll: f32) {
+        if let Some(pane) = self.pane_mut() {
+            pane.build_diff(path, scroll);
+        }
     }
 
     /// Copies the text of one diff row.
@@ -4365,6 +4454,7 @@ impl App {
         let mut status_click = None;
         let mut setting_click = None;
         let mut context_choice = None;
+        let mut reveal_row = None;
         let Some(id) = self.focused else { return };
         let Some(pane) = self.panes.get_mut(&id) else {
             return;
@@ -4446,27 +4536,17 @@ impl App {
             }
             // A click on the new side of an editable diff places the
             // caret in the buffer, at the line that row shows.
-            // The committed column takes no caret, so a left click on
-            // it does nothing. It is a hit so that a right click can
-            // name the change it is over.
-            Hit::DiffRow(_) => {}
-            Hit::DiffText { row, column } => {
-                let side_by_side = pane.preview_defaults.side_by_side_diff;
-                let line = pane
-                    .ws
-                    .diff()
-                    .and_then(|diff| row_line(diff, row, side_by_side));
-                let Some(line) = line else { return };
-                let Some(editor) = pane.ws.active_mut() else {
-                    return;
-                };
-                // Diff line numbers are 1-based; buffer lines are not.
-                let line = line.saturating_sub(1).min(editor.doc.len_lines() - 1);
-                let start = editor.doc.line_to_char(line);
-                let at = (start + column).min(start + editor.doc.line_len_chars(line));
-                editor.sel.collapse_to(Cursor::at(at));
-                pane.last_text_click = None;
-            }
+            // The committed column takes no caret, so the only thing a
+            // click on it can mean is the one thing a row there can
+            // offer.
+            Hit::DiffRow(row) => reveal_row = marker_row(pane, row),
+            // A marker is not a line of the file, so clicking one asks
+            // for the lines it is hiding rather than putting the caret
+            // somewhere there is nothing to type.
+            Hit::DiffText { row, column } => match marker_row(pane, row) {
+                Some(row) => reveal_row = Some(row),
+                None => pane.place_diff_caret(row, column),
+            },
             Hit::Text => {
                 // Count the click before the editor is borrowed.
                 const MULTI: std::time::Duration = std::time::Duration::from_millis(400);
@@ -4615,6 +4695,9 @@ impl App {
                         // no single document to colour it against.
                         old: lithe_core::TextBuffer::new(),
                         old_syntax: None,
+                        // A commit's diff is rebuilt from nothing, so
+                        // there is nowhere for an expanded gap to go.
+                        revealed: Vec::new(),
                         path: PathBuf::new(),
                         title: format!("{short}  {summary}"),
                         lines,
@@ -4666,6 +4749,9 @@ impl App {
         }
         if let Some((action, target, row)) = context_choice {
             self.run_context(action, target, row);
+        }
+        if reveal_row.is_some() {
+            self.reveal_gap(reveal_row);
         }
         if let Some(setting) = setting_click {
             setting.toggle(&mut self.settings);
@@ -5563,6 +5649,27 @@ fn revert_edit(
     (start..end, text)
 }
 
+/// The row, if the diff row under it is an elision marker.
+///
+/// Both halves of a split row are the same marker, so which column was
+/// clicked does not matter.
+fn marker_row(pane: &Pane, row: usize) -> Option<usize> {
+    let side_by_side = pane.preview_defaults.side_by_side_diff;
+    let diff = pane.ws.diff()?;
+    let (left, right) = row_sides(diff, row, side_by_side);
+    lithe_vcs::elided_at(&diff.lines, left.or(right)?).map(|_| row)
+}
+
+/// Which expanded gap a diff row came from, if it came from one.
+///
+/// A row that is only there because a marker was expanded can be put
+/// back, and this is how it is recognised: its committed line number
+/// falls inside one of the runs that were asked for.
+fn revealed_at(view: &workspace::Diff, index: usize) -> Option<usize> {
+    let old = view.lines.get(index)?.old?.checked_sub(1)?;
+    view.revealed.iter().position(|range| range.contains(&old))
+}
+
 /// Which lines of the diff a row shows, as indices into `lines`: the
 /// committed side and the working side.
 ///
@@ -6097,7 +6204,10 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
     // A diff of the active file, for eyeballing the view.
     // Through the workspace, as the real pane does, so the snapshot
     // shows the tab a diff opens in rather than a diff with no tab.
-    if matches!(overlay, Some("diff") | Some("split") | Some("diff-menu")) {
+    if matches!(
+        overlay,
+        Some("diff") | Some("split") | Some("diff-menu") | Some("gap-menu") | Some("expanded")
+    ) {
         if let (Some(repo), Some(path)) = (repo.as_ref(), ws.active().and_then(|e| e.path.clone()))
         {
             let committed = repo.committed(&path).unwrap_or_default();
@@ -6117,7 +6227,21 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
                 old_syntax,
                 title: repo.relative(&path).unwrap_or_default(),
                 path: path.clone(),
-                lines: lithe_vcs::unified(&committed, &current, 3),
+                revealed: Vec::new(),
+                lines: {
+                    let plain = lithe_vcs::unified(&committed, &current, 3);
+                    // `--overlay expanded` opens every gap, which is
+                    // what clicking each marker in turn does.
+                    match overlay == Some("expanded") {
+                        false => plain,
+                        true => {
+                            let open: Vec<_> = (0..plain.len())
+                                .filter_map(|i| lithe_vcs::elided_at(&plain, i))
+                                .collect();
+                            lithe_vcs::unified_revealing(&committed, &current, 3, &open)
+                        }
+                    }
+                },
                 revision: 0,
                 scroll: 0.0,
             };
@@ -6208,12 +6332,25 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
             Some(false),
             context::GoesTo::ALL,
         )),
-        Some("diff-menu") => Some(ContextMenu::for_diff(
-            (420.0, 300.0),
-            ws.active().and_then(|e| e.path.clone()).unwrap_or_default(),
-            5,
-            true,
-        )),
+        // Described from the real diff, at the row the menu sits on,
+        // so the overlay shows the entries that row actually offers.
+        Some("diff-menu") | Some("gap-menu") => {
+            let row = if overlay == Some("gap-menu") { 2 } else { 5 };
+            let diff = ws.diff().expect("the overlay builds one above");
+            let (left, right) = row_sides(diff, row, true);
+            let index = left.or(right);
+            Some(ContextMenu::for_diff(
+                (420.0, 300.0),
+                ws.active().and_then(|e| e.path.clone()).unwrap_or_default(),
+                row,
+                context::DiffRow {
+                    revertible: index
+                        .is_some_and(|i| lithe_vcs::revert_at(&diff.lines, i).is_some()),
+                    elided: index.is_some_and(|i| lithe_vcs::elided_at(&diff.lines, i).is_some()),
+                    expanded: false,
+                },
+            ))
+        }
         Some("explorer-menu") => Some(ContextMenu::for_explorer(
             (120.0, 260.0),
             tree.as_ref()
@@ -6277,7 +6414,10 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         diff: ws.diff().map(|d| d.lines.as_slice()),
         diff_title: ws.diff().map(|d| d.title.as_str()),
         diff_scroll: 0.0,
-        diff_side_by_side: matches!(overlay, Some("split") | Some("diff-menu")),
+        diff_side_by_side: matches!(
+            overlay,
+            Some("split") | Some("diff-menu") | Some("gap-menu") | Some("expanded")
+        ),
         // Both overlays build a diff of the active working file, which
         // is the editable kind. History's read-only diff is a different
         // thing and is not what either one shows.
@@ -6676,6 +6816,7 @@ mod diff_tests {
             editor: Some(editor::Editor::new(lithe_core::TextBuffer::new(), None, 4)),
             old: lithe_core::TextBuffer::new(),
             old_syntax: None,
+            revealed: Vec::new(),
             path: PathBuf::from("a.rs"),
             title: "a.rs".into(),
             lines,
@@ -6771,6 +6912,7 @@ mod diff_tests {
             editor: None,
             old: lithe_core::TextBuffer::new(),
             old_syntax: None,
+            revealed: Vec::new(),
             path: PathBuf::new(),
             title: "abc123  a commit".into(),
             lines: Vec::new(),
@@ -7070,5 +7212,100 @@ mod revert_edit_tests {
             out, "one\ntwo\nthree\nFOUR\n",
             "the first change goes back and the second is left alone"
         );
+    }
+}
+
+#[cfg(test)]
+mod reveal_row_tests {
+    use super::{revealed_at, row_sides, workspace};
+    use lithe_vcs::LineKind;
+
+    fn diff(revealed: Vec<std::ops::Range<usize>>) -> workspace::Diff {
+        let before: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        let after = before.replace("line 1\n", "LINE 1\n");
+        workspace::Diff {
+            editor: None,
+            old: lithe_core::TextBuffer::from_text(&before),
+            old_syntax: None,
+            revealed: revealed.clone(),
+            title: "a.rs".into(),
+            path: std::path::PathBuf::from("a.rs"),
+            lines: lithe_vcs::unified_revealing(&before, &after, 2, &revealed),
+            revision: 0,
+            scroll: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_row_that_is_only_there_because_a_gap_was_opened_is_recognised() {
+        let shut = diff(Vec::new());
+        let gap = shut
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Skipped)
+            .expect("a gap");
+        let range = lithe_vcs::elided_at(&shut.lines, gap).expect("a marker");
+
+        let open = diff(vec![range.clone()]);
+        let inside: Vec<usize> = open
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.old.is_some_and(|old| range.contains(&(old - 1))))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!inside.is_empty(), "the gap opened to something");
+        for i in inside {
+            assert_eq!(
+                revealed_at(&open, i),
+                Some(0),
+                "row {i} came from the run that was asked for"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_context_row_came_from_no_gap() {
+        // Two runs, so the answer has to be which one rather than
+        // merely whether.
+        let open = diff(vec![10..20, 30..40]);
+        // The context either side of the change is there whether or
+        // not anything was expanded, so collapsing must not offer to
+        // take it away.
+        let near_change = open
+            .lines
+            .iter()
+            .position(|l| l.old == Some(1))
+            .expect("the line before the change");
+        assert_eq!(revealed_at(&open, near_change), None);
+
+        let in_second = open
+            .lines
+            .iter()
+            .position(|l| l.old == Some(35))
+            .expect("a line from the second run");
+        assert_eq!(revealed_at(&open, in_second), Some(1));
+    }
+
+    #[test]
+    fn both_halves_of_a_split_row_point_at_the_same_line() {
+        let shut = diff(Vec::new());
+        let pairs = lithe_vcs::pair_columns(&shut.lines);
+        for row in 0..pairs.len() {
+            let (left, right) = row_sides(&shut, row, true);
+            if let (Some(left), Some(right)) = (left, right) {
+                let kind = shut.lines[left].kind;
+                if kind == LineKind::Context || kind == LineKind::Skipped {
+                    assert_eq!(left, right, "an unchanged row is one line, shown twice");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_unified_row_is_its_own_index_and_past_the_end_is_nothing() {
+        let shut = diff(Vec::new());
+        assert_eq!(row_sides(&shut, 3, false), (Some(3), Some(3)));
+        assert_eq!(row_sides(&shut, shut.lines.len(), false), (None, None));
     }
 }

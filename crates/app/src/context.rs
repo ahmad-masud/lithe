@@ -33,6 +33,10 @@ pub enum Action {
     RevertHunk,
     /// Copy the text of the diff row the menu was opened on.
     CopyDiffLine,
+    /// Show the unchanged lines an elision marker stands in for.
+    ExpandUnchanged,
+    /// Elide them again.
+    CollapseUnchanged,
     OpenChange,
     ShowDiff,
     CopyPath,
@@ -180,6 +184,17 @@ pub struct State {
 }
 
 /// An open right-click menu.
+/// What the diff row under the pointer offers.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DiffRow {
+    /// It is part of a change, so there is something to put back.
+    pub revertible: bool,
+    /// It is an elision marker, standing in for lines not shown.
+    pub elided: bool,
+    /// It is one of the lines a marker was expanded to show.
+    pub expanded: bool,
+}
+
 pub struct ContextMenu {
     pub entries: Vec<Entry>,
     /// Top-left corner, in physical pixels.
@@ -246,11 +261,24 @@ impl ContextMenu {
     /// the undo history: a change put back by mistake is one `cmd+Z`
     /// away. That is also why it needs no confirmation, unlike
     /// discarding the whole file, which does not.
-    pub fn for_diff(at: (f32, f32), target: PathBuf, row: usize, revertible: bool) -> Self {
+    pub fn for_diff(at: (f32, f32), target: PathBuf, row: usize, on: DiffRow) -> Self {
         let mut entries = Vec::new();
-        if revertible {
+        if on.revertible {
             entries.extend([
                 Entry::item("Revert This Change", "", Action::RevertHunk),
+                Entry::separator(),
+            ]);
+        }
+        // Only one of these can apply: a row is either standing in for
+        // lines that are not shown or one of the lines that is.
+        if on.elided {
+            entries.extend([
+                Entry::item("Expand Unchanged Lines", "", Action::ExpandUnchanged),
+                Entry::separator(),
+            ]);
+        } else if on.expanded {
+            entries.extend([
+                Entry::item("Collapse Unchanged Lines", "", Action::CollapseUnchanged),
                 Entry::separator(),
             ]);
         }
@@ -775,7 +803,15 @@ mod diff_menu_tests {
     use std::path::Path;
 
     fn menu(revertible: bool) -> ContextMenu {
-        ContextMenu::for_diff((0.0, 0.0), PathBuf::from("/w/a.rs"), 4, revertible)
+        ContextMenu::for_diff(
+            (0.0, 0.0),
+            PathBuf::from("/w/a.rs"),
+            4,
+            DiffRow {
+                revertible,
+                ..Default::default()
+            },
+        )
     }
 
     fn actions(menu: &ContextMenu) -> Vec<Action> {
@@ -819,13 +855,64 @@ mod diff_menu_tests {
     }
 
     #[test]
+    fn a_marker_offers_to_expand_and_a_shown_line_to_collapse() {
+        let on = |row: DiffRow| ContextMenu::for_diff((0.0, 0.0), PathBuf::from("/w/a.rs"), 2, row);
+        let elided = actions(&on(DiffRow {
+            elided: true,
+            ..Default::default()
+        }));
+        assert!(elided.contains(&Action::ExpandUnchanged));
+        assert!(!elided.contains(&Action::CollapseUnchanged));
+
+        let expanded = actions(&on(DiffRow {
+            expanded: true,
+            ..Default::default()
+        }));
+        assert!(expanded.contains(&Action::CollapseUnchanged));
+        assert!(!expanded.contains(&Action::ExpandUnchanged));
+
+        // A row that is neither offers neither: an ordinary context
+        // line inside a gap that was never expanded.
+        let plain = actions(&on(DiffRow::default()));
+        assert!(!plain.contains(&Action::ExpandUnchanged));
+        assert!(!plain.contains(&Action::CollapseUnchanged));
+    }
+
+    #[test]
+    fn a_marker_is_not_a_change_so_it_offers_no_revert() {
+        // The two are independent: a marker stands in for unchanged
+        // lines, so it can be expanded and cannot be reverted.
+        let menu = ContextMenu::for_diff(
+            (0.0, 0.0),
+            PathBuf::from("/w/a.rs"),
+            2,
+            DiffRow {
+                elided: true,
+                ..Default::default()
+            },
+        );
+        assert!(!actions(&menu).contains(&Action::RevertHunk));
+    }
+
+    #[test]
     fn the_menu_never_opens_on_a_separator() {
         for revertible in [true, false] {
-            let menu = menu(revertible);
-            assert!(
-                !menu.entries[menu.selected].is_separator(),
-                "revertible={revertible}"
-            );
+            for (elided, expanded) in [(false, false), (true, false), (false, true)] {
+                let menu = ContextMenu::for_diff(
+                    (0.0, 0.0),
+                    PathBuf::from("/w/a.rs"),
+                    2,
+                    DiffRow {
+                        revertible,
+                        elided,
+                        expanded,
+                    },
+                );
+                assert!(
+                    !menu.entries[menu.selected].is_separator(),
+                    "revertible={revertible} elided={elided} expanded={expanded}"
+                );
+            }
         }
     }
 }

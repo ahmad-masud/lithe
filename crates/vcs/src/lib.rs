@@ -185,6 +185,51 @@ pub struct DiffLine {
 /// apart than twice the context are separated by a [`LineKind::Skipped`]
 /// marker rather than joined.
 pub fn unified(before: &str, after: &str, context: usize) -> Vec<DiffLine> {
+    unified_revealing(before, after, context, &[])
+}
+
+/// The committed lines an elision marker stands in for: 0-based,
+/// end-exclusive.
+///
+/// Read off the marker's neighbours rather than stored on it, because
+/// the list already says it — the last real line before the gap and the
+/// first after it are exactly its edges. A marker with nothing after it
+/// runs to the end of the committed file, which this list does not know
+/// the length of, so it saturates and the caller clamps.
+///
+/// `None` for a row that is not a marker.
+pub fn elided_at(lines: &[DiffLine], index: usize) -> Option<Range<usize>> {
+    if lines.get(index)?.kind != LineKind::Skipped {
+        return None;
+    }
+    // 1-based line numbers: the line before the gap is the last one
+    // still shown, so the gap starts just after it.
+    let from = lines[..index]
+        .iter()
+        .rev()
+        .find_map(|line| line.old)
+        .unwrap_or(0);
+    let to = lines[index + 1..]
+        .iter()
+        .find_map(|line| line.old)
+        .map(|line| line.saturating_sub(1))
+        .unwrap_or(usize::MAX);
+    (from < to).then_some(from..to)
+}
+
+/// As [`unified`], but showing the committed lines in `revealed` rather
+/// than eliding them.
+///
+/// The ranges are in committed line numbers, 0-based and end-exclusive,
+/// because those are the stable name for a run of unchanged text: typing
+/// above a gap moves its working line numbers and leaves these alone, so
+/// a gap stays expanded across the rebuild that every keystroke causes.
+pub fn unified_revealing(
+    before: &str,
+    after: &str,
+    context: usize,
+    revealed: &[Range<usize>],
+) -> Vec<DiffLine> {
     let old_lines: Vec<&str> = before.lines().collect();
     let new_lines: Vec<&str> = after.lines().collect();
 
@@ -206,14 +251,14 @@ pub fn unified(before: &str, after: &str, context: usize) -> Vec<DiffLine> {
 
         // Elide the unchanged run before this hunk when it is long.
         if lead > new_at {
-            out.push(DiffLine {
-                kind: LineKind::Skipped,
-                old: None,
-                new: None,
-                text: format!("… {} unchanged lines", lead - new_at),
-            });
-            old_at += lead - new_at;
-            new_at = lead;
+            emit_gap(
+                &mut out,
+                &new_lines,
+                &mut old_at,
+                &mut new_at,
+                lead,
+                revealed,
+            );
         }
         while new_at < change_new {
             out.push(DiffLine {
@@ -275,14 +320,67 @@ pub fn unified(before: &str, after: &str, context: usize) -> Vec<DiffLine> {
         new_at += 1;
     }
     if new_at < new_lines.len() {
-        out.push(DiffLine {
-            kind: LineKind::Skipped,
-            old: None,
-            new: None,
-            text: format!("… {} unchanged lines", new_lines.len() - new_at),
-        });
+        let end = new_lines.len();
+        emit_gap(
+            &mut out,
+            &new_lines,
+            &mut old_at,
+            &mut new_at,
+            end,
+            revealed,
+        );
     }
     out
+}
+
+/// Emits the unchanged run from where we are up to `until`: as context
+/// lines where the committed side has been revealed, and as one marker
+/// per stretch that has not.
+///
+/// A gap can be part revealed and part not — expanding one of two
+/// adjacent gaps leaves the other alone — so this walks the run and
+/// changes form wherever the answer changes rather than deciding once.
+fn emit_gap(
+    out: &mut Vec<DiffLine>,
+    new_lines: &[&str],
+    old_at: &mut usize,
+    new_at: &mut usize,
+    until: usize,
+    revealed: &[Range<usize>],
+) {
+    let shown = |old: usize| revealed.iter().any(|range| range.contains(&old));
+    while *new_at < until {
+        let here = shown(*old_at);
+        let mut run = 1;
+        while *new_at + run < until && shown(*old_at + run) == here {
+            run += 1;
+        }
+        if here {
+            for _ in 0..run {
+                out.push(DiffLine {
+                    kind: LineKind::Context,
+                    old: Some(*old_at + 1),
+                    new: Some(*new_at + 1),
+                    text: new_lines
+                        .get(*new_at)
+                        .copied()
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+                *old_at += 1;
+                *new_at += 1;
+            }
+        } else {
+            out.push(DiffLine {
+                kind: LineKind::Skipped,
+                old: None,
+                new: None,
+                text: format!("… {run} unchanged lines"),
+            });
+            *old_at += run;
+            *new_at += run;
+        }
+    }
 }
 
 /// One change in a diff, expressed as the edit that puts the committed
@@ -1465,5 +1563,185 @@ mod revert_tests {
         let lines = unified("a\nb\n", "a\nb\n", 1);
         assert!(lines.is_empty(), "no diff at all, so no row to revert");
         assert!(revert_at(&lines, 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+
+    /// A file long enough that the run between its two changes is
+    /// elided, and with a tail long enough to be elided as well — so
+    /// there is both a gap with lines either side of it and a gap that
+    /// runs off the end.
+    fn pair() -> (String, String) {
+        let before: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        let after = before
+            .replace("line 1\n", "LINE 1\n")
+            .replace("line 50\n", "LINE 50\n");
+        (before, after)
+    }
+
+    fn markers(lines: &[DiffLine]) -> Vec<usize> {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.kind == LineKind::Skipped)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn context_rows(lines: &[DiffLine]) -> usize {
+        lines.iter().filter(|l| l.kind == LineKind::Context).count()
+    }
+
+    /// The gap between the two changes, and the one that runs off the
+    /// end — named rather than indexed, because which is which is the
+    /// thing most of these tests turn on.
+    fn gaps(lines: &[DiffLine]) -> (usize, usize) {
+        let found = markers(lines);
+        assert_eq!(found.len(), 2, "one gap in the middle, one at the end");
+        (found[0], found[1])
+    }
+
+    #[test]
+    fn a_marker_names_the_committed_lines_it_stands_for() {
+        let (before, after) = pair();
+        let lines = unified(&before, &after, 2);
+        let (middle, _) = gaps(&lines);
+        let range = elided_at(&lines, middle).expect("a marker has a range");
+
+        let prev = lines[..middle]
+            .iter()
+            .rev()
+            .find_map(|l| l.old)
+            .expect("a line before the gap");
+        let next = lines[middle + 1..]
+            .iter()
+            .find_map(|l| l.old)
+            .expect("a line after the gap");
+        assert_eq!(range, prev..next - 1, "the gap is exactly what is missing");
+        assert!(
+            lines[middle].text.contains(&range.len().to_string()),
+            "and the marker says so: {:?} for {range:?}",
+            lines[middle].text
+        );
+    }
+
+    #[test]
+    fn a_marker_with_nothing_after_it_runs_to_the_end_of_the_file() {
+        let (before, after) = pair();
+        let lines = unified(&before, &after, 2);
+        let (_, tail) = gaps(&lines);
+        let range = elided_at(&lines, tail).expect("a marker has a range");
+        assert_eq!(
+            range.end,
+            usize::MAX,
+            "the list does not know how long the file is, so it saturates"
+        );
+    }
+
+    #[test]
+    fn a_context_row_has_no_range_to_expand() {
+        let (before, after) = pair();
+        let lines = unified(&before, &after, 2);
+        for (i, line) in lines.iter().enumerate() {
+            if line.kind != LineKind::Skipped {
+                assert!(elided_at(&lines, i).is_none(), "row {i} is not a marker");
+            }
+        }
+        assert!(elided_at(&lines, lines.len()).is_none(), "past the end");
+    }
+
+    #[test]
+    fn revealing_a_gap_shows_exactly_those_lines() {
+        let (before, after) = pair();
+        let lines = unified(&before, &after, 2);
+        let (middle, _) = gaps(&lines);
+        let range = elided_at(&lines, middle).expect("a marker");
+
+        let opened = unified_revealing(&before, &after, 2, std::slice::from_ref(&range));
+        assert_eq!(
+            context_rows(&opened) - context_rows(&lines),
+            range.len(),
+            "every line the marker counted is now a row"
+        );
+        assert_eq!(
+            markers(&opened).len(),
+            1,
+            "that marker is gone and the one at the end is not"
+        );
+    }
+
+    #[test]
+    fn revealing_the_tail_leaves_the_middle_elided() {
+        let (before, after) = pair();
+        let lines = unified(&before, &after, 2);
+        let (_, tail) = gaps(&lines);
+        let range = elided_at(&lines, tail).expect("a marker");
+
+        let opened = unified_revealing(&before, &after, 2, &[range]);
+        assert_eq!(
+            markers(&opened).len(),
+            1,
+            "expanding one gap must not expand another"
+        );
+        assert!(
+            opened.last().is_some_and(|l| l.kind == LineKind::Context),
+            "the file now runs to its end"
+        );
+    }
+
+    #[test]
+    fn revealing_part_of_a_gap_splits_it() {
+        let (before, after) = pair();
+        let lines = unified(&before, &after, 2);
+        let (middle, _) = gaps(&lines);
+        let range = elided_at(&lines, middle).expect("a marker");
+        let half = range.start..range.start + range.len() / 2;
+
+        let opened = unified_revealing(&before, &after, 2, std::slice::from_ref(&half));
+        assert_eq!(
+            markers(&opened).len(),
+            2,
+            "the unrevealed half is still a gap, and so is the tail"
+        );
+        let revealed: Vec<usize> = opened
+            .iter()
+            .filter_map(|l| (l.kind == LineKind::Context).then_some(l.old? - 1))
+            .filter(|old| half.contains(old))
+            .collect();
+        assert_eq!(
+            revealed.len(),
+            half.len(),
+            "and the revealed half is all there"
+        );
+    }
+
+    #[test]
+    fn a_saturating_range_reveals_what_there_is_and_stops() {
+        let (before, after) = pair();
+        let opened = unified_revealing(&before, &after, 2, std::slice::from_ref(&(0..usize::MAX)));
+        assert!(
+            markers(&opened).is_empty(),
+            "nothing is left to elide once everything is revealed"
+        );
+        assert_eq!(
+            context_rows(&opened),
+            58,
+            "every line but the two that changed"
+        );
+    }
+
+    #[test]
+    fn revealing_nothing_is_the_plain_diff() {
+        let (before, after) = pair();
+        let plain = unified(&before, &after, 2);
+        let same = unified_revealing(&before, &after, 2, &[]);
+        assert_eq!(plain.len(), same.len());
+        assert!(plain
+            .iter()
+            .zip(&same)
+            .all(|(a, b)| a.kind == b.kind && a.old == b.old && a.new == b.new));
     }
 }

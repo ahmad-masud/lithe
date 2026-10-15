@@ -49,6 +49,14 @@ pub struct Diff {
     /// The working file, empty for a commit.
     pub path: PathBuf,
     pub lines: Vec<lithe_vcs::DiffLine>,
+    /// Runs of unchanged committed lines to show rather than elide,
+    /// 0-based and end-exclusive.
+    ///
+    /// In committed line numbers because those are the stable name for
+    /// a run of unchanged text: typing above a gap moves its working
+    /// line numbers and leaves these alone, so an expanded gap stays
+    /// expanded across the rebuild every keystroke causes.
+    pub revealed: Vec<std::ops::Range<usize>>,
     /// Buffer revision it was built from, so it is only rebuilt when it
     /// would differ.
     pub revision: u64,
@@ -502,6 +510,7 @@ mod tests {
             editor: None,
             old: lithe_core::TextBuffer::new(),
             old_syntax: None,
+            revealed: Vec::new(),
             title: path.to_string(),
             path: PathBuf::from(path),
             lines: Vec::new(),

@@ -303,6 +303,31 @@ putting lines back at the end of a file that does not end in a newline
 has to supply one or the first of them is glued to the line already
 there.
 
+An elided run can be opened. Clicking the "… N unchanged lines" marker
+shows exactly those lines, and the right-click menu offers the same
+thing and the way back. The whole run, not a window onto it: the marker
+says how many lines it is standing in for, so expanding it gives you
+what it said. The rows below move down and the rows above do not, so
+the scroll position still points at the same place and no adjustment is
+needed.
+
+Nothing is stored on the marker to make this work. A gap's edges are
+the last real line before it and the first after it, so `elided_at`
+reads the range off the list the diff is already drawn from — which
+keeps `DiffLine` the size it was, and keeps a field that is meaningful
+on one row in a thousand from existing on all of them. A marker with
+nothing after it saturates, because the list does not know how long the
+file is, and `unified_revealing` clamps.
+
+Which runs are open is kept in committed line numbers, because those
+are the stable name for unchanged text: typing above a gap moves its
+working line numbers and leaves these alone, so an expanded gap
+survives the rebuild that every keystroke causes. It travels across
+that rebuild beside the committed document and its tree, for the same
+reason they do. A gap can also be part open — `emit_gap` walks the run
+and changes form wherever the answer changes, rather than deciding once
+per gap.
+
 Hit-testing a diff learned the committed column at the same time, and
 the two bools that described a diff — whether one is open, and whether
 it is editable — became one `Option<DiffKind>`. They only ever made
