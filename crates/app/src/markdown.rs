@@ -86,6 +86,16 @@ pub trait Measure {
     /// `scale` is the line's, because a heading is drawn larger than the
     /// run inside it says on its own.
     fn width(&mut self, text: &str, style: Style, scale: Scale) -> f32;
+
+    /// How tall a grid row is relative to a cell's width.
+    ///
+    /// A figure is laid out in cells and drawn as shapes, so it needs
+    /// to know the shape of a cell or a circle comes out oval. Two is
+    /// about right for a monospace face and is what the grid assumes
+    /// when there is no window to ask.
+    fn aspect(&mut self) -> f32 {
+        2.0
+    }
 }
 
 /// A measure for a grid: one cell per character, whatever the style.
@@ -194,6 +204,13 @@ pub struct Line {
     /// Glyph size, and so the row height. Only headings are ever anything
     /// but [`Scale::Body`].
     pub scale: Scale,
+    /// A drawn figure this line stands for.
+    ///
+    /// A figure is one line of the preview however many rows it takes:
+    /// it has no text to wrap, so breaking it into rows would only
+    /// mean reassembling it to draw it. [`Line::rows`] reports its
+    /// height, which is what scrolling and hit-testing count.
+    pub figure: Option<Arc<crate::mermaid::Diagram>>,
     /// The verbatim source of the fenced block this row belongs to.
     ///
     /// Carried on every row of the block rather than only its first, so
@@ -214,7 +231,10 @@ impl Line {
 
     /// Grid rows this line occupies.
     pub fn rows(&self) -> usize {
-        self.scale.rows()
+        match &self.figure {
+            Some(figure) => figure.rows,
+            None => self.scale.rows(),
+        }
     }
 
     /// Everything on this line, as one string.
@@ -235,6 +255,9 @@ impl Line {
 
     /// How many characters [`Line::text`] has.
     pub fn len_chars(&self) -> usize {
+        if self.figure.is_some() {
+            return 0;
+        }
         self.indent
             + self
                 .spans
@@ -554,6 +577,7 @@ impl Table {
                 block: Block::Table,
                 scale: Scale::Body,
                 code: None,
+                figure: None,
             }
         };
 
@@ -598,6 +622,7 @@ impl Table {
                 },
                 scale: Scale::Body,
                 code: None,
+                figure: None,
             });
             // A heading is separated from the body, but only when there
             // is a body to separate it from.
@@ -791,6 +816,8 @@ fn slug(text: &str) -> String {
 /// being collected.
 struct Preview<'a> {
     columns: usize,
+    /// How tall a row is against a cell's width, for figures.
+    aspect: f32,
     /// How wide a figure may be, in cells. Wider than the column: prose
     /// is capped at what it reads well at, a diagram only by the page.
     room: usize,
@@ -825,8 +852,10 @@ impl<'a> Preview<'a> {
     /// `column` is where prose wraps and `room` is how wide a figure may
     /// be; a tooltip passes the same number for both.
     fn new(column: f32, room: f32, measure: &'a mut dyn Measure) -> Self {
+        let aspect = measure.aspect();
         Self {
             columns: column as usize,
+            aspect,
             room: room as usize,
             prose: column,
             measure,
@@ -1279,7 +1308,7 @@ impl<'a> Preview<'a> {
         // a diagram is drawn from.
         let source: Arc<str> = Arc::from(text.trim_end_matches('\n'));
         let at = self.out.len();
-        match diagram(&language, &source, self.room) {
+        match diagram(&language, &source, self.room, self.aspect) {
             Some(drawn) => self.out.extend(drawn),
             None => {
                 let code: Vec<&str> = source.lines().collect();
@@ -1334,33 +1363,33 @@ fn push_heading(
 /// `None` for every other fence, and for a Mermaid diagram the reader
 /// will not lay out — the preview then shows the source, which says
 /// what was meant even when the picture cannot be drawn.
-fn diagram(language: &str, source: &str, room: usize) -> Option<Vec<Line>> {
+fn diagram(language: &str, source: &str, room: usize, aspect: f32) -> Option<Vec<Line>> {
     if !language.trim().eq_ignore_ascii_case("mermaid") {
         return None;
     }
     // Two cells of indent and two of margin, which is what the tint
     // behind the block takes up on either side of it.
-    let drawn = crate::mermaid::render(source, room.saturating_sub(4))?;
-    // Every row padded to the widest, the blank ones above and below
-    // included: the tint is sized from the row it is drawn on, and a
-    // ragged one would stair-step down the page.
-    let width = drawn.iter().map(|r| r.chars().count()).max().unwrap_or(0);
-    let row = |text: String| {
-        let short = width.saturating_sub(text.chars().count());
-        let mut text = text;
-        text.extend(std::iter::repeat_n(' ', short));
+    let drawn = crate::mermaid::render(source, room.saturating_sub(4), aspect)?;
+    // A blank row above and below, so the tint behind the figure has
+    // air in it rather than ending flush against the drawing.
+    let pad = || Line {
+        indent: 2,
+        block: Block::Diagram,
+        ..Line::default()
+    };
+    Some(vec![
+        pad(),
         Line {
-            spans: vec![Span::plain(text, Style::Body)],
             indent: 2,
             block: Block::Diagram,
-            scale: Scale::Body,
-            code: None,
-        }
-    };
-    let mut out = vec![row(String::new())];
-    out.extend(drawn.into_iter().map(&row));
-    out.push(row(String::new()));
-    Some(out)
+            // The fence's own source, so clicking the figure copies
+            // the Mermaid back rather than nothing.
+            code: Some(Arc::from(source)),
+            figure: Some(Arc::new(drawn)),
+            ..Line::default()
+        },
+        pad(),
+    ])
 }
 
 /// A fenced block: tinted, padded, and highlighted when the fence names a
@@ -1387,6 +1416,7 @@ fn code_block(language: String, code: &[&str], columns: usize) -> Vec<Line> {
                 block: Block::Code,
                 scale: Scale::Body,
                 code: None,
+                figure: None,
             });
         }
     }
@@ -1492,6 +1522,7 @@ fn wrap(
                 block: Block::Plain,
                 scale,
                 code: None,
+                figure: None,
             });
             used = 0.0;
         }
@@ -1529,6 +1560,7 @@ fn wrap(
             block: Block::Plain,
             scale,
             code: None,
+            figure: None,
         });
     }
     lines
@@ -1892,8 +1924,13 @@ mod tests {
     fn a_mermaid_fence_is_drawn_and_still_copies_its_source() {
         let src = "```mermaid\nflowchart TB\n  A[One] --> B[Two]\n```\n";
         let out = render(src, 60);
-        let drawn: String = out.iter().map(text_of).collect::<Vec<_>>().join("\n");
-        assert!(drawn.contains("One") && drawn.contains('▼'), "{drawn}");
+        let figure = out
+            .iter()
+            .find_map(|l| l.figure.clone())
+            .expect("a drawn figure");
+        let said: Vec<&str> = figure.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(said.contains(&"One") && said.contains(&"Two"), "{said:?}");
+        assert!(!figure.svg.is_empty(), "and shapes to draw");
         assert!(
             out.iter().any(|l| l.block == Block::Diagram),
             "it should be a diagram, not a code block"
@@ -1901,6 +1938,19 @@ mod tests {
         // Copying gives back the mermaid, not the picture.
         let source = out.iter().find_map(|l| l.code.clone()).expect("a source");
         assert!(source.contains("flowchart TB"), "{source}");
+    }
+
+    /// A figure is one line of the preview however tall it is, and
+    /// says so — the rows it reports are what scrolling counts.
+    #[test]
+    fn a_figure_is_one_line_as_tall_as_it_says() {
+        let src = "```mermaid\nflowchart TB\n  A[One] --> B[Two]\n```\n";
+        let out = render(src, 60);
+        let line = out.iter().find(|l| l.figure.is_some()).expect("a figure");
+        let figure = line.figure.as_deref().expect("a figure");
+        assert!(figure.rows > 1, "a diagram is more than one row tall");
+        assert_eq!(line.rows(), figure.rows, "and the line reports them");
+        assert_eq!(line.len_chars(), 0, "it has no text to select");
     }
 
     #[test]
@@ -2308,14 +2358,7 @@ mod tests {
         let out = render(source, 160);
         let widest = out
             .iter()
-            .filter(|l| l.block == Block::Diagram)
-            .map(|l| {
-                l.indent
-                    + l.spans
-                        .iter()
-                        .map(|s| s.text.chars().count())
-                        .sum::<usize>()
-            })
+            .filter_map(|l| Some(l.indent + l.figure.as_deref()?.cols))
             .max()
             .expect("a drawn figure, not a fence");
         assert!(

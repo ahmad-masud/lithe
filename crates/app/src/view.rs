@@ -137,6 +137,15 @@ pub struct ButtonSlot {
     pub active: bool,
 }
 
+/// Rasterised diagrams, keyed by the markup they were drawn from and
+/// the width they were drawn at.
+pub type Figures = std::collections::HashMap<(u64, u32), crate::imageview::ImageView>;
+
+/// For a scene with no window behind it, which cannot hold an uploaded
+/// picture and so can never have one to look up.
+#[cfg(test)]
+static EMPTY_FIGURES: std::sync::LazyLock<Figures> = std::sync::LazyLock::new(Figures::new);
+
 /// Which kind of diff a pane is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiffKind {
@@ -427,6 +436,10 @@ pub struct Scene<'a> {
     /// Rendered Markdown, shown instead of the file when open.
     pub preview: Option<&'a [MdLine]>,
     pub preview_scroll: f32,
+    /// Rasterised diagrams, by markup and width. Looked up rather than
+    /// carried on the line, because a picture belongs to the window it
+    /// was uploaded to and a laid-out document does not.
+    pub figures: &'a Figures,
     /// Selected text in the preview: where the drag began and where it
     /// is now, in either order.
     pub preview_sel: Option<(PreviewPos, PreviewPos)>,
@@ -1235,14 +1248,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
     } else if let Some(lines) = scene.diff {
         draw_diff(&mut f, &l, lines, scene, theme, scratch);
     } else if let Some(lines) = scene.preview {
-        draw_preview(
-            &mut f,
-            &l,
-            lines,
-            scene.preview_scroll,
-            scene.preview_sel,
-            theme,
-        );
+        draw_preview(&mut f, &l, lines, scene, theme);
     } else if showing_landing(scene.workspace) {
         draw_landing(&mut f, &l, scene, scratch);
     } else {
@@ -2437,6 +2443,14 @@ struct Measured<'a, 'f> {
 }
 
 impl crate::markdown::Measure for Measured<'_, '_> {
+    fn aspect(&mut self) -> f32 {
+        let cell = self.frame.cell();
+        match cell.advance > 0.0 {
+            true => cell.line_height / cell.advance,
+            false => 2.0,
+        }
+    }
+
     fn width(&mut self, text: &str, style: MdStyle, scale: MdScale) -> f32 {
         let cell = self.frame.cell().advance;
         if cell <= 0.0 {
@@ -2732,10 +2746,10 @@ fn draw_preview(
     f: &mut lithe_gpu::Frame<'_>,
     l: &Layout,
     lines: &[MdLine],
-    scroll: f32,
-    sel: Option<(PreviewPos, PreviewPos)>,
+    scene: &Scene<'_>,
     theme: &Theme,
 ) {
+    let (scroll, sel) = (scene.preview_scroll, scene.preview_sel);
     use lithe_gpu::Size;
 
     let top = scroll.max(0.0) as usize;
@@ -2857,6 +2871,57 @@ fn draw_preview(
                 COPY,
                 theme.gutter_fg,
             );
+        }
+
+        // A figure: the shapes as a picture, then its labels in the
+        // editor's own face. The text is drawn here rather than baked
+        // into the picture so that it matches the prose around it and
+        // the rasteriser needs no fonts of its own.
+        if let Some(figure) = line.figure.as_deref() {
+            let fx = origin + line.indent as f32 * l.cell.advance;
+            let key = (
+                crate::figure_key(&figure.svg)
+                    ^ crate::figure_key(&format!("{:?}", theme.preview_fg)),
+                (figure.cols as f32 * l.cell.advance).round().max(1.0) as u32,
+            );
+            if let Some(picture) = scene.figures.get(&key) {
+                f.image(
+                    &picture.image,
+                    fx,
+                    y,
+                    picture.width as f32,
+                    picture.height as f32,
+                );
+            }
+            for label in &figure.labels {
+                let colour = if label.faint {
+                    theme.gutter_fg
+                } else {
+                    theme.fg
+                };
+                let width = f.measure(
+                    &label.text,
+                    lithe_gpu::Face::Regular,
+                    Size::Body,
+                    lithe_gpu::Family::Mono,
+                );
+                let lx = match label.centred {
+                    true => fx + label.x * l.cell.advance - width / 2.0,
+                    false => fx + label.x * l.cell.advance,
+                };
+                let ly = y + label.row * l.cell.line_height + l.cell.ascent;
+                f.text_run(
+                    lx,
+                    ly,
+                    &label.text,
+                    colour,
+                    lithe_gpu::Face::Regular,
+                    Size::Body,
+                    lithe_gpu::Family::Mono,
+                );
+            }
+            y += height;
+            continue;
         }
 
         let mut x = origin + line.indent as f32 * l.cell.advance;
@@ -3790,6 +3855,7 @@ mod tests {
             sidebar_cols: TREE_COLS,
             preview: None,
             preview_scroll: 0.0,
+            figures: &EMPTY_FIGURES,
             preview_sel: None,
             diff: None,
             diff_title: None,
@@ -4481,6 +4547,7 @@ mod tests {
             sidebar_cols: TREE_COLS,
             preview: None,
             preview_scroll: 0.0,
+            figures: &EMPTY_FIGURES,
             preview_sel: None,
             diff: None,
             diff_title: None,
@@ -5101,6 +5168,7 @@ mod tests {
             sidebar_cols: TREE_COLS,
             preview: None,
             preview_scroll: 0.0,
+            figures: &EMPTY_FIGURES,
             preview_sel: None,
             diff: None,
             diff_title: None,

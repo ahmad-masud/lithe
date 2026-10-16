@@ -189,6 +189,14 @@ struct Pane {
     /// pointer is over one. Underlined, so what a cmd-click would do
     /// is visible before you do it.
     cmd_link: Option<Range<usize>>,
+    /// Rasterised diagrams, by the shapes they were drawn from and the
+    /// width they were drawn at.
+    ///
+    /// Keyed by the markup rather than by where the figure sits, so a
+    /// re-render that moves a diagram down the page reuses the picture
+    /// instead of drawing it again; keyed by width too, because a
+    /// resize is the one thing that does mean drawing it again.
+    figures: HashMap<(u64, u32), imageview::ImageView>,
     /// Selected text in the preview, as the place the drag started and
     /// the place it is now. Not ordered: which end moves is which end
     /// the pointer is, and swapping them as the drag crosses its own
@@ -1049,6 +1057,44 @@ impl Pane {
         self.preview_sel = None;
     }
 
+    /// Rasterises the figures the preview is about to draw.
+    ///
+    /// Before the frame rather than during it: uploading wants the
+    /// renderer and drawing wants a frame borrowed from it, and a
+    /// diagram is drawn from the same pixels for as long as the page
+    /// is the same width.
+    fn refresh_figures(&mut self, ink: lithe_gpu::Rgba) {
+        let Some(lines) = self.preview.as_deref() else {
+            self.figures.clear();
+            return;
+        };
+        let cell = self.renderer.cell();
+        if cell.advance <= 0.0 {
+            return;
+        }
+        let mut wanted: Vec<((u64, u32), String, u32, u32)> = Vec::new();
+        let mut live: Vec<(u64, u32)> = Vec::new();
+        for figure in lines.iter().filter_map(|line| line.figure.as_deref()) {
+            let w = (figure.cols as f32 * cell.advance).round().max(1.0) as u32;
+            let h = (figure.rows as f32 * cell.line_height).round().max(1.0) as u32;
+            // The colour is part of the key: a theme change repaints
+            // the strokes, which means rasterising them again.
+            let key = (figure_key(&figure.svg) ^ figure_key(&format!("{ink:?}")), w);
+            live.push(key);
+            if !self.figures.contains_key(&key) {
+                wanted.push((key, figure.svg.clone(), w, h));
+            }
+        }
+        // A resize changes every key, so without this the old pictures
+        // would sit on the GPU for as long as the file stayed open.
+        self.figures.retain(|key, _| live.contains(key));
+        for (key, svg, w, h) in wanted {
+            if let Some(view) = imageview::rasterise(&self.renderer, &svg, w, h, ink) {
+                self.figures.insert(key, view);
+            }
+        }
+    }
+
     /// Works out the blame note for the cursor's line.
     ///
     /// A modified buffer is not blamed: `git blame` reads the file on
@@ -1307,6 +1353,7 @@ impl Pane {
         self.refresh_hunks();
         self.refresh_git();
         self.refresh_preview();
+        self.refresh_figures(theme.preview_fg);
         self.refresh_diff();
         self.refresh_image();
         self.refresh_blame();
@@ -1324,6 +1371,7 @@ impl Pane {
             sidebar_cols,
             preview,
             preview_scroll,
+            figures,
             preview_sel,
             image,
             preview_defaults,
@@ -1376,6 +1424,7 @@ impl Pane {
             sidebar_cols: *sidebar_cols,
             preview: preview.as_deref(),
             preview_scroll: *preview_scroll,
+            figures,
             preview_sel: *preview_sel,
             diff: ws.diff().map(|d| d.lines.as_slice()),
             diff_title: ws.diff().map(|d| d.title.as_str()),
@@ -1408,6 +1457,16 @@ struct Measured<'a> {
 }
 
 impl markdown::Measure for Measured<'_> {
+    /// The window's own cell, so a figure laid out in cells is drawn
+    /// in the shape those cells actually have.
+    fn aspect(&mut self) -> f32 {
+        let cell = self.renderer.cell();
+        match cell.advance > 0.0 {
+            true => cell.line_height / cell.advance,
+            false => 2.0,
+        }
+    }
+
     fn width(&mut self, text: &str, style: markdown::Style, scale: markdown::Scale) -> f32 {
         let cell = self.renderer.cell().advance;
         if cell <= 0.0 {
@@ -2443,6 +2502,7 @@ impl App {
             highlights: Vec::new(),
             diff_old_spans: Vec::new(),
             cmd_link: None,
+            figures: HashMap::new(),
             preview_sel: None,
             preview_dragging: false,
             diff_new_spans: Vec::new(),
@@ -5949,6 +6009,18 @@ fn revert_edit(
     (start..end, text)
 }
 
+/// A diagram's identity: the shapes it is made of.
+///
+/// Hashed rather than kept, because the key is only ever compared and
+/// the markup is long enough that holding a copy per figure would cost
+/// more than drawing one.
+fn figure_key(svg: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    svg.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The name at `at`, if what is there is a name.
 ///
 /// `word_at` takes the run of like characters around a point, which
@@ -6630,6 +6702,25 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         })
         .flatten();
 
+    // The snapshot rasterises its figures too, so a picture of a page
+    // with a diagram on it is a picture of the diagram rather than of
+    // the hole where one would go.
+    let mut figures = view::Figures::new();
+    if let Some(lines) = md.as_deref() {
+        let cell = renderer.cell();
+        for figure in lines.iter().filter_map(|line| line.figure.as_deref()) {
+            let w = (figure.cols as f32 * cell.advance).round().max(1.0) as u32;
+            let h = (figure.rows as f32 * cell.line_height).round().max(1.0) as u32;
+            let ink = Theme::default().preview_fg;
+            if let Some(view) = imageview::rasterise(&renderer, &figure.svg, w, h, ink) {
+                figures.insert(
+                    (figure_key(&figure.svg) ^ figure_key(&format!("{ink:?}")), w),
+                    view,
+                );
+            }
+        }
+    }
+
     let prompt = (overlay == Some("prompt")).then(|| {
         let mut prompt = Prompt::commit();
         prompt.text = "tidy up the renderer".into();
@@ -6737,6 +6828,7 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         sidebar_cols: view::TREE_COLS,
         preview: md.as_deref(),
         preview_scroll: 0.0,
+        figures: &figures,
         // `--overlay selected` shows a dragged selection.
         preview_sel: (overlay == Some("selected")).then_some((
             view::PreviewPos { line: 2, char: 4 },

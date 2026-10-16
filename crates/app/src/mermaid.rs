@@ -95,9 +95,155 @@ struct Edge {
     both: bool,
 }
 
+/// A diagram, as shapes to rasterise and labels to typeset.
+///
+/// The text is deliberately *not* in the SVG. Putting it there would
+/// mean handing a font database to the rasteriser, which means scanning
+/// every font on the machine at startup for a picture that is mostly
+/// lines — and the labels would then be set by a different engine from
+/// the prose around them, in a different face, at a different weight.
+/// Lithe draws them itself, with the same atlas as everything else.
+#[derive(Clone, Debug)]
+pub struct Diagram {
+    /// Shapes only: boxes, edges, arrowheads, subgraph frames.
+    pub svg: String,
+    pub labels: Vec<Label>,
+    /// Size on the character grid, so scrolling and hit-testing can
+    /// count rows without rasterising anything.
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// One run of text in a diagram, positioned in grid cells.
+#[derive(Clone, Debug)]
+pub struct Label {
+    /// Cells from the left, and rows from the top. `x` is the centre
+    /// of the text for a centred label and its left edge otherwise.
+    pub x: f32,
+    pub row: f32,
+    pub text: String,
+    pub centred: bool,
+    /// Drawn quieter than a node's own name: a subgraph's title and an
+    /// edge's label are annotations on the picture rather than things
+    /// in it.
+    pub faint: bool,
+}
+
+/// Builds the shape half of a diagram.
+///
+/// Coordinates are in cells across and rows down, scaled to square
+/// units on the way out so the picture can be scaled uniformly without
+/// distorting a corner radius or an arrowhead.
+struct Svg {
+    body: String,
+    aspect: f32,
+}
+
+impl Svg {
+    /// Stroke width, in cell widths. Thin enough to read as a hairline
+    /// at any size the preview will show it at.
+    const STROKE: f32 = 0.09;
+
+    fn new(aspect: f32) -> Self {
+        Self {
+            body: String::new(),
+            aspect,
+        }
+    }
+
+    /// A row index to a y coordinate in square units.
+    fn y(&self, row: f32) -> f32 {
+        row * self.aspect
+    }
+
+    fn rect(&mut self, x: f32, row: f32, w: f32, rows: f32, radius: f32) {
+        let (y, h) = (self.y(row), self.y(rows));
+        self.body.push_str(&format!(
+            "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{h:.2}\" \
+             rx=\"{radius:.2}\" fill=\"none\" stroke=\"currentColor\" \
+             stroke-width=\"{:.3}\"/>",
+            Self::STROKE
+        ));
+    }
+
+    /// A closed shape through the given cell points.
+    fn polygon(&mut self, points: &[(f32, f32)], filled: bool) {
+        let path: String = points
+            .iter()
+            .enumerate()
+            .map(|(i, (x, row))| {
+                let cmd = if i == 0 { 'M' } else { 'L' };
+                format!("{cmd}{x:.2} {:.2}", self.y(*row))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fill = if filled { "currentColor" } else { "none" };
+        self.body.push_str(&format!(
+            "<path d=\"{path} Z\" fill=\"{fill}\" stroke=\"currentColor\" \
+             stroke-width=\"{:.3}\" stroke-linejoin=\"round\"/>",
+            Self::STROKE
+        ));
+    }
+
+    /// An open run through the given cell points, with rounded corners.
+    fn polyline(&mut self, points: &[(f32, f32)], dashed: bool) {
+        if points.len() < 2 {
+            return;
+        }
+        let path: String = points
+            .iter()
+            .enumerate()
+            .map(|(i, (x, row))| {
+                let cmd = if i == 0 { 'M' } else { 'L' };
+                format!("{cmd}{x:.2} {:.2}", self.y(*row))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let dash = if dashed {
+            " stroke-dasharray=\"0.5 0.45\""
+        } else {
+            ""
+        };
+        self.body.push_str(&format!(
+            "<path d=\"{path}\" fill=\"none\" stroke=\"currentColor\" \
+             stroke-width=\"{:.3}\" stroke-linecap=\"round\" \
+             stroke-linejoin=\"round\"{dash}/>",
+            Self::STROKE
+        ));
+    }
+
+    /// A filled triangle at `(x, row)`, pointing the way given.
+    fn arrowhead(&mut self, x: f32, row: f32, dx: f32, dy: f32) {
+        const LEN: f32 = 0.62;
+        const HALF: f32 = 0.34;
+        // In square units, so the head is the same shape whichever way
+        // it points; converted back to rows for `polygon`.
+        let back_row = row - dy * LEN / self.aspect;
+        let (sx, sy) = (-dy * HALF, dx * HALF / self.aspect);
+        // Written out rather than built in a loop: three points, and
+        // the arithmetic reads as what it is.
+        let tip = (x, row);
+        let left = (x - dx * LEN + sx, back_row + sy);
+        let right = (x - dx * LEN - sx, back_row - sy);
+        self.polygon(&[tip, left, right], true);
+    }
+
+    fn finish(self, cols: usize, rows: usize) -> String {
+        let (w, h) = (cols as f32, rows as f32 * self.aspect);
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w:.2} {h:.2}\" \
+             width=\"{w:.2}\" height=\"{h:.2}\">{}</svg>",
+            self.body
+        )
+    }
+}
+
 /// Renders a `mermaid` fence, or `None` when it is not a flowchart this
 /// can lay out honestly.
-pub fn render(source: &str, columns: usize) -> Option<Vec<String>> {
+/// `aspect` is how tall a grid row is relative to a cell's width, so
+/// the picture can be laid out in cells and still be scaled uniformly
+/// without an arrowhead or a corner radius coming out oval.
+pub fn render(source: &str, columns: usize, aspect: f32) -> Option<Diagram> {
     let kind = source
         .lines()
         .map(str::trim)
@@ -105,19 +251,18 @@ pub fn render(source: &str, columns: usize) -> Option<Vec<String>> {
         .split_whitespace()
         .next()?;
     if kind == "sequenceDiagram" {
-        return sequence::render(source, columns);
+        return sequence::render(source, columns, aspect);
     }
     let (dir, mut nodes, edges, groups) = parse(source)?;
     if nodes.is_empty() {
         return None;
     }
     layer(&mut nodes, &edges, &groups);
-    let canvas = if dir.vertical() {
-        draw_vertical(dir, &mut nodes, &edges, &groups, columns)
+    if dir.vertical() {
+        draw_vertical(dir, &mut nodes, &edges, &groups, columns, aspect)
     } else {
-        draw_horizontal(dir, &mut nodes, &edges, columns)
-    }?;
-    Some(canvas)
+        draw_horizontal(dir, &mut nodes, &edges, columns, aspect)
+    }
 }
 
 /// Reads the subset of the flowchart grammar that a README uses.
@@ -522,12 +667,20 @@ fn layer(nodes: &mut [Node], edges: &[Edge], groups: &[Group]) {
 
 /// Cells a box takes, including its border and one space of padding.
 fn box_width(node: &Node) -> usize {
-    node.lines
+    let text = node
+        .lines
         .iter()
         .map(|row| row.chars().count())
         .max()
-        .unwrap_or(0)
-        + 4
+        .unwrap_or(0);
+    // A diamond is only its full width across the middle, and a label
+    // is taller than the one row it sits on, so its corners cut into
+    // the text unless the shape is wider than a box would be.
+    let padding = match node.shape {
+        Shape::Diamond => 8,
+        _ => 4,
+    };
+    text + padding
 }
 
 /// Rows a box takes: one per line of its label, and its two borders.
@@ -563,180 +716,6 @@ const GAP_V: usize = 3;
 const GAP_H: usize = 2;
 /// Columns between one layer of boxes and the next.
 const GAP_LR: usize = 4;
-
-struct Canvas {
-    cells: Vec<Vec<char>>,
-    /// Cells a box owns. Nothing else may write to them.
-    ///
-    /// Without this an arrow routed past a box wrote its corners and
-    /// arrowheads straight through the label — `Node 0 (leader)` came
-    /// out as `N┴de╮0 (leader)`. Checking for a blank cell is not
-    /// enough, because a box's own characters are not blank.
-    locked: Vec<Vec<bool>>,
-}
-
-impl Canvas {
-    fn new(width: usize, height: usize) -> Self {
-        Self {
-            cells: vec![vec![' '; width]; height],
-            locked: vec![vec![false; width]; height],
-        }
-    }
-
-    /// Writes regardless of who owns the cell. Only box drawing may.
-    fn set(&mut self, x: usize, y: usize, ch: char) {
-        if let Some(row) = self.cells.get_mut(y) {
-            if let Some(cell) = row.get_mut(x) {
-                *cell = ch;
-            }
-        }
-        if let Some(row) = self.locked.get_mut(y) {
-            if let Some(cell) = row.get_mut(x) {
-                *cell = true;
-            }
-        }
-    }
-
-    fn owned(&self, x: usize, y: usize) -> bool {
-        self.locked
-            .get(y)
-            .and_then(|r| r.get(x))
-            .copied()
-            .unwrap_or(false)
-    }
-
-    fn put(&mut self, x: usize, y: usize, ch: char) {
-        if self.owned(x, y) {
-            return;
-        }
-        if let Some(row) = self.cells.get_mut(y) {
-            if let Some(cell) = row.get_mut(x) {
-                *cell = ch;
-            }
-        }
-    }
-
-    /// Draws a character only where the cell is still blank, so a box
-    /// is never scribbled over by an arrow routed past it.
-    fn under(&mut self, x: usize, y: usize, ch: char) {
-        if !self.owned(x, y) && self.cells.get(y).and_then(|r| r.get(x)) == Some(&' ') {
-            self.put(x, y, ch);
-        }
-    }
-
-    /// Draws `ch`, or `joined` when something is already there — two
-    /// edges that branch from one box share a cell, and the second must
-    /// not erase the first.
-    fn join(&mut self, x: usize, y: usize, ch: char, joined: char) {
-        if self.owned(x, y) {
-            return;
-        }
-        let here = self.cells.get(y).and_then(|r| r.get(x)).copied();
-        let occupied = matches!(here, Some(c) if c != ' ' && c != '─' && c != '│');
-        self.put(x, y, if occupied { joined } else { ch });
-    }
-
-    fn text(&mut self, x: usize, y: usize, text: &str) {
-        for (i, ch) in text.chars().enumerate() {
-            self.put(x + i, y, ch);
-        }
-    }
-
-    /// Text that gives way to anything already there, so a label never
-    /// lands on a box or a line it does not own.
-    fn label(&mut self, x: usize, y: usize, text: &str) {
-        for (i, ch) in text.chars().enumerate() {
-            self.under(x + i, y, ch);
-        }
-    }
-
-    /// A box with its label inside, at `x`,`y`.
-    ///
-    /// As many rows as the label has lines, each centred in the box:
-    /// a two-line label in a left-aligned box reads as one line that
-    /// ran out of room.
-    fn boxed(&mut self, x: usize, y: usize, node: &Node) {
-        let width = box_width(node);
-        let height = box_height(node);
-        let (tl, tr, bl, br) = match node.shape {
-            Shape::Rect => ('┌', '┐', '└', '┘'),
-            Shape::Round | Shape::Cylinder => ('╭', '╮', '╰', '╯'),
-            Shape::Diamond => ('╱', '╲', '╲', '╱'),
-        };
-        for row in 0..height {
-            for i in 0..width {
-                self.set(x + i, y + row, ' ');
-            }
-        }
-        let last = height - 1;
-        self.set(x, y, tl);
-        self.set(x + width - 1, y, tr);
-        self.set(x, y + last, bl);
-        self.set(x + width - 1, y + last, br);
-        for i in 1..width - 1 {
-            self.set(x + i, y, '─');
-            self.set(x + i, y + last, '─');
-        }
-        for row in 1..last {
-            self.set(x, y + row, '│');
-            self.set(x + width - 1, y + row, '│');
-        }
-        // A store's disc: the line that makes a rounded box read as a
-        // cylinder rather than as a terminus.
-        let lid = usize::from(node.shape == Shape::Cylinder);
-        if lid == 1 {
-            self.set(x, y + 1, '├');
-            self.set(x + width - 1, y + 1, '┤');
-            for i in 1..width - 1 {
-                self.set(x + i, y + 1, '─');
-            }
-        }
-        for (row, text) in node.lines.iter().enumerate() {
-            let inset = (width - text.chars().count()) / 2;
-            for (i, ch) in text.chars().enumerate() {
-                self.set(x + inset + i, y + 1 + lid + row, ch);
-            }
-        }
-    }
-
-    /// A light frame with a title on its top edge, drawn only where the
-    /// cells are free.
-    fn frame(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, title: &str) {
-        if x1 <= x0 || y1 <= y0 {
-            return;
-        }
-        for x in x0 + 1..x1 {
-            self.under(x, y0, '╌');
-            self.under(x, y1, '╌');
-        }
-        for y in y0 + 1..y1 {
-            self.under(x0, y, '╎');
-            self.under(x1, y, '╎');
-        }
-        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
-            self.under(x, y, '┼');
-        }
-        if !title.is_empty() {
-            let at = x0 + 2;
-            if at + title.chars().count() < x1 {
-                self.text(at, y0, title);
-            }
-        }
-    }
-
-    fn into_lines(self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .cells
-            .into_iter()
-            .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
-            .collect();
-        while out.last().is_some_and(|l| l.is_empty()) {
-            out.pop();
-        }
-        out
-    }
-}
-
 /// Nodes grouped by layer, in drawing order.
 fn layers(nodes: &[Node], reversed: bool) -> Vec<Vec<usize>> {
     let depth = nodes.iter().map(|n| n.layer).max().unwrap_or(0) + 1;
@@ -753,13 +732,22 @@ fn layers(nodes: &[Node], reversed: bool) -> Vec<Vec<usize>> {
     out
 }
 
+/// Shapes for a top-to-bottom (or bottom-to-top) flowchart.
+///
+/// The placement is the same grid the character renderer used, and
+/// deliberately so: a figure occupies whole rows of the preview, so the
+/// rows it takes have to be countable without drawing anything. Only
+/// the painting is vector — which is also what lets an edge be one
+/// rounded polyline instead of a run of corner characters that have to
+/// be tee-joined where two of them meet.
 fn draw_vertical(
     dir: Dir,
     nodes: &mut [Node],
     edges: &[Edge],
     groups: &[Group],
     columns: usize,
-) -> Option<Vec<String>> {
+    aspect: f32,
+) -> Option<Diagram> {
     let rows = layers(nodes, dir.reversed());
 
     // Width is set by the widest layer; every layer is then centred in
@@ -773,18 +761,16 @@ fn draw_vertical(
         })
         .collect();
     // Edge labels sit to the right of the arrow they belong to, so the
-    // canvas needs a gutter for them — sized to the widest, or they are
-    // parsed and then silently dropped for want of room.
+    // picture needs a gutter for them — sized to the widest, or they
+    // are parsed and then run off the edge.
     let gutter = edges
         .iter()
         .filter_map(|e| e.label.as_deref())
         .map(|l| l.chars().count() + 3)
         .max()
         .unwrap_or(0);
-    // A subgraph's title is written on its top border, so a group
-    // whose boxes are narrower than its name still needs the room:
-    // without this the title did not fit and was dropped, and the
-    // subgraph was drawn as an unlabelled box.
+    // A subgraph's title is written along its top border, so a group
+    // whose boxes are narrower than its name still needs the room.
     let titles = groups
         .iter()
         .filter(|g| !g.members.is_empty())
@@ -797,16 +783,14 @@ fn draw_vertical(
         return None;
     }
     // A frame needs rows of its own, above and below the boxes it
-    // holds, or an arrowhead arriving at the layer inside it lands on
-    // the border and eats the title: `Raft Cluster` came out as
-    // `Raft Cl▼ster`. Three more rows between layers buys them, and
-    // the room is only taken when there is a subgraph to spend it on.
+    // holds, so an edge arriving at the layer inside it has somewhere
+    // to cross. Only taken when there is a subgraph to spend it on.
     let framed = !groups.is_empty();
     let headroom = if framed { FRAME_PAD } else { 0 };
     let gap = if framed { GAP_V + 3 } else { GAP_V };
-    // Layers are no longer all one height — a box is as tall as its
-    // label has lines — so the row each one starts on is the sum of
-    // the ones above it rather than its depth times a constant.
+    // Layers are not all one height — a box is as tall as its label
+    // has lines — so the row each one starts on is the sum of the ones
+    // above it rather than its depth times a constant.
     let heights: Vec<usize> = rows.iter().map(|l| layer_height(nodes, l)).collect();
     let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
     let mut at = headroom;
@@ -822,7 +806,8 @@ fn draw_vertical(
         .map(|layer| layer.first().map_or(0, |i| nodes[*i].layer))
         .collect();
 
-    let mut canvas = Canvas::new(width + 4, height);
+    let mut svg = Svg::new(aspect);
+    let mut labels: Vec<Label> = Vec::new();
     let mut tops: Vec<usize> = vec![0; nodes.len()];
     let mut bottoms: Vec<usize> = vec![0; nodes.len()];
 
@@ -831,7 +816,7 @@ fn draw_vertical(
         let mut x = (content - widths[depth]) / 2;
         for &i in layer {
             let w = box_width(&nodes[i]);
-            canvas.boxed(x, y, &nodes[i]);
+            shape(&mut svg, &mut labels, x, y, &nodes[i]);
             nodes[i].centre = x + w / 2;
             tops[i] = y;
             bottoms[i] = y + box_height(&nodes[i]);
@@ -839,12 +824,12 @@ fn draw_vertical(
         }
     }
 
-    // A subgraph is drawn as a frame round the boxes it holds, once they
-    // have been placed. Flattening the group into the layout and framing
-    // it afterwards is what lets the layering stay one simple pass; the
-    // frame is skipped when the nodes did not land in a clean rectangle,
-    // because a frame that encloses something it does not own says
-    // something false.
+    // A subgraph is drawn as a frame round the boxes it holds, once
+    // they have been placed. Flattening the group into the layout and
+    // framing it afterwards is what lets the layering stay one simple
+    // pass; the frame is skipped when the nodes did not land in a clean
+    // rectangle, because a frame that encloses something it does not
+    // own says something false.
     for group in groups {
         if group.members.is_empty() {
             continue;
@@ -874,35 +859,26 @@ fn draw_vertical(
         let bottom = starts.get(last_depth).copied().unwrap_or(headroom)
             + heights.get(last_depth).copied().unwrap_or(BOX_H);
         // Below the row a link between two members is routed on, so
-        // such a link is drawn inside the subgraph it belongs to. Wide
-        // enough for the title, which is written along the top border
-        // and is otherwise dropped for want of room.
-        let x0 = left.saturating_sub(2);
-        let x1 = (right + 2).max(x0 + group.title.chars().count() + 4);
-        canvas.frame(
-            x0,
-            top.saturating_sub(FRAME_PAD),
-            x1.min(content),
-            bottom + FRAME_PAD,
-            &group.title,
-        );
+        // such a link is drawn inside the subgraph it belongs to.
+        let x0 = left.saturating_sub(2) as f32;
+        let x1 = ((right + 2).max(left + group.title.chars().count() + 2)).min(content) as f32;
+        let y0 = top.saturating_sub(FRAME_PAD) as f32;
+        let y1 = (bottom + FRAME_PAD) as f32;
+        frame(&mut svg, &mut labels, x0, y0, x1, y1, &group.title);
     }
 
     // Edges whose ends landed on one row, which a top-to-bottom route
-    // cannot express. Collected here and drawn below the row they
+    // cannot express. Collected here and drawn under the row they
     // share, once everything on it is placed.
     let mut same_layer: Vec<&Edge> = Vec::new();
-    // Labels already placed in the gutter, so two do not land on each
-    // other and one of them come out half-written.
-    let mut taken: Vec<(usize, String)> = Vec::new();
 
     for edge in edges {
         if edge.from == edge.to {
             continue;
         }
         let (a, b) = (edge.from, edge.to);
-        // Drawn from whichever end is higher on the canvas, so an edge
-        // that runs against the layout direction still points somewhere.
+        // Drawn from whichever end is higher, so an edge that runs
+        // against the layout direction still points somewhere.
         let (top, bottom) = if tops[a] <= tops[b] { (a, b) } else { (b, a) };
         let from_y = bottoms[top];
         let to_y = tops[bottom];
@@ -910,105 +886,167 @@ fn draw_vertical(
             same_layer.push(edge);
             continue;
         }
-        let mid = from_y + (to_y - from_y) / 2;
-        let (x0, x1) = (nodes[top].centre, nodes[bottom].centre);
-
-        for y in from_y..mid {
-            canvas.under(x0, y, '│');
-        }
-        for y in mid + 1..to_y {
-            canvas.under(x1, y, '│');
-        }
-        if x0 != x1 {
-            let (lo, hi) = (x0.min(x1), x0.max(x1));
-            for x in lo..=hi {
-                canvas.under(x, mid, '─');
-            }
-            // Two edges leaving the same box meet here, so a corner that
-            // lands on one already drawn becomes a tee rather than
-            // replacing it and losing the other branch.
-            canvas.join(x0, mid, if x1 > x0 { '╰' } else { '╯' }, '┴');
-            canvas.join(x1, mid, if x1 > x0 { '╮' } else { '╭' }, '┬');
-        } else {
-            canvas.under(x0, mid, '│');
-        }
-        let head = to_y.saturating_sub(1);
-        canvas.put(x1, head, '▼');
+        let mid = from_y as f32 + (to_y - from_y) as f32 / 2.0;
+        let (x0, x1) = (nodes[top].centre as f32, nodes[bottom].centre as f32);
+        // One run with rounded joins. The character version needed
+        // corner glyphs and a rule for what happens where two of them
+        // land on one cell; a stroke simply overlaps a stroke.
+        let head_at = to_y as f32 - HEAD_ROOM;
+        svg.polyline(
+            &[(x0, from_y as f32), (x0, mid), (x1, mid), (x1, head_at)],
+            false,
+        );
+        svg.arrowhead(x1, to_y as f32, 0.0, 1.0);
 
         if let Some(label) = edge.label.as_deref() {
-            // On the arrowhead's row, beside it. On the connector row it
-            // was written over the line it belonged to.
-            let at = x1 + 2;
-            if at + label.chars().count() < width {
-                canvas.label(at, head, label);
-            }
+            labels.push(Label {
+                x: x1 + 1.0,
+                row: mid - 0.5,
+                text: label.to_string(),
+                centred: false,
+                faint: true,
+            });
         }
     }
-    // Edges between boxes on the same row, routed under it: down out
-    // of one, across, and up into the other. Drawn last so they give
-    // way to everything already placed.
+
+    // Edges between boxes on the same row, routed under it: out of one,
+    // across, and back up into the other.
     for edge in same_layer {
         let (a, b) = (edge.from, edge.to);
         if nodes[a].centre == nodes[b].centre {
             continue;
         }
-        let base = bottoms[a].max(bottoms[b]);
-        let run = base + 1;
-        if run >= height {
-            continue;
-        }
-        let (lo, hi) = (
-            nodes[a].centre.min(nodes[b].centre),
-            nodes[a].centre.max(nodes[b].centre),
+        let base = bottoms[a].max(bottoms[b]) as f32;
+        let run = base + 1.0;
+        let (ax, bx) = (nodes[a].centre as f32, nodes[b].centre as f32);
+        svg.polyline(
+            &[
+                (ax, base + HEAD_ROOM),
+                (ax, run),
+                (bx, run),
+                (bx, base + HEAD_ROOM),
+            ],
+            false,
         );
-        for x in lo..=hi {
-            canvas.under(x, run, '─');
-        }
-        canvas.join(lo, run, '╰', '┴');
-        canvas.join(hi, run, '╯', '┴');
         // Pointing up into the box it arrives at, since it comes from
         // below. A two-headed arrow arrives at both.
-        canvas.put(nodes[b].centre, base, '▲');
+        svg.arrowhead(bx, base, 0.0, -1.0);
         if edge.both {
-            canvas.put(nodes[a].centre, base, '▲');
-        } else {
-            canvas.under(nodes[a].centre, base, '│');
+            svg.arrowhead(ax, base, 0.0, -1.0);
         }
         if let Some(label) = edge.label.as_deref() {
-            // In the gutter, not beside the arrow: a same-row link runs
-            // across the whole width between its ends, so there is no
-            // clear cell next to it — the label landed on the line and
-            // came out as `Raft─consensus────`.
+            // In the gutter rather than on the run: a same-row link
+            // spans the whole distance between its ends, so there is
+            // no clear space beside it to write in.
             //
             // Three links between the same three peers usually carry
-            // the same word, so an identical label on a row it is
-            // already on is the one already there; a different one
-            // steps down until it finds a row of its own.
-            let here = |taken: &[(usize, String)], row: usize| {
-                taken.iter().any(|(r, l)| *r == row && l == label)
-            };
-            let used = |taken: &[(usize, String)], row: usize| taken.iter().any(|(r, _)| *r == row);
-            let mut row = run;
-            while !here(&taken, row) && used(&taken, row) && row + 1 < height {
-                row += 1;
+            // the same word. Written once: three copies of
+            // `Raft consensus` stacked on one line is noise, not
+            // information.
+            let already = labels
+                .iter()
+                .any(|l| l.text == label && (l.row - run).abs() < 0.01);
+            if !already {
+                labels.push(Label {
+                    x: content as f32 + 1.0,
+                    row: run - 0.5,
+                    text: label.to_string(),
+                    centred: false,
+                    faint: true,
+                });
             }
-            if here(&taken, row) {
-                continue;
-            }
-            taken.push((row, label.to_string()));
-            canvas.label(content + 1, row, label);
         }
     }
 
-    Some(canvas.into_lines())
+    Some(Diagram {
+        svg: svg.finish(width, height),
+        labels,
+        cols: width,
+        rows: height,
+    })
 }
 
+/// How far short of a box an edge stops, so the arrowhead has room to
+/// sit against the edge rather than through it.
+const HEAD_ROOM: f32 = 0.62;
+
+/// One node: its outline, and its label as text to typeset.
+fn shape(svg: &mut Svg, labels: &mut Vec<Label>, x: usize, y: usize, node: &Node) {
+    let w = box_width(node) as f32;
+    let h = box_height(node) as f32;
+    let (x, y) = (x as f32, y as f32);
+    // Inset by half a cell on every side, so adjacent boxes have air
+    // between them rather than touching outlines.
+    let (bx, bw) = (x + 0.5, w - 1.0);
+    let (by, bh) = (y + 0.25, h - 0.5);
+
+    match node.shape {
+        Shape::Rect => svg.rect(bx, by, bw, bh, 0.0),
+        Shape::Round => svg.rect(bx, by, bw, bh, 0.9),
+        Shape::Cylinder => {
+            svg.rect(bx, by, bw, bh, 0.9);
+            // The disc, which is what makes it read as a store.
+            svg.polyline(&[(bx, by + 0.9), (bx + bw, by + 0.9)], false);
+        }
+        Shape::Diamond => svg.polygon(
+            &[
+                (bx + bw / 2.0, by),
+                (bx + bw, by + bh / 2.0),
+                (bx + bw / 2.0, by + bh),
+                (bx, by + bh / 2.0),
+            ],
+            false,
+        ),
+    }
+
+    let lid = f32::from(u8::from(node.shape == Shape::Cylinder)) * 0.5;
+    for (row, text) in node.lines.iter().enumerate() {
+        labels.push(Label {
+            x: x + w / 2.0,
+            row: y + lid + 0.5 + row as f32,
+            text: text.clone(),
+            centred: true,
+            faint: false,
+        });
+    }
+}
+
+/// A subgraph's frame, with a gap in the top border for its title.
+fn frame(svg: &mut Svg, labels: &mut Vec<Label>, x0: f32, y0: f32, x1: f32, y1: f32, title: &str) {
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let dashed = true;
+    // Everything but the top edge, then the top edge in two pieces with
+    // the title between them. Breaking the border rather than drawing
+    // the title over it is what a cartouche does, and it means the
+    // title needs no backing rectangle of its own.
+    svg.polyline(&[(x0, y0), (x0, y1), (x1, y1), (x1, y0)], dashed);
+    if title.is_empty() {
+        svg.polyline(&[(x0, y0), (x1, y0)], dashed);
+        return;
+    }
+    let lead = 1.0;
+    let room = title.chars().count() as f32 + 1.0;
+    svg.polyline(&[(x0, y0), (x0 + lead, y0)], dashed);
+    svg.polyline(&[(x0 + lead + room, y0), (x1, y0)], dashed);
+    labels.push(Label {
+        x: x0 + lead + 0.5,
+        row: y0 - 0.5,
+        text: title.to_string(),
+        centred: false,
+        faint: true,
+    });
+}
+
+/// Shapes for a left-to-right (or right-to-left) flowchart.
 fn draw_horizontal(
     dir: Dir,
     nodes: &mut [Node],
     edges: &[Edge],
     columns: usize,
-) -> Option<Vec<String>> {
+    aspect: f32,
+) -> Option<Diagram> {
     let cols = layers(nodes, dir.reversed());
 
     let col_widths: Vec<usize> = cols
@@ -1022,9 +1060,7 @@ fn draw_horizontal(
         })
         .collect();
     // Edge labels are written in the space between two columns, so
-    // that space has to be wide enough for them. Without this a label
-    // was centred on the connector it belonged to and cut in half by
-    // it: `no` came out as `n`.
+    // that space has to be wide enough for them.
     let lane = edges
         .iter()
         .filter_map(|e| e.label.as_deref())
@@ -1051,9 +1087,10 @@ fn draw_horizontal(
         .collect();
     let height = *spans.iter().max()?;
 
-    let mut canvas = Canvas::new(width, height);
+    let mut svg = Svg::new(aspect);
+    let mut labels: Vec<Label> = Vec::new();
     let mut lefts: Vec<usize> = vec![0; nodes.len()];
-    let mut mids: Vec<usize> = vec![0; nodes.len()];
+    let mut mids: Vec<f32> = vec![0.0; nodes.len()];
     let mut rights: Vec<usize> = vec![0; nodes.len()];
 
     let mut x = 0;
@@ -1063,12 +1100,12 @@ fn draw_horizontal(
         let mut y = (height - spans[depth]) / 2;
         for &i in layer {
             let tall = box_height(&nodes[i]);
-            canvas.boxed(x, y, &nodes[i]);
+            shape(&mut svg, &mut labels, x, y, &nodes[i]);
             lefts[i] = x;
             rights[i] = x + box_width(&nodes[i]);
-            // The middle of the box, so an arrow arrives beside the
-            // label rather than on a border or on a store's disc.
-            mids[i] = y + tall / 2;
+            // The middle of the box, so an edge arrives beside the
+            // label rather than against a border or a store's disc.
+            mids[i] = y as f32 + tall as f32 / 2.0;
             y += tall + 1;
         }
         x += col_widths[depth] + gap_lr;
@@ -1080,43 +1117,37 @@ fn draw_horizontal(
         }
         let (a, b) = (edge.from, edge.to);
         let (near, far) = if lefts[a] <= lefts[b] { (a, b) } else { (b, a) };
-        let from_x = rights[near];
-        let to_x = lefts[far];
+        let from_x = rights[near] as f32 - 0.5;
+        let to_x = lefts[far] as f32 + 0.5;
         if to_x <= from_x {
             continue;
         }
-        let mid = from_x + (to_x - from_x) / 2;
+        let mid = from_x + (to_x - from_x) / 2.0;
         let (y0, y1) = (mids[near], mids[far]);
-
-        for x in from_x..mid {
-            canvas.under(x, y0, '─');
-        }
-        for x in mid + 1..to_x {
-            canvas.under(x, y1, '─');
-        }
-        if y0 != y1 {
-            let (lo, hi) = (y0.min(y1), y0.max(y1));
-            for y in lo..=hi {
-                canvas.under(mid, y, '│');
-            }
-            canvas.join(mid, y0, if y1 > y0 { '╮' } else { '╯' }, '┤');
-            canvas.join(mid, y1, if y1 > y0 { '╰' } else { '╭' }, '├');
-        } else {
-            canvas.under(mid, y0, '─');
-        }
-        canvas.put(to_x.saturating_sub(1), y1, '▶');
+        svg.polyline(
+            &[(from_x, y0), (mid, y0), (mid, y1), (to_x - HEAD_ROOM, y1)],
+            false,
+        );
+        svg.arrowhead(to_x, y1, 1.0, 0.0);
 
         if let Some(label) = edge.label.as_deref() {
-            // Beside the arrowhead and one row above it: clear of the
-            // connector, which cut a centred label in half, and on a
-            // row of its own, which two edges leaving the same box
-            // were not — both labels landed on one row and the second
-            // was written over the first.
-            let at = to_x.saturating_sub(1 + label.chars().count());
-            canvas.label(at, y1.saturating_sub(1), label);
+            // Just past the bend and above the line it belongs to, so
+            // two edges leaving one box do not label the same spot.
+            labels.push(Label {
+                x: mid + 0.5,
+                row: y1 - 1.0,
+                text: label.to_string(),
+                centred: false,
+                faint: true,
+            });
         }
     }
-    Some(canvas.into_lines())
+    Some(Diagram {
+        svg: svg.finish(width, height),
+        labels,
+        cols: width,
+        rows: height,
+    })
 }
 
 /// Sequence diagrams: participants across the top, time down.
@@ -1126,7 +1157,7 @@ fn draw_horizontal(
 /// no layering to work out. It is here because `sequenceDiagram` is the
 /// other half of what a project's documentation actually contains.
 mod sequence {
-    use super::Canvas;
+    use super::{Label, Svg};
 
     /// How a message's line is drawn.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1148,7 +1179,7 @@ mod sequence {
     /// Cells between one participant's box and the next.
     const GAP: usize = 3;
 
-    pub fn render(source: &str, columns: usize) -> Option<Vec<String>> {
+    pub fn render(source: &str, columns: usize, aspect: f32) -> Option<super::Diagram> {
         let (names, messages) = parse(source)?;
         if names.is_empty() || messages.is_empty() {
             return None;
@@ -1166,8 +1197,8 @@ mod sequence {
             x += width + GAP;
         }
 
-        // The canvas is widened to fit the longest message rather than
-        // the text being cut at the next lifeline. A message clipped to
+        // Widened to fit the longest message rather than the text
+        // being cut at the next lifeline. A message clipped to
         // `UNAVAILABLE + l` has lost the part that mattered.
         let needed = messages
             .iter()
@@ -1189,11 +1220,14 @@ mod sequence {
         // Three rows per message: its text, its arrow, and air.
         let head = 3;
         let height = head + messages.len() * 3 + 1;
-        let mut canvas = Canvas::new(width, height);
+        let mut svg = Svg::new(aspect);
+        let mut labels: Vec<Label> = Vec::new();
 
         let mut x = 0;
         for (i, name) in names.iter().enumerate() {
-            canvas.boxed(
+            super::shape(
+                &mut svg,
+                &mut labels,
                 x,
                 0,
                 &super::Node {
@@ -1207,62 +1241,65 @@ mod sequence {
             x += widths[i] + GAP;
         }
 
+        // Lifelines run from under the boxes to the foot of the
+        // picture, in one stroke each rather than per message row.
+        for line in &lifelines {
+            svg.polyline(
+                &[
+                    (*line as f32, head as f32 - 0.5),
+                    (*line as f32, height as f32 - 0.5),
+                ],
+                true,
+            );
+        }
+
         for (i, message) in messages.iter().enumerate() {
             let row = head + i * 3;
-            let (a, b) = (lifelines[message.from], lifelines[message.to]);
-            let arrow = row + 1;
+            let (a, b) = (lifelines[message.from] as f32, lifelines[message.to] as f32);
+            let arrow = row as f32 + 1.5;
 
-            // The text goes down before the lifelines, which are then
-            // drawn only where it is not. The other order put a `│`
-            // through every message that reached past one lifeline:
-            // `Set(key, value│`.
             let (text_at, text_row) = if message.from == message.to {
-                (a + 4, arrow)
+                (a + 4.0, arrow)
             } else {
-                (a.min(b) + 2, row)
+                (a.min(b) + 1.0, row as f32 + 0.5)
             };
-            canvas.text(text_at, text_row, &message.text);
+            labels.push(Label {
+                x: text_at,
+                row: text_row,
+                text: message.text.clone(),
+                centred: false,
+                faint: false,
+            });
 
-            // Lifelines run the whole height, under everything, so a
-            // message crossing one stays readable.
-            for line in &lifelines {
-                for y in row..row + 3 {
-                    canvas.under(*line, y, '│');
-                }
-            }
-
+            let dashed = message.line == Line::Dashed;
             if message.from == message.to {
                 // A message to itself turns back on its own lifeline.
-                canvas.put(a + 1, row, '─');
-                canvas.put(a + 2, row, '╮');
-                canvas.put(a + 2, arrow, '│');
-                canvas.put(a + 2, arrow + 1, '╯');
-                canvas.put(a + 1, arrow + 1, '─');
-                canvas.put(a, arrow + 1, '◀');
+                svg.polyline(
+                    &[
+                        (a, arrow - 0.9),
+                        (a + 2.5, arrow - 0.9),
+                        (a + 2.5, arrow + 0.9),
+                        (a + super::HEAD_ROOM, arrow + 0.9),
+                    ],
+                    dashed,
+                );
+                svg.arrowhead(a, arrow + 0.9, -1.0, 0.0);
                 continue;
             }
 
-            let (lo, hi) = (a.min(b), a.max(b));
-            for x in lo + 1..hi {
-                canvas.put(
-                    x,
-                    arrow,
-                    match message.line {
-                        Line::Solid => '─',
-                        // A hyphen rather than a box-drawing dash: it is
-                        // in every font, and a reply that renders as a
-                        // missing glyph is worse than one that is plain.
-                        Line::Dashed => '-',
-                    },
-                );
-            }
-            // The tail is on the sender's side whichever way the
-            // message runs; `├` on the right end of a leftward arrow
-            // pointed the wrong way.
-            canvas.put(a, arrow, if b > a { '├' } else { '┤' });
-            canvas.put(b, arrow, if b > a { '▶' } else { '◀' });
+            let towards = if b > a { 1.0 } else { -1.0 };
+            svg.polyline(
+                &[(a, arrow), (b - towards * super::HEAD_ROOM, arrow)],
+                dashed,
+            );
+            svg.arrowhead(b, arrow, towards, 0.0);
         }
-        Some(canvas.into_lines())
+        Some(super::Diagram {
+            svg: svg.finish(width, height),
+            labels,
+            cols: width,
+            rows: height,
+        })
     }
 
     /// Reads participants and messages, and refuses the rest.
@@ -1368,31 +1405,63 @@ mod sequence {
 mod tests {
     use super::*;
 
+    fn diagram(src: &str) -> Diagram {
+        render(src, 100, 2.0).expect("a diagram")
+    }
+
+    /// What the picture says: one label per line, in drawing order.
+    ///
+    /// The text is no longer part of the drawing — it is handed back
+    /// to be typeset — so this is what used to be read off the
+    /// character canvas, and most of these tests read it the same way.
+    fn words(d: &Diagram) -> String {
+        d.labels
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn drawn(src: &str) -> String {
-        render(src, 100).expect("a flowchart").join("\n")
+        words(&diagram(src))
+    }
+
+    /// The grid row a label sits on, and the cell it starts at.
+    fn at(d: &Diagram, text: &str) -> (usize, f32) {
+        let label = d
+            .labels
+            .iter()
+            .find(|l| l.text == text)
+            .unwrap_or_else(|| panic!("no label {text:?} among:\n{}", words(d)));
+        (label.row as usize, label.x)
+    }
+
+    /// Whether anything in the picture is a filled shape, which only an
+    /// arrowhead is.
+    fn has_arrow(d: &Diagram) -> bool {
+        d.svg.contains("fill=\"currentColor\"")
+    }
+
+    /// Whether anything is dashed, which only a subgraph frame and a
+    /// reply are.
+    fn has_dashes(d: &Diagram) -> bool {
+        d.svg.contains("stroke-dasharray")
     }
 
     #[test]
     fn a_chain_of_boxes_is_drawn_top_to_bottom() {
-        let out = drawn("flowchart TB\n  A[Start] --> B[Finish]\n");
-        assert!(out.contains("Start") && out.contains("Finish"), "{out}");
-        assert!(out.contains('▼'), "the edge should point somewhere:\n{out}");
-        // Start is above Finish.
-        let lines: Vec<&str> = out.lines().collect();
-        let start = lines.iter().position(|l| l.contains("Start")).unwrap();
-        let finish = lines.iter().position(|l| l.contains("Finish")).unwrap();
-        assert!(start < finish, "{out}");
+        let d = diagram("flowchart TB\n  A[Start] --> B[Finish]\n");
+        assert!(has_arrow(&d), "the edge should point somewhere");
+        assert!(at(&d, "Start").0 < at(&d, "Finish").0, "{}", words(&d));
     }
 
     #[test]
     fn left_to_right_puts_them_side_by_side() {
-        let out = drawn("flowchart LR\n  A[One] --> B[Two]\n");
-        let row = out
-            .lines()
-            .find(|l| l.contains("One"))
-            .expect("a row with One");
-        assert!(row.contains("Two"), "both should share a row:\n{out}");
-        assert!(out.contains('▶'), "{out}");
+        let d = diagram("flowchart LR\n  A[One] --> B[Two]\n");
+        let (one, two) = (at(&d, "One"), at(&d, "Two"));
+        assert_eq!(one.0, two.0, "both should share a row");
+        assert!(one.1 < two.1, "and One comes first");
+        assert!(has_arrow(&d));
     }
 
     #[test]
@@ -1414,30 +1483,35 @@ mod tests {
         // A flowchart says what a thing is by the shape it is drawn
         // as, so a decision that looks like a step has thrown the
         // information away.
-        let out =
-            drawn("flowchart TB\n  A[Step] --> B{Choice}\n  B --> C(Done)\n  B --> D[(Store)]\n");
-        assert!(out.contains('┌'), "a step is square: {out}");
-        assert!(out.contains('╱'), "a decision is sloped: {out}");
-        assert!(out.contains('╭'), "a terminus is rounded: {out}");
-        assert!(
-            out.contains('├') && out.contains('┤'),
-            "a store has a disc across its top: {out}"
-        );
+        let shapes: Vec<String> = ["A[Step]", "A{Choice}", "A(Done)", "A[(Store)]"]
+            .iter()
+            .map(|node| diagram(&format!("flowchart TB\n  {node} --> B[Next]\n")).svg)
+            .collect();
+        for (i, a) in shapes.iter().enumerate() {
+            for (j, b) in shapes.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "shapes {i} and {j} are drawn the same way");
+            }
+        }
+        assert!(shapes[0].contains("rx=\"0.00\""), "a step is square");
+        assert!(shapes[1].contains("<path"), "a decision is a polygon");
+        assert!(shapes[2].contains("rx=\"0.90\""), "a terminus is rounded");
     }
 
     #[test]
     fn a_store_is_taller_than_the_box_beside_it() {
-        // The disc is a row of its own, so the layout has to give it
-        // one — a box drawn taller than the row it was placed in
-        // writes through whatever is under it.
-        let out = drawn("flowchart LR\n  A[Step] --> B[(Store)]\n");
-        for row in out.lines() {
-            assert!(
-                !row.contains("Step") || !row.contains("Store"),
-                "the two sit on different rows of their boxes: {out}"
-            );
-        }
-        assert!(out.contains("Step") && out.contains("Store"), "{out}");
+        // The disc across its top is a row of its own, so the layout
+        // has to give it one.
+        let node = |token: &str| {
+            let (_, lines, shape) = node_parts(token).expect("a node");
+            Node {
+                lines: lines.expect("a label"),
+                shape,
+                layer: 0,
+                order: 0,
+                centre: 0,
+            }
+        };
+        assert!(box_height(&node("A[(Store)]")) > box_height(&node("A[Step]")));
     }
 
     #[test]
@@ -1456,11 +1530,12 @@ mod tests {
 
     #[test]
     fn a_subgraph_groups_its_nodes_inside_a_frame() {
-        let out = drawn(
+        let d = diagram(
             "flowchart TB\n  subgraph clients [Clients]\n    A[One]\n    B[Two]\n  end\n  A --> C[Out]\n",
         );
+        let out = words(&d);
         assert!(out.contains("Clients"), "the group is named: {out}");
-        assert!(out.contains('╎'), "and framed: {out}");
+        assert!(has_dashes(&d), "and framed: {}", d.svg);
         for name in ["One", "Two", "Out"] {
             assert!(out.contains(name), "{name} missing:\n{out}");
         }
@@ -1468,12 +1543,14 @@ mod tests {
 
     #[test]
     fn a_frame_is_dropped_rather_than_drawn_round_the_wrong_nodes() {
-        // `B` is not in the group but shares its layer, so a frame round
-        // the group's bounding box would enclose it and say something
-        // false. The nodes are still drawn.
-        let out =
-            drawn("flowchart TB\n  subgraph g [G]\n    A[Aaa]\n  end\n  B[Bbb]\n  A --> C[Ccc]\n");
-        assert!(!out.contains('╎'), "no frame should be drawn:\n{out}");
+        // `B` is not in the group but shares its layer, so a frame
+        // round the group's bounding box would enclose it and say
+        // something false. The nodes are still drawn.
+        let d = diagram(
+            "flowchart TB\n  subgraph g [G]\n    A[Aaa]\n  end\n  B[Bbb]\n  A --> C[Ccc]\n",
+        );
+        assert!(!has_dashes(&d), "no frame should be drawn:\n{}", d.svg);
+        let out = words(&d);
         for name in ["Aaa", "Bbb", "Ccc"] {
             assert!(out.contains(name), "{name} missing:\n{out}");
         }
@@ -1481,33 +1558,23 @@ mod tests {
 
     #[test]
     fn a_quoted_label_breaks_where_it_says_to_break() {
-        let out = drawn("flowchart TB\n  A[\"Node 0 (leader)\\ngRPC\"] --> B[Next]\n");
+        let d = diagram("flowchart TB\n  A[\"Node 0 (leader)\\ngRPC\"] --> B[Next]\n");
+        let out = words(&d);
         assert!(!out.contains('\\'), "the escape should not survive:\n{out}");
         assert!(!out.contains('"'), "nor the quotes:\n{out}");
         // Two rows of one box, not one row saying something the author
         // did not write.
-        let rows: Vec<&str> = out.lines().collect();
-        let first = rows
-            .iter()
-            .position(|r| r.contains("Node 0 (leader)"))
-            .expect("the first line of the label");
-        assert!(
-            rows[first + 1].contains("gRPC"),
-            "the second line belongs under the first:\n{out}"
-        );
-        assert!(!rows[first].contains("gRPC"), "and not beside it:\n{out}");
+        let first = at(&d, "Node 0 (leader)");
+        let second = at(&d, "gRPC");
+        assert_eq!(second.0, first.0 + 1, "the second line is under the first");
+        assert_eq!(second.1, first.1, "and in the same box");
     }
 
     #[test]
     fn a_br_tag_breaks_a_label_too() {
-        let out = drawn("flowchart TB\n  A[One<br/>Two] --> B[Next]\n");
-        let rows: Vec<&str> = out.lines().collect();
-        let first = rows
-            .iter()
-            .position(|r| r.contains("One"))
-            .expect("the first line");
-        assert!(rows[first + 1].contains("Two"), "{out}");
-        assert!(!out.contains("<br"), "the tag itself is not text:\n{out}");
+        let d = diagram("flowchart TB\n  A[One<br/>Two] --> B[Next]\n");
+        assert_eq!(at(&d, "Two").0, at(&d, "One").0 + 1);
+        assert!(!words(&d).contains("<br"), "the tag itself is not text");
     }
 
     #[test]
@@ -1515,11 +1582,8 @@ mod tests {
         // `<-->` says two nodes are connected, not that one comes
         // before the other. Ranking it put the peers of a cluster on
         // three separate rows.
-        let out = drawn("flowchart TB\n  A[Aaa] <--> B[Bbb]\n");
-        let rows: Vec<&str> = out.lines().collect();
-        let a = rows.iter().position(|r| r.contains("Aaa")).expect("Aaa");
-        let b = rows.iter().position(|r| r.contains("Bbb")).expect("Bbb");
-        assert_eq!(a, b, "both on one row:\n{out}");
+        let d = diagram("flowchart TB\n  A[Aaa] <--> B[Bbb]\n");
+        assert_eq!(at(&d, "Aaa").0, at(&d, "Bbb").0, "both on one row");
     }
 
     #[test]
@@ -1527,57 +1591,60 @@ mod tests {
         // `C` is only reachable by a two-headed arrow, so nothing ranks
         // it and it would sit at the top on its own — leaving the
         // subgraph round it unable to frame anything honestly.
-        let source = "flowchart TB\n               subgraph g [Group]\n    A[Aaa]\n    C[Ccc]\n  end\n               Z[Zzz] --> A\n  A <--> C\n";
-        let out = drawn(source);
-        let rows: Vec<&str> = out.lines().collect();
-        let a = rows.iter().position(|r| r.contains("Aaa")).expect("Aaa");
-        let c = rows.iter().position(|r| r.contains("Ccc")).expect("Ccc");
-        assert_eq!(a, c, "members share a row:\n{out}");
-        assert!(out.contains("Group"), "and the frame is drawn:\n{out}");
-        assert!(out.contains('╎'), "with sides:\n{out}");
-    }
-
-    #[test]
-    fn an_arrow_into_a_subgraph_does_not_land_on_its_title() {
-        // The arrowhead used to arrive on the frame's top border:
-        // `Raft Cluster` came out as `Raft Cl▼ster`.
-        let source = "flowchart TB\n               Z[Zzz] --> A\n  subgraph g [Raft Cluster]\n    A[Aaa]\n  end\n";
-        let out = drawn(source);
-        assert!(out.contains("Raft Cluster"), "the title survives:\n{out}");
-        assert!(out.contains('▼'), "and the arrow still arrives:\n{out}");
-    }
-
-    #[test]
-    fn a_label_never_lands_on_top_of_a_box() {
-        // An arrow routed past a box used to write its corners through
-        // the label: `Node 0 (leader)` came out as `N┴de╮0 (leader)`.
-        let out = drawn(
-            "flowchart TB\n  A[Aaaaaaaaaa] --> B[Bbbbbbbbbb]\n  B --> C[Cccccccccc]\n  A --> C\n",
+        let d = diagram(
+            "flowchart TB\n  subgraph g [Group]\n    A[Aaa]\n    C[Ccc]\n  end\n  \
+             Z[Zzz] --> A\n  A <--> C\n",
         );
-        for name in ["Aaaaaaaaaa", "Bbbbbbbbbb", "Cccccccccc"] {
-            assert!(out.contains(name), "{name} was written through:\n{out}");
+        assert_eq!(at(&d, "Aaa").0, at(&d, "Ccc").0, "members share a row");
+        assert!(words(&d).contains("Group"), "and the frame is named");
+        assert!(has_dashes(&d), "and drawn");
+    }
+
+    #[test]
+    fn a_subgraph_title_is_not_crossed_by_its_own_border() {
+        // The border is broken for the title rather than drawn through
+        // it, so the title needs no backing of its own and the frame
+        // still reads as one shape.
+        let d = diagram(
+            "flowchart TB\n  Z[Zzz] --> A\n  subgraph g [Raft Cluster]\n    A[Aaa]\n  end\n",
+        );
+        let title = at(&d, "Raft Cluster");
+        assert!(has_dashes(&d), "the frame is drawn");
+        assert!(has_arrow(&d), "and the edge still arrives");
+        assert!(
+            title.0 < at(&d, "Aaa").0,
+            "the title sits above what it names"
+        );
+    }
+
+    #[test]
+    fn every_node_is_named_exactly_once() {
+        // Three layers, so an edge from the first to the third is
+        // routed past the middle one — which on a character grid used
+        // to write through its label.
+        let d = diagram("flowchart TB\n  A[Aaa] --> B[Bbb]\n  B --> C[Ccc]\n  A --> C\n");
+        for name in ["Aaa", "Bbb", "Ccc"] {
+            let found = d.labels.iter().filter(|l| l.text == name).count();
+            assert_eq!(found, 1, "{name} appears {found} times");
         }
     }
 
     #[test]
     fn a_sequence_diagram_draws_lifelines_and_messages() {
-        let out = drawn(
+        let d = diagram(
             "sequenceDiagram\n  participant C as Client\n  participant S as Server\n\
              \n  C->>S: Set(key)\n  S-->>C: ok\n",
         );
+        let out = words(&d);
         assert!(out.contains("Client") && out.contains("Server"), "{out}");
         assert!(out.contains("Set(key)") && out.contains("ok"), "{out}");
-        assert!(
-            out.contains('▶') && out.contains('◀'),
-            "both directions: {out}"
-        );
-        // A reply is dashed, a call is not.
-        assert!(out.contains('-'), "{out}");
+        assert!(has_arrow(&d), "both messages point somewhere");
+        assert!(has_dashes(&d), "a reply is dashed, and so are lifelines");
     }
 
     #[test]
     fn a_message_is_not_cut_off_at_the_next_lifeline() {
-        // The canvas widens to the longest message instead:
+        // The picture widens to the longest message instead:
         // `UNAVAILABLE + l` had lost the part that mattered.
         let long = "UNAVAILABLE plus a leader-address header";
         let out = drawn(&format!(
@@ -1588,84 +1655,82 @@ mod tests {
 
     #[test]
     fn a_message_to_itself_turns_back_on_its_own_lifeline() {
-        let out = drawn("sequenceDiagram\n  participant R\n  R->>R: replicate\n");
-        assert!(out.contains("replicate"), "{out}");
-        assert!(out.contains('╮') && out.contains('╯'), "{out}");
+        let straight = diagram("sequenceDiagram\n  participant R\n  participant S\n  R->>S: go\n");
+        let loops = diagram("sequenceDiagram\n  participant R\n  R->>R: replicate\n");
+        assert!(words(&loops).contains("replicate"));
+        // A message to itself leaves and comes back, so its run has
+        // corners where a message to someone else is a straight line.
+        let bends = |d: &Diagram| d.svg.matches('L').count();
+        assert!(
+            bends(&loops) > bends(&straight),
+            "a self-message should turn back:\n{}",
+            loops.svg
+        );
     }
 
     #[test]
     fn participants_are_named_by_their_alias_and_in_order() {
-        let out = drawn(
+        let d = diagram(
             "sequenceDiagram\n  participant L as Leader\n  participant F as Follower\n\
              \n  F->>L: hello\n",
         );
-        let header = out.lines().nth(1).expect("the name row");
-        let leader = header.find("Leader").expect("Leader");
-        let follower = header.find("Follower").expect("Follower");
-        assert!(leader < follower, "declared order wins: {header:?}");
+        assert!(
+            at(&d, "Leader").1 < at(&d, "Follower").1,
+            "declared order wins"
+        );
     }
 
     #[test]
     fn what_it_cannot_draw_it_refuses() {
+        let refuse = |src: &str, columns: usize| render(src, columns, 2.0).is_none();
         // Neither of the two diagrams this draws.
-        assert!(render("pie title Pets\n  \"Dogs\" : 1\n", 100).is_none());
-        assert!(render(
+        assert!(refuse("pie title Pets\n  \"Dogs\" : 1\n", 100));
+        assert!(refuse(
             "gantt\n  title A\n  section S\n  Task :a1, 2024-01-01, 30d\n",
             100
-        )
-        .is_none());
-        assert!(render("erDiagram\n  A ||--o{ B : has\n", 100).is_none());
+        ));
+        assert!(refuse("erDiagram\n  A ||--o{ B : has\n", 100));
         // Control flow in a sequence diagram is drawn as nested frames;
         // without them the messages inside would read as though they
         // always happen, which is a different diagram.
-        assert!(render(
+        assert!(refuse(
             "sequenceDiagram\n  loop every minute\n  A->>B: hi\n  end\n",
             100
-        )
-        .is_none());
+        ));
         // And a chart too wide for the column it has.
-        assert!(render("flowchart LR\n  A[aaaaaaaaaaaa] --> B[bbbbbbbbbbbb]\n", 20).is_none());
+        assert!(refuse(
+            "flowchart LR\n  A[aaaaaaaaaaaa] --> B[bbbbbbbbbbbb]\n",
+            20
+        ));
     }
 
     #[test]
     fn a_tinted_box_is_still_a_box() {
-        // Styling is dropped rather than refused: there is no colour on
-        // this grid to honour it with, and refusing threw away the
+        // Styling is dropped rather than refused: there is no palette
+        // here to honour it with, and refusing threw away the
         // structure as well — which is most of what made real charts
         // in a real README come out as their own source.
-        let out = drawn(
+        let d = diagram(
             "flowchart TD\n  A[Client] --> B[Server]\n  B --> C[(Store)]\n\
              \n  style A fill:#f9f,stroke:#333\n  classDef hot fill:#f00\n\
              \n  class B hot\n  click A \"https://example.com\"\n\
              \n  linkStyle 0 stroke:#0f0\n",
         );
+        let out = words(&d);
         for name in ["Client", "Server", "Store"] {
             assert!(
                 out.contains(name),
                 "{name} was dropped with the styling:\n{out}"
             );
         }
-        assert!(out.contains('▼'), "the edges survived too:\n{out}");
+        assert!(has_arrow(&d), "the edges survived too");
     }
 
     #[test]
     fn an_ampersand_is_every_edge_between_the_two_sides() {
-        let out = drawn("flowchart TD\n  A & B --> C\n");
-        for name in ["A", "B", "C"] {
-            assert!(out.contains(name), "{name} is a node:\n{out}");
-        }
-        // Two boxes on the top layer and one underneath, which is what
-        // two edges into one node looks like.
-        let rows: Vec<&str> = out.lines().collect();
-        let top = rows
-            .iter()
-            .position(|r| r.contains('A'))
-            .expect("the first layer");
-        assert!(rows[top].contains('B'), "A and B share a layer:\n{out}");
-        assert!(
-            rows.iter().skip(top).any(|r| r.contains('C')),
-            "C is below them:\n{out}"
-        );
+        let d = diagram("flowchart TD\n  A & B --> C\n");
+        assert_eq!(at(&d, "A").0, at(&d, "B").0, "A and B share a layer");
+        assert!(at(&d, "C").0 > at(&d, "A").0, "C is below them");
     }
 
     #[test]
@@ -1676,18 +1741,28 @@ mod tests {
 
     #[test]
     fn an_unknown_direction_is_refused_rather_than_guessed() {
-        assert!(render("flowchart XY\n  A --> B\n", 100).is_none());
+        assert!(render("flowchart XY\n  A --> B\n", 100, 2.0).is_none());
         // But a missing one is top-down, as Mermaid says.
-        assert!(render("flowchart\n  A --> B\n", 100).is_some());
+        assert!(render("flowchart\n  A --> B\n", 100, 2.0).is_some());
     }
 
     #[test]
-    fn a_box_is_never_drawn_over_by_an_arrow() {
-        // Three layers, so an edge from the first to the third has to be
-        // routed past the middle one.
-        let out = drawn("flowchart TB\n  A[Aaa] --> B[Bbb]\n  B --> C[Ccc]\n  A --> C\n");
-        for name in ["Aaa", "Bbb", "Ccc"] {
-            assert!(out.contains(name), "{name} was drawn over:\n{out}");
-        }
+    fn the_picture_fits_the_rows_it_says_it_takes() {
+        // The preview counts a figure's rows to scroll past it, so a
+        // picture taller than it claims would overlap what follows.
+        let d = diagram("flowchart TB\n  A[Aaa] --> B[Bbb]\n  B --> C[Ccc]\n");
+        let height: f32 = d.rows as f32 * 2.0;
+        let viewbox = d
+            .svg
+            .split("viewBox=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("a viewBox");
+        let parts: Vec<f32> = viewbox
+            .split_whitespace()
+            .map(|n| n.parse().expect("a number"))
+            .collect();
+        assert_eq!(parts[2], d.cols as f32, "width in cells");
+        assert_eq!(parts[3], height, "height in rows times the aspect");
     }
 }

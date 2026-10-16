@@ -44,6 +44,76 @@ fn extension(path: &Path) -> Option<String> {
 /// How wide an SVG with no intrinsic size is rasterised.
 const SVG_DEFAULT: f32 = 1024.0;
 
+/// Rasterises SVG markup at a given pixel size and uploads it.
+///
+/// A diagram is drawn as shapes rather than characters, and this is
+/// where the shapes become pixels. Sized by the caller rather than by
+/// the markup: a figure fills the width it was laid out for, and
+/// rasterising at that size is what keeps the strokes crisp instead of
+/// scaling a smaller bitmap up.
+pub fn rasterise(
+    renderer: &Renderer,
+    svg: &str,
+    width: u32,
+    height: u32,
+    ink: lithe_gpu::Rgba,
+) -> Option<ImageView> {
+    let (width, height) = (width.clamp(1, MAX_PIXELS), height.clamp(1, MAX_PIXELS));
+    // The shapes are written in `currentColor`, which an SVG outside a
+    // document has nothing to resolve against — resvg falls back to
+    // black, and black lines on a dark theme are no lines at all. The
+    // theme's colour is substituted here, where it is known, rather
+    // than baked in where the picture was laid out.
+    let svg = svg.replace("currentColor", &hex(ink));
+    let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+        .map_err(|e| log::debug!("diagram will not parse: {e}"))
+        .ok()?;
+    let size = tree.size();
+    if size.width() <= 0.0 || size.height() <= 0.0 {
+        return None;
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(
+            width as f32 / size.width(),
+            height as f32 / size.height(),
+        ),
+        &mut pixmap.as_mut(),
+    );
+    let image = renderer
+        .upload_image(&straight(pixmap.take()), width, height)
+        .map_err(|e| log::debug!("diagram will not upload: {e}"))
+        .ok()?;
+    Some(ImageView {
+        image,
+        width,
+        height,
+    })
+}
+
+/// `#rrggbb` for an SVG attribute. Alpha is left to the stroke's own
+/// opacity, which the markup sets.
+fn hex(colour: lithe_gpu::Rgba) -> String {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let [r, g, b, _] = colour.0;
+    format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))
+}
+
+/// tiny-skia gives premultiplied RGBA; the shader blends straight
+/// alpha, so this has to be undone or every edge darkens.
+fn straight(mut rgba: Vec<u8>) -> Vec<u8> {
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a != 0 && a != 255 {
+            for channel in px.iter_mut().take(3) {
+                *channel = ((*channel as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    rgba
+}
+
 /// Rasterises an SVG and uploads the result.
 ///
 /// Vector art goes down the same path as a photograph: once it is pixels
@@ -72,18 +142,7 @@ fn load_svg(renderer: &Renderer, path: &Path) -> Result<ImageView, String> {
         &mut pixmap.as_mut(),
     );
 
-    // tiny-skia gives premultiplied RGBA; the shader blends straight
-    // alpha, so this has to be undone or every edge darkens.
-    let mut rgba = pixmap.take();
-    for px in rgba.chunks_exact_mut(4) {
-        let a = px[3] as u32;
-        if a != 0 && a != 255 {
-            for channel in px.iter_mut().take(3) {
-                *channel = ((*channel as u32 * 255 + a / 2) / a).min(255) as u8;
-            }
-        }
-    }
-
+    let rgba = straight(pixmap.take());
     let image = renderer
         .upload_image(&rgba, width, height)
         .map_err(|e| format!("{e}"))?;

@@ -467,11 +467,43 @@ with the pointer elsewhere, nothing did, and the window stayed blank
 until it was clicked. `Focused(true)` and `Occluded(false)` — the two
 events that mean the window is really on screen — now redraw.
 
-The Mermaid canvas locks the cells a box owns. Checking for a blank cell
-is not enough, because a box's own characters are not blank: an arrow
-routed past one wrote its corners straight through the label, and
-`Node 0 (leader)` came out as `N┴de╮0 (leader)`. Only box drawing may
-write to a locked cell.
+Diagrams are drawn as shapes, not as box-drawing characters. The
+layout is still the same grid — a figure takes whole rows of the
+preview, so the rows it takes have to be countable before anything is
+drawn — but the painting emits SVG, which is rasterised through the
+same resvg path an `.svg` file already goes down and shown as a
+picture.
+
+That removes a whole class of bug rather than fixing one. A character
+canvas had to lock the cells a box owned, because an arrow routed past
+one wrote its corners through the label and `Node 0 (leader)` came out
+as `N┴de╮0 (leader)`; it had to turn a corner into a tee where two
+edges met; it had to find a clear cell for every label. A stroke
+simply overlaps a stroke, so an edge is one rounded polyline and none
+of that machinery exists any more.
+
+The text is deliberately *not* in the SVG. Putting it there would mean
+handing a font database to the rasteriser — scanning every font on the
+machine at startup, for a picture that is mostly lines — and the
+labels would then be set by a different engine from the prose around
+them. The diagram hands back its labels in grid coordinates and lithe
+typesets them with the same atlas as everything else, in the mono face
+the box widths were measured in.
+
+`currentColor` is substituted for the theme's ink when the picture is
+rasterised rather than when it is laid out. An SVG outside a document
+has nothing to resolve `currentColor` against, so resvg falls back to
+black, and black lines on a dark theme are no lines at all.
+
+Figures are cached by the markup they were drawn from and the width
+they were drawn at, so a re-render that moves a diagram down the page
+reuses the picture and a resize is the one thing that redraws it. The
+cache is pruned to what the page still shows, or a resize would leave
+every old size on the GPU.
+
+A subgraph's border is broken for its title rather than drawn through
+it, so the title needs no backing of its own and the frame still reads
+as one shape.
 
 Subgraphs are flattened into the layering and framed afterwards, which
 is what lets the layering stay one simple pass. The frame is skipped
