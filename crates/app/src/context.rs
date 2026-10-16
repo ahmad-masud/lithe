@@ -894,6 +894,21 @@ mod diff_menu_tests {
         assert!(!actions(&menu).contains(&Action::RevertHunk));
     }
 
+    /// The row a point lands on, as `hit_test` works it out, is what
+    /// the pointer has to be able to select — so the two have to agree
+    /// about which rows are choices.
+    #[test]
+    fn every_row_the_pointer_can_land_on_is_a_choice_or_a_separator() {
+        let menu = menu(true);
+        for (index, entry) in menu.entries.iter().enumerate() {
+            assert_eq!(
+                entry.action.is_none(),
+                entry.is_separator(),
+                "row {index} must be one or the other"
+            );
+        }
+    }
+
     #[test]
     fn the_menu_never_opens_on_a_separator() {
         for revertible in [true, false] {

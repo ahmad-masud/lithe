@@ -4185,6 +4185,51 @@ mod tests {
         }
     }
 
+    /// Hovering highlights the row `hit_test` names, and the band is
+    /// drawn where `draw_context_menu` puts it. The two work the row
+    /// out separately, so a test that a point inside a row comes back
+    /// as that row is what keeps the highlight under the pointer.
+    #[test]
+    fn a_point_inside_a_menu_row_hit_tests_as_that_row() {
+        let Ok(r) = Renderer::offscreen(900, 600, 1.0, 16.0) else {
+            return;
+        };
+        let ws = Workspace::empty(None);
+        let l = layout(&r, &ws, Chrome::default());
+        let menu = ContextMenu::for_diff(
+            (120.0, 80.0),
+            std::path::PathBuf::from("/w/a.rs"),
+            0,
+            crate::context::DiffRow {
+                revertible: true,
+                ..Default::default()
+            },
+        );
+        let panels = Panels {
+            context: Some(&menu),
+            ..probe_panels(&ws)
+        };
+        let (x, y, width, _) = context_bounds(&l, &menu);
+
+        for index in 0..menu.entries.len() {
+            // The middle of the row, as the drawing lays it out.
+            let row_y = y + 2.0 + index as f32 * l.cell.line_height;
+            let at = row_y + l.cell.line_height / 2.0;
+            assert_eq!(
+                hit_test(&l, &panels, x + width / 2.0, at),
+                Hit::Context(index),
+                "row {index} is drawn at {row_y} and hit-tests elsewhere"
+            );
+        }
+
+        // And a point outside it dismisses rather than choosing.
+        assert_eq!(
+            hit_test(&l, &panels, x - 4.0, y + 4.0),
+            Hit::Elsewhere,
+            "beside the menu is not in it"
+        );
+    }
+
     #[test]
     fn the_cmd_underline_sits_under_the_name_and_nothing_else() {
         const W: u32 = 700;

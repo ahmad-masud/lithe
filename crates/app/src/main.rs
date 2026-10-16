@@ -661,6 +661,36 @@ impl Pane {
         (!text.trim().is_empty()).then_some(text)
     }
 
+    /// Moves an open menu's selection to the entry under the pointer.
+    ///
+    /// A menu's highlight *is* its selection: hovering an entry makes
+    /// it the one Return would take, which is what every other menu on
+    /// the machine does. A separate hover tint would put two
+    /// highlights on screen and two answers to what Return picks.
+    ///
+    /// Returns whether it moved, because every pixel of pointer
+    /// movement comes through here and only a change is worth a frame.
+    fn hover_menu(&mut self, over: view::Hit) -> bool {
+        let Hit::Context(row) = over else {
+            return false;
+        };
+        let Some(menu) = self.context.as_mut() else {
+            return false;
+        };
+        // A separator is not a choice, so passing over one leaves the
+        // selection where it was rather than landing on something
+        // Return cannot take.
+        let choosable = menu
+            .entries
+            .get(row)
+            .is_some_and(|entry| !entry.is_separator());
+        if !choosable || menu.selected == row {
+            return false;
+        }
+        menu.selected = row;
+        true
+    }
+
     /// Takes down the tooltip, and re-arms the dwell.
     ///
     /// Called from everything that means the pointer is no longer just
@@ -5251,7 +5281,12 @@ impl ApplicationHandler<Wake> for App {
 
                 // Moving re-starts the dwell, and takes down a tooltip
                 // once the pointer has left the character it was about.
-                if pane.set_hovered(over) {
+                // Both, always: the hover state has to keep up whether
+                // or not the menu moved, so neither call may be
+                // short-circuited away by the other.
+                let hovered = pane.set_hovered(over);
+                let picked = pane.hover_menu(over);
+                if hovered || picked {
                     pane.redraw();
                 }
                 if pane.refresh_cmd_link(cmd, &live) {
@@ -7666,5 +7701,90 @@ mod cmd_link_tests {
         let doc = TextBuffer::from_text("");
         assert_eq!(name_at(&doc, 0), None);
         assert_eq!(name_at(&doc, 7), None, "past the end");
+    }
+}
+
+#[cfg(test)]
+mod menu_hover_tests {
+    use crate::context::{ContextMenu, DiffRow};
+    use crate::view::Hit;
+    use std::path::PathBuf;
+
+    /// `hover_menu` without a pane: the rule it applies, on the menu
+    /// itself, which is the part worth pinning.
+    fn moved(menu: &mut ContextMenu, row: usize) -> bool {
+        let choosable = menu
+            .entries
+            .get(row)
+            .is_some_and(|entry| !entry.is_separator());
+        if !choosable || menu.selected == row {
+            return false;
+        }
+        menu.selected = row;
+        true
+    }
+
+    fn diff_menu() -> ContextMenu {
+        ContextMenu::for_diff(
+            (0.0, 0.0),
+            PathBuf::from("/w/a.rs"),
+            0,
+            DiffRow {
+                revertible: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_pointer_moves_the_selection_to_the_row_it_is_over() {
+        let mut menu = diff_menu();
+        let last = menu
+            .entries
+            .iter()
+            .rposition(|e| !e.is_separator())
+            .expect("a choosable row");
+        assert!(moved(&mut menu, last), "a new row moves the selection");
+        assert_eq!(menu.selected, last);
+    }
+
+    #[test]
+    fn resting_on_the_row_already_selected_asks_for_no_frame() {
+        let mut menu = diff_menu();
+        let at = menu.selected;
+        assert!(
+            !moved(&mut menu, at),
+            "every pixel of movement comes through here"
+        );
+    }
+
+    #[test]
+    fn passing_over_a_separator_leaves_the_selection_alone() {
+        let mut menu = diff_menu();
+        let bar = menu
+            .entries
+            .iter()
+            .position(|e| e.is_separator())
+            .expect("the menu has a separator");
+        let before = menu.selected;
+        assert!(!moved(&mut menu, bar), "a separator is not a choice");
+        assert_eq!(menu.selected, before);
+    }
+
+    #[test]
+    fn a_row_past_the_end_selects_nothing() {
+        let mut menu = diff_menu();
+        let (before, past) = (menu.selected, menu.entries.len() + 3);
+        assert!(!moved(&mut menu, past));
+        assert_eq!(menu.selected, before);
+    }
+
+    #[test]
+    fn a_hit_that_is_not_a_menu_row_is_not_a_menu_move() {
+        // `hover_menu` reads the hit, so anything else has to fall
+        // straight through — otherwise moving over the tree with a
+        // menu open would reach into it.
+        assert!(!matches!(Hit::Tree(2), Hit::Context(_)));
+        assert!(matches!(Hit::Context(2), Hit::Context(_)));
     }
 }

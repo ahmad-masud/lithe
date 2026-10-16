@@ -278,6 +278,17 @@ Both queries are bounded to the visible rows, like the editor's. The
 mapping is the diff row's line number, which the editable diff already
 had to carry for the caret.
 
+A menu's highlight is its selection. Moving the pointer over an entry
+makes it the one Return would take, rather than tinting it the way a
+hovered tree row is tinted: two highlights on screen would be two
+answers to what Return picks. The pointer passes over a separator
+without taking the selection with it, since a separator is not
+something Return could choose.
+
+Hit-testing and drawing work a menu row out separately, so a test
+pins them together: the middle of where each entry is drawn has to
+hit-test as that entry, or the highlight sits under the wrong one.
+
 A change in a diff can be put back on its own, from a right-click on
 either column. Two things make that cheap. The first is that a change
 is already a run of added and removed lines in the list the diff is
