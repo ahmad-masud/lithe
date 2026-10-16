@@ -467,6 +467,23 @@ with the pointer elsewhere, nothing did, and the window stayed blank
 until it was clicked. `Focused(true)` and `Occluded(false)` — the two
 events that mean the window is really on screen — now redraw.
 
+The preview scrolls in rows, and a line is not a row. The scrollbar
+and the scroll limit always counted rows; four other places read the
+same number as a line index and took its fraction as a sub-row slip.
+That was close enough while every line was a row or two — a heading
+made it drift by one — and it broke outright once a figure could be
+thirty rows tall on one line: a notch of the wheel skipped the whole
+diagram, so it appeared and vanished all at once instead of sliding
+in. One function now walks the lines accumulating their heights and
+answers which line the window starts on and how far into it, and
+drawing, link hit-testing, fence hit-testing and text hit-testing all
+ask it.
+
+Past the end it answers with a line index one off the end rather than
+the last line, so a caller walking from there draws nothing. Pinning
+the last line to the top instead would mean a document could never be
+scrolled off its own bottom.
+
 The preview is a document, not a terminal with a nice font. Four
 things were giving away where it came from, and all four were the
 grid.

@@ -6824,7 +6824,13 @@ fn snapshot(arg: Option<PathBuf>, out: &std::path::Path, overlay: Option<&str>) 
         git: git_panel.as_ref(),
         sidebar_cols: view::TREE_COLS,
         preview: md.as_deref(),
-        preview_scroll: 0.0,
+        // `LITHE_SCROLL` lets a snapshot be taken part way down a
+        // document, which is the only way to see what scrolling looks
+        // like in a still frame.
+        preview_scroll: std::env::var("LITHE_SCROLL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
         figures: &figures,
         // `--overlay selected` shows a dragged selection.
         preview_sel: (overlay == Some("selected")).then_some((

@@ -894,8 +894,8 @@ pub fn hit_test(l: &Layout, panels: &Panels<'_>, x: f32, y: f32) -> Hit {
     // found by walking them rather than by dividing.
     if let Some(preview) = panels.preview.filter(|p| !p.is_empty()) {
         if x >= l.tree_w && y >= l.text_y {
-            let top = panels.preview_scroll.max(0.0) as usize;
-            let slip = (panels.preview_scroll.max(0.0).fract() * l.cell.line_height).round();
+            let (top, into) = preview_start(preview, panels.preview_scroll);
+            let slip = (into * l.cell.line_height).round();
             let mut row_y = l.text_y + l.cell.line_height - slip;
             for (offset, line) in preview.iter().skip(top).enumerate() {
                 let height = line.rows() as f32 * l.cell.line_height;
@@ -2536,8 +2536,8 @@ pub fn preview_link_at(
         return None;
     }
     let page = preview_page(l, measure);
-    let top = scroll.max(0.0) as usize;
-    let slip = (scroll.max(0.0).fract() * l.cell.line_height).round();
+    let (top, into) = preview_start(lines, scroll);
+    let slip = (into * l.cell.line_height).round();
     let mut row_y = l.text_y + l.cell.line_height - slip;
     for line in lines.iter().skip(top) {
         if row_y > l.text_y + l.text_h {
@@ -2594,16 +2594,17 @@ pub fn preview_char_at(
         line,
         char: lines[line].len_chars(),
     };
+    let (top, into) = preview_start(lines, scroll);
     if y < l.text_y {
+        // Above the window is the start of what it is showing.
         return Some(PreviewPos {
-            line: scroll.max(0.0) as usize,
+            line: top.min(lines.len() - 1),
             char: 0,
         });
     }
 
     let page = preview_page(l, measure);
-    let top = (scroll.max(0.0) as usize).min(lines.len() - 1);
-    let slip = (scroll.max(0.0).fract() * l.cell.line_height).round();
+    let slip = (into * l.cell.line_height).round();
     let mut row_y = l.text_y + l.cell.line_height - slip;
     let mut last = top;
     for (offset, line) in lines.iter().enumerate().skip(top) {
@@ -2752,7 +2753,7 @@ fn draw_preview(
     let (scroll, sel) = (scene.preview_scroll, scene.preview_sel);
     use lithe_gpu::Size;
 
-    let top = scroll.max(0.0) as usize;
+    let (top, into) = preview_start(lines, scroll);
     let page = {
         let mut measure = Measured { frame: f };
         preview_page(l, &mut measure)
@@ -2765,7 +2766,7 @@ fn draw_preview(
     // the ones above it rather than its index times the line height. The
     // fractional part of the scroll still slips by one body row, which is
     // what a wheel notch means.
-    let slip = (scroll.max(0.0).fract() * l.cell.line_height).round();
+    let slip = (into * l.cell.line_height).round();
     let mut y = l.text_y + top_margin - slip;
     let bottom = l.text_y + l.text_h;
 
@@ -3047,6 +3048,30 @@ fn draw_preview(
             theme.scrollbar_thumb,
         );
     }
+}
+
+/// Where a scroll position lands: which line the view starts on, and
+/// how many of that line's rows are above the top of the window.
+///
+/// The preview scrolls in rows — the scrollbar and the scroll limit
+/// both count them — but a line is not a row. A heading is two, and a
+/// figure is as many as the picture is tall. Treating the scroll
+/// position as a line index was close enough while everything was one
+/// row or two; past a thirty-row diagram, one notch of the wheel
+/// skipped the whole figure and it appeared and vanished all at once.
+fn preview_start(lines: &[MdLine], scroll: f32) -> (usize, f32) {
+    let mut left = scroll.max(0.0);
+    for (index, line) in lines.iter().enumerate() {
+        let height = line.rows() as f32;
+        if left < height {
+            return (index, left);
+        }
+        left -= height;
+    }
+    // Past everything: a line index one off the end, so a caller
+    // walking from here draws nothing rather than pinning the last
+    // line to the top of the window.
+    (lines.len(), 0.0)
 }
 
 /// How many grid rows a rendered preview occupies.
@@ -5420,6 +5445,96 @@ mod preview_selection_tests {
 
     fn at(line: usize, char: usize) -> PreviewPos {
         PreviewPos { line, char }
+    }
+
+    /// Lines of the given heights: a body line, a heading, a figure
+    /// as tall as a real diagram, and a body line after it.
+    fn tall_page() -> Vec<MdLine> {
+        let figure = crate::mermaid::Diagram {
+            svg: String::new(),
+            labels: Vec::new(),
+            cols: 40,
+            rows: 30,
+        };
+        vec![
+            line(0, "before"),
+            MdLine {
+                scale: crate::markdown::Scale::Huge,
+                ..line(0, "a heading")
+            },
+            MdLine {
+                figure: Some(std::sync::Arc::new(figure)),
+                ..MdLine::default()
+            },
+            line(0, "after"),
+        ]
+    }
+
+    /// The preview scrolls in rows, and a line is not a row. Reading
+    /// the scroll position as a line index was close enough while
+    /// everything was a row or two; past a thirty-row diagram one
+    /// notch of the wheel skipped the whole figure, so it appeared and
+    /// vanished all at once instead of sliding in.
+    #[test]
+    fn scrolling_counts_rows_not_lines() {
+        let page = tall_page();
+        assert_eq!(
+            page.iter().map(MdLine::rows).collect::<Vec<_>>(),
+            [1, 2, 30, 1]
+        );
+
+        for (scroll, want) in [
+            (0.0, (0, 0.0)),
+            (0.5, (0, 0.5)),
+            (1.0, (1, 0.0)),
+            (2.0, (1, 1.0)),
+            (3.0, (2, 0.0)),
+            // Seven rows into the figure — where reading the scroll as
+            // a line index would have run off the end of the document.
+            (10.0, (2, 7.0)),
+            (32.5, (2, 29.5)),
+            (33.0, (3, 0.0)),
+        ] {
+            assert_eq!(preview_start(&page, scroll), want, "at scroll {scroll}");
+        }
+    }
+
+    #[test]
+    fn a_figure_slides_in_a_row_at_a_time() {
+        // What the bug looked like: the y a figure is drawn at has to
+        // move by exactly one row for one row of scroll, all the way
+        // through it, rather than jumping when the line index changes.
+        let page = tall_page();
+        let top_of_figure = |scroll: f32| -> f32 {
+            let (start, into) = preview_start(&page, scroll);
+            let mut rows = -into;
+            for line in page.iter().skip(start) {
+                if line.figure.is_some() {
+                    return rows;
+                }
+                rows += line.rows() as f32;
+            }
+            f32::MIN
+        };
+        let mut previous = top_of_figure(0.0);
+        assert_eq!(previous, 3.0, "three rows down to begin with");
+        for step in 1..=30 {
+            let now = top_of_figure(step as f32 * 0.5);
+            let moved = previous - now;
+            assert!(
+                (moved - 0.5).abs() < 0.001,
+                "half a row of scroll moved the figure {moved} rows"
+            );
+            previous = now;
+        }
+    }
+
+    #[test]
+    fn scrolling_past_the_end_shows_nothing() {
+        let page = tall_page();
+        let (line, into) = preview_start(&page, 9_999.0);
+        assert_eq!(line, page.len(), "one off the end, so nothing is drawn");
+        assert_eq!(into, 0.0);
     }
 
     #[test]
