@@ -726,12 +726,15 @@ impl Frame<'_> {
     /// As [`Frame::text_sized`], in a chosen face.
     ///
     /// Eight arguments, because drawing one run of a document is eight
-    /// facts: where, what, in what colour, weight, slant, size and face.
-    #[allow(clippy::too_many_arguments)]
+    /// facts: where, what, in what colour, weight, slant, size and
+    /// face.
     ///
-    /// The pen moves by each glyph's own advance rather than by a cell,
-    /// which is what makes prose prose. Returns the x it ended at, so a
-    /// caller drawing a line of runs can hand the next one its start.
+    /// The run is shaped as a whole rather than a glyph at a time,
+    /// which is what makes prose prose: the shaper decides where each
+    /// glyph sits, so `To` and `AVATAR` are kerned and `fi` may be one
+    /// glyph. Returns the x it ended at, so a caller drawing a line of
+    /// runs can hand the next one its start.
+    #[allow(clippy::too_many_arguments)]
     pub fn text_run(
         &mut self,
         x: f32,
@@ -752,29 +755,29 @@ impl Frame<'_> {
             ..
         } = &mut *self.r;
         let mut atlas = atlas.borrow_mut();
-        let mut pen = x;
-
-        for ch in text.chars() {
-            let Some(g) = atlas.glyph_in(queue, ch, face, size, family) else {
-                continue;
-            };
-            // A space has an advance and no coverage.
-            if g.size[0] > 0.0 && g.size[1] > 0.0 {
-                quads.push(Quad {
-                    pos: [
-                        (pen + g.offset[0]).round(),
-                        (baseline_y + g.offset[1]).round(),
-                    ],
-                    size: g.size,
-                    uv: [g.uv.min[0], g.uv.min[1], g.uv.max[0], g.uv.max[1]],
-                    color: color.0,
-                    mode: 0.0,
-                    _pad: [0.0; 3],
-                });
-            }
-            pen += g.advance;
+        // One shaped run, which is also what `measure` reports: the
+        // glyphs go where the shaper put them, kerning and all, and
+        // the pen ends where the measurement said it would.
+        let run = atlas.run(queue, text, face, size, family);
+        for glyph in &run.glyphs {
+            quads.push(Quad {
+                pos: [
+                    (x + glyph.x + glyph.offset[0]).round(),
+                    (baseline_y + glyph.offset[1]).round(),
+                ],
+                size: glyph.size,
+                uv: [
+                    glyph.uv.min[0],
+                    glyph.uv.min[1],
+                    glyph.uv.max[0],
+                    glyph.uv.max[1],
+                ],
+                color: color.0,
+                mode: 0.0,
+                _pad: [0.0; 3],
+            });
         }
-        pen
+        x + run.width
     }
 
     /// How wide `text` would be drawn here. See [`Renderer::measure`].
@@ -943,5 +946,88 @@ impl Frame<'_> {
         if let Some(frame) = acquired {
             r.queue.present(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod shaping_tests {
+    use super::*;
+
+    fn renderer() -> Option<Renderer> {
+        Renderer::offscreen(400, 200, 1.0, 16.0).ok()
+    }
+
+    /// The point of shaping a run rather than a glyph at a time. A
+    /// capital-heavy word set character by character is several per
+    /// cent too wide, and a heading — most capitals, largest size — is
+    /// where that shows most.
+    #[test]
+    fn a_shaped_run_is_tighter_than_the_sum_of_its_letters() {
+        let Some(r) = renderer() else { return };
+        let one = |text: &str| r.measure(text, Face::Regular, Size::Body, Family::Prose);
+        for word in ["AVATAR", "To the Wall", "Walking Away, Type Vo."] {
+            let whole = one(word);
+            let letters: f32 = word.chars().map(|c| one(&c.to_string())).sum();
+            assert!(
+                whole < letters,
+                "{word:?} shaped {whole} but letter by letter {letters}"
+            );
+        }
+    }
+
+    /// The grid depends on every cell being exactly one advance wide,
+    /// so the monospace face must *not* be kerned.
+    #[test]
+    fn the_grid_face_is_not_shaped() {
+        let Some(r) = renderer() else { return };
+        let cell = r.cell().advance;
+        for text in ["AVATAR", "iiii", "fi fl"] {
+            let width = r.measure(text, Face::Regular, Size::Body, Family::Mono);
+            let want = cell * text.chars().count() as f32;
+            assert!(
+                (width - want).abs() < 0.01,
+                "{text:?} measured {width}, the grid says {want}"
+            );
+        }
+    }
+
+    /// What measuring is for: a run reports the width it will be drawn
+    /// at. Both now read one shaped array, so this cannot drift.
+    #[test]
+    fn measuring_a_run_agrees_with_drawing_it() {
+        let Some(mut r) = renderer() else { return };
+        let text = "Walking Away, Type Vo.";
+        let want = r.measure(text, Face::Regular, Size::Body, Family::Prose);
+        let mut frame = r.frame(Rgba::BLACK);
+        let end = frame.text_run(
+            10.0,
+            20.0,
+            text,
+            Rgba::BLACK,
+            Face::Regular,
+            Size::Body,
+            Family::Prose,
+        );
+        assert!(
+            (end - 10.0 - want).abs() < 0.01,
+            "drawn to {end}, measured {want} from 10"
+        );
+    }
+
+    #[test]
+    fn an_empty_run_measures_nothing_and_draws_nothing() {
+        let Some(mut r) = renderer() else { return };
+        assert_eq!(r.measure("", Face::Regular, Size::Body, Family::Prose), 0.0);
+        let mut frame = r.frame(Rgba::BLACK);
+        let end = frame.text_run(
+            7.0,
+            9.0,
+            "",
+            Rgba::BLACK,
+            Face::Regular,
+            Size::Body,
+            Family::Prose,
+        );
+        assert_eq!(end, 7.0, "the pen stays where it was");
     }
 }

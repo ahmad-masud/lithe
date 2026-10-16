@@ -467,6 +467,35 @@ with the pointer elsewhere, nothing did, and the window stayed blank
 until it was clicked. `Focused(true)` and `Occluded(false)` — the two
 events that mean the window is really on screen — now redraw.
 
+Prose is shaped a run at a time, not a glyph at a time. Shaping each
+character alone was deliberate once: it made the width reported by
+`measure` and the width drawn by `text_run` the same number by
+construction, so a line could never wrap in one place and be painted
+in another. It also threw away kerning — `AVATAR` came out a tenth too
+wide, `To the Wall` four per cent, ordinary lowercase prose under one
+— and a heading is the worst case on both counts, most capitals and
+the largest size.
+
+The invariant is kept and strengthened rather than traded away. A run
+is shaped once into an array of placed glyphs; measuring returns that
+run's width and drawing reads that run's positions, so the two agree
+because they are the same data rather than because two sums happen to
+match. Runs are cached by what they say and how they are set, and the
+cache is cleared wholesale when it grows past what a window could
+hold — what is on screen is shaped again on the next frame, and a
+frame only happens when something changed anyway.
+
+The grid face is explicitly *not* shaped. Every cell being exactly one
+advance wide is what the editor is built on, and that has to be
+exactly true rather than approximately, so the monospace path returns
+the cell metric and never asks the shaper. The editor's own hot path
+is therefore untouched by any of this.
+
+Glyph images are now cached twice over, by character for the grid and
+by the identity shaping gives them for prose. A character cannot name
+a shaped glyph: a ligature is one glyph for two letters, and a
+contextual alternate is a different glyph for the same one.
+
 Diagrams are drawn as shapes, not as box-drawing characters. The
 layout is still the same grid — a figure takes whole rows of the
 preview, so the rows it takes have to be countable before anything is

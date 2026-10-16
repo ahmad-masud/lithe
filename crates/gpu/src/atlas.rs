@@ -101,6 +101,12 @@ const ATLAS_SIZE: u32 = 1024;
 /// Padding between packed glyphs, so neighbouring cells cannot bleed.
 const PAD: u32 = 1;
 
+/// How many shaped runs to keep. Far more than a window holds, so a
+/// page being read back and forth never re-shapes, and small enough
+/// that a document scrolled end to end does not accumulate one entry
+/// per line of it.
+const MAX_RUNS: usize = 4096;
+
 /// Candidate monospace faces, best first.
 ///
 /// This list is load-bearing, not a nicety. We build cosmic-text without
@@ -154,12 +160,6 @@ const PROSE_PREFERENCES: &[&str] = &[
     "Helvetica",
 ];
 
-/// Whether a character is one of the printable ASCII the advance table
-/// covers, which is most of a document by a wide margin.
-fn is_table_ascii(ch: char) -> bool {
-    ('\u{20}'..'\u{7f}').contains(&ch)
-}
-
 /// Normalised atlas rectangle.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UvRect {
@@ -177,11 +177,6 @@ pub struct Glyph {
     /// Offset from pen origin to the bitmap's top-left corner, physical px.
     /// `y` is already measured downward from the baseline.
     pub offset: [f32; 2],
-    /// How far the pen moves past this glyph, physical px.
-    ///
-    /// Equal to the cell for every glyph in the grid's own face, and the
-    /// whole point of the proportional one — an `i` is not an `M`.
-    pub advance: f32,
 }
 
 /// Grid geometry, in physical pixels.
@@ -195,6 +190,39 @@ pub struct CellMetrics {
     pub ascent: f32,
 }
 
+/// One glyph of a shaped run: its image in the atlas, and where it
+/// sits along the run.
+///
+/// No advance of its own. A shaped glyph's position comes from the
+/// run it was shaped in — that is the whole point of shaping — and an
+/// advance here would be a second answer to the same question.
+#[derive(Clone, Copy, Debug)]
+pub struct Placed {
+    pub uv: UvRect,
+    pub size: [f32; 2],
+    /// From the pen origin to the bitmap's top-left, physical px.
+    pub offset: [f32; 2],
+    /// From the start of the run to this glyph's pen, physical px.
+    pub x: f32,
+}
+
+/// A run of proportional text, shaped once.
+///
+/// Shaping the whole run is what gives it kerning: an `AVATAR` set
+/// character by character is a tenth wider than the same word shaped
+/// together, and headings — most capitals, largest size — are where
+/// that shows most.
+///
+/// Measuring and drawing both read this, so the width reported and the
+/// positions drawn come out of one array rather than out of two sums
+/// that have to agree. That was the reason the old code shaped each
+/// character alone, and it is kept rather than traded away.
+#[derive(Clone, Debug, Default)]
+pub struct Run {
+    pub glyphs: Vec<Placed>,
+    pub width: f32,
+}
+
 pub struct Atlas {
     texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -206,13 +234,17 @@ pub struct Atlas {
     shelf_h: u32,
 
     cache: HashMap<(char, Face, Size, Family), Option<Glyph>>,
+    /// Shaped runs of proportional text, by what they say and how they
+    /// are set. Bounded by what the window has shown: a run is a span
+    /// of one line, and the same words come back frame after frame.
+    runs: HashMap<(Box<str>, Face, Size, Family), Run>,
+    /// Glyph images by the identity shaping gave them, which a
+    /// character cannot name: a ligature is one glyph for two letters,
+    /// and a contextual alternate is a different glyph for the same
+    /// one.
+    sprites: HashMap<cosmic_text::CacheKey, Option<Placed>>,
     /// Line geometry per size and face, measured on first use.
     sizes: HashMap<(Size, Family), CellMetrics>,
-    /// Advances for printable ASCII, per face. Laying out a document asks
-    /// the same question tens of thousands of times in a row, and an
-    /// array index is a great deal cheaper than hashing a four-field key
-    /// to answer it.
-    ascii: HashMap<(Face, Size, Family), [f32; 95]>,
     /// Reserved fully-opaque texel. Lets a filled rect reuse the glyph
     /// pipeline rather than needing one of its own.
     pub opaque: UvRect,
@@ -250,8 +282,9 @@ impl Atlas {
             pen_y: 0,
             shelf_h: 0,
             cache: HashMap::new(),
+            runs: HashMap::new(),
+            sprites: HashMap::new(),
             sizes: HashMap::new(),
-            ascii: HashMap::new(),
             opaque: UvRect::default(),
             metrics: CellMetrics {
                 advance: font_px * 0.6,
@@ -363,15 +396,9 @@ impl Atlas {
         // and when one does it rasterises on first sight like any other
         // uncommon glyph.
         for size in [Size::Body, Size::Large, Size::Huge] {
-            let advance = self.metrics_at(size).advance;
             for face in [Face::Regular, Face::Bold] {
-                self.cache.insert(
-                    (' ', face, size, Family::Mono),
-                    Some(Glyph {
-                        advance,
-                        ..Glyph::default()
-                    }),
-                );
+                self.cache
+                    .insert((' ', face, size, Family::Mono), Some(Glyph::default()));
             }
         }
     }
@@ -427,35 +454,10 @@ impl Atlas {
         if family == Family::Mono {
             return self.metrics_in(size, family).advance * text.chars().count() as f32;
         }
-        let key = (face, size, family);
-        if !self.ascii.contains_key(&key) {
-            let mut widths = [0.0f32; 95];
-            for (index, slot) in widths.iter_mut().enumerate() {
-                let ch = (0x20u8 + index as u8) as char;
-                *slot = self
-                    .glyph_in(queue, ch, face, size, family)
-                    .map_or(0.0, |glyph| glyph.advance);
-            }
-            self.ascii.insert(key, widths);
-        }
-        // Anything outside the table is rasterised first, so the sum
-        // below needs nothing but a look at what is already cached.
-        for ch in text.chars().filter(|ch| !is_table_ascii(*ch)) {
-            self.glyph_in(queue, ch, face, size, family);
-        }
-
-        let table = self.ascii.get(&key);
-        let cache = &self.cache;
-        text.chars()
-            .map(|ch| match (is_table_ascii(ch), table) {
-                (true, Some(widths)) => widths[ch as usize - 0x20],
-                _ => cache
-                    .get(&(ch, face, size, family))
-                    .copied()
-                    .flatten()
-                    .map_or(0.0, |glyph| glyph.advance),
-            })
-            .sum()
+        // The shaped run, which is also what is drawn: what this
+        // reports and where the glyphs land come out of one array, so
+        // a line cannot wrap in one place and be painted in another.
+        self.run(queue, text, face, size, family).width
     }
 
     /// Grid geometry at `size`, measured once per size.
@@ -538,17 +540,13 @@ impl Atlas {
         buf.shape_until_scroll(&mut self.fonts, false);
 
         let laid_out = buf.layout_runs().next()?.glyphs.first()?.clone();
-        let advance = laid_out.w;
         let key = laid_out.physical((0.0, 0.0), 1.0).cache_key;
 
         let image = self.swash.get_image_uncached(&mut self.fonts, key)?;
         let (w, h) = (image.placement.width, image.placement.height);
         // No coverage — a space, most often. It still moves the pen.
         if w == 0 || h == 0 {
-            return Some(Glyph {
-                advance,
-                ..Glyph::default()
-            });
+            return Some(Glyph::default());
         }
 
         // Coverage masks go straight in. Colour glyphs (emoji) need an RGBA
@@ -574,7 +572,124 @@ impl Atlas {
             },
             size: [w as f32, h as f32],
             offset: [image.placement.left as f32, -image.placement.top as f32],
-            advance,
+        })
+    }
+
+    /// A run of proportional text, shaped and cached.
+    ///
+    /// The monospace face is not shaped: every cell is the same width
+    /// by definition, and the grid depends on that being exactly true
+    /// rather than approximately.
+    pub fn run(
+        &mut self,
+        queue: &wgpu::Queue,
+        text: &str,
+        face: Face,
+        size: Size,
+        family: Family,
+    ) -> &Run {
+        let key = (Box::from(text), face, size, family);
+        if !self.runs.contains_key(&key) {
+            // Scrolling a long document asks about a different run on
+            // every line, so this cannot grow forever. Cleared rather
+            // than evicted one at a time: what is on screen is shaped
+            // again on the next frame, and a frame only happens when
+            // something changed anyway.
+            if self.runs.len() >= MAX_RUNS {
+                self.runs.clear();
+            }
+            let built = self.shape(queue, text, face, size, family);
+            self.runs.insert(key.clone(), built);
+        }
+        &self.runs[&key]
+    }
+
+    fn shape(
+        &mut self,
+        queue: &wgpu::Queue,
+        text: &str,
+        face: Face,
+        size: Size,
+        family: Family,
+    ) -> Run {
+        let line_height = self.metrics_in(size, family).line_height;
+        let metrics = Metrics::new(self.font_px * size.factor(), line_height);
+        let attrs = Attrs::new()
+            .family(family.resolved())
+            .weight(face.weight())
+            .style(face.slant());
+
+        // Collected before anything is rasterised: the buffer borrows
+        // the font system, and so does the rasteriser.
+        let (places, width) = {
+            let mut buf = Buffer::new(&mut self.fonts, metrics);
+            // The caller has already decided where this line ends, so
+            // the shaper must not decide again.
+            buf.set_wrap(cosmic_text::Wrap::None);
+            buf.set_size(None, None);
+            buf.set_text(text, &attrs, Shaping::Advanced, None);
+            buf.shape_until_scroll(&mut self.fonts, false);
+            match buf.layout_runs().next() {
+                Some(run) => (
+                    run.glyphs
+                        .iter()
+                        .map(|g| (g.physical((0.0, 0.0), 1.0).cache_key, g.x))
+                        .collect::<Vec<_>>(),
+                    run.line_w,
+                ),
+                None => (Vec::new(), 0.0),
+            }
+        };
+
+        let mut glyphs = Vec::with_capacity(places.len());
+        for (key, x) in places {
+            if let Some(sprite) = self.sprite(queue, key) {
+                glyphs.push(Placed { x, ..sprite });
+            }
+        }
+        Run { glyphs, width }
+    }
+
+    /// One shaped glyph's image, rasterised and packed on first use.
+    ///
+    /// `None` for a glyph with no coverage — a space, most often —
+    /// which has nothing to draw but still moved the pen when the run
+    /// was shaped.
+    fn sprite(&mut self, queue: &wgpu::Queue, key: cosmic_text::CacheKey) -> Option<Placed> {
+        if let Some(hit) = self.sprites.get(&key) {
+            return *hit;
+        }
+        let packed = self.pack(queue, key);
+        self.sprites.insert(key, packed);
+        packed
+    }
+
+    fn pack(&mut self, queue: &wgpu::Queue, key: cosmic_text::CacheKey) -> Option<Placed> {
+        let image = self.swash.get_image_uncached(&mut self.fonts, key)?;
+        let (w, h) = (image.placement.width, image.placement.height);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let coverage: Vec<u8> = match image.content {
+            SwashContent::Mask => image.data,
+            SwashContent::SubpixelMask | SwashContent::Color => {
+                image.data.chunks_exact(4).map(|px| px[3]).collect()
+            }
+        };
+        if coverage.len() < (w * h) as usize {
+            return None;
+        }
+        let (x, y) = self.alloc(w, h)?;
+        self.upload(queue, x, y, w, h, &coverage);
+        let inv = 1.0 / ATLAS_SIZE as f32;
+        Some(Placed {
+            uv: UvRect {
+                min: [x as f32 * inv, y as f32 * inv],
+                max: [(x + w) as f32 * inv, (y + h) as f32 * inv],
+            },
+            size: [w as f32, h as f32],
+            offset: [image.placement.left as f32, -image.placement.top as f32],
+            x: 0.0,
         })
     }
 
