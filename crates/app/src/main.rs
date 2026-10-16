@@ -1472,12 +1472,9 @@ impl markdown::Measure for Measured<'_> {
         if cell <= 0.0 {
             return text.chars().count() as f32;
         }
-        let pixels = self.renderer.measure(
-            text,
-            style.face(),
-            markdown::Style::size(scale),
-            style.family(),
-        );
+        let pixels = self
+            .renderer
+            .measure(text, style.face(), style.size(scale), style.family());
         pixels / cell
     }
 }

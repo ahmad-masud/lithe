@@ -28,9 +28,12 @@ struct Quad {
     size: [f32; 2],
     uv: [f32; 4],
     color: [f32; 4],
-    /// 0 for the glyph atlas, 1 for an image texture.
+    /// 0 for the glyph atlas, 1 for an image texture, 2 for a rounded
+    /// rectangle drawn by the shader rather than sampled.
     mode: f32,
-    _pad: [f32; 3],
+    /// Corner radius in physical px, for mode 2.
+    radius: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -351,7 +354,8 @@ impl Renderer {
                         1 => Float32x2,
                         2 => Float32x4,
                         3 => Float32x4,
-                        4 => Float32
+                        4 => Float32,
+                        5 => Float32
                     ],
                 })],
             },
@@ -662,7 +666,8 @@ impl Frame<'_> {
             uv: [uv.min[0], uv.min[1], uv.max[0], uv.max[1]],
             color: color.0,
             mode: 0.0,
-            _pad: [0.0; 3],
+            radius: 0.0,
+            _pad: [0.0; 2],
         });
     }
 
@@ -715,7 +720,8 @@ impl Frame<'_> {
                     uv: [g.uv.min[0], g.uv.min[1], g.uv.max[0], g.uv.max[1]],
                     color: color.0,
                     mode: 0.0,
-                    _pad: [0.0; 3],
+                    radius: 0.0,
+                    _pad: [0.0; 2],
                 });
             }
             pen += advance;
@@ -774,7 +780,8 @@ impl Frame<'_> {
                 ],
                 color: color.0,
                 mode: 0.0,
-                _pad: [0.0; 3],
+                radius: 0.0,
+                _pad: [0.0; 2],
             });
         }
         x + run.width
@@ -812,11 +819,36 @@ impl Frame<'_> {
             uv: [0.0, 0.0, 1.0, 1.0],
             color: [1.0, 1.0, 1.0, 1.0],
             mode: 1.0,
-            _pad: [0.0; 3],
+            radius: 0.0,
+            _pad: [0.0; 2],
         });
         r.batches.push(Batch {
             end: r.quads.len() as u32,
             image: Some(index),
+        });
+    }
+
+    /// A filled rectangle with rounded corners.
+    ///
+    /// Drawn by the shader as a distance field rather than sampled, so
+    /// it costs the same one quad a square rect does — which is what
+    /// makes it affordable to put one behind every piece of inline
+    /// code on the page.
+    pub fn rounded(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Rgba) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let uv = self.r.atlas.borrow().opaque;
+        self.r.quads.push(Quad {
+            pos: [x, y],
+            size: [w, h],
+            uv: [uv.min[0], uv.min[1], uv.max[0], uv.max[1]],
+            color: color.0,
+            mode: 2.0,
+            // Never more than half the shorter side, or opposite
+            // corners overlap and the shape turns inside out.
+            radius: radius.min(w.min(h) / 2.0).max(0.0),
+            _pad: [0.0; 2],
         });
     }
 

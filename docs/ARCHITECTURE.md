@@ -467,6 +467,47 @@ with the pointer elsewhere, nothing did, and the window stayed blank
 until it was clicked. `Focused(true)` and `Occluded(false)` — the two
 events that mean the window is really on screen — now redraw.
 
+The preview is a document, not a terminal with a nice font. Four
+things were giving away where it came from, and all four were the
+grid.
+
+A table was one padded monospace string per row, with `│` and `─`
+between the cells. That did line the columns up, and it set every
+cell — prose included — in the grid's face. A table now carries its
+cells, each with the column it sits in, measured the way it will be
+drawn; the painter places them and draws a rule under the heading and
+between the rows. No outer frame and no vertical rules: the gap
+between columns keeps them apart, and a box round a table is most of
+what made it read as a terminal. Headings are promoted to bold
+*before* the columns are measured, or the header is measured in one
+face and drawn in another — `Default` came out as `Def…` in a column
+sized for `exp`.
+
+Inline code sits on a tinted chip, a shade smaller than the prose
+around it. A monospace face at the same nominal size reads as larger,
+so a word of code stood proud of its own line and the colour alone
+made it look like an error in the sentence rather than a thing being
+named.
+
+A fenced block is a panel the width of the column rather than a tint
+from one edge of the pane to the other, which reads as a change of
+mode. It is rounded at the block's first and last row and square in
+between, so consecutive rows join into one card instead of a stack of
+lozenges.
+
+All of that needed a rounded rectangle, which the renderer could not
+draw. It is a third quad mode: the fragment shader evaluates the
+signed distance to a rounded box and feathers the edge, so a rounded
+rect costs the same one quad a square one does. That is what makes it
+affordable to put a chip behind every piece of inline code on a page.
+
+The rhythm was built out of whole grid rows, and a heading was paying
+for its air twice: the larger scales take two rows with the text on
+the lower one, so that row *is* the space above, and a blank line as
+well made the gap above an `h2` three rows deep. A rule — under a
+heading, or a thematic break across the page — is likewise the air
+under itself, so nothing follows it with another blank.
+
 Prose is shaped a run at a time, not a glyph at a time. Shaping each
 character alone was deliberate once: it made the width reported by
 `measure` and the width drawn by `text_run` the same number by

@@ -76,6 +76,11 @@ impl Family {
 /// continuous range that would fill the atlas with near-identical glyphs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Size {
+    /// A shade under body, for inline code. A monospace face at the
+    /// same nominal size as the prose around it reads as larger than
+    /// it, and a word of code in the middle of a sentence should sit
+    /// in the line rather than on top of it.
+    Small,
     #[default]
     Body,
     /// Half again, for an `h2`.
@@ -87,6 +92,7 @@ pub enum Size {
 impl Size {
     fn factor(self) -> f32 {
         match self {
+            Self::Small => 0.88,
             Self::Body => 1.0,
             Self::Large => 1.45,
             Self::Huge => 1.9,

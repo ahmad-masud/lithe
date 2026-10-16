@@ -23,8 +23,12 @@ struct Quad {
     @location(2) uv: vec4<f32>,     // xy = uv min, zw = uv max
     @location(3) color: vec4<f32>,
     // 0 samples coverage from the glyph atlas; 1 samples full colour, for
-    // an image. The bound texture differs too, but the pipeline does not.
+    // an image; 2 is a rounded rectangle, whose coverage the fragment
+    // shader works out rather than sampling. The bound texture differs
+    // for an image too, but the pipeline does not.
     @location(4) mode: f32,
+    // Corner radius in physical px, for mode 2.
+    @location(5) radius: f32,
 }
 
 struct VsOut {
@@ -32,6 +36,13 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) mode: f32,
+    // Where this fragment is inside the quad, measured from its
+    // centre, and the quad's own half-size and radius. A rounded
+    // corner is a distance field, and a distance field needs to know
+    // where it is.
+    @location(3) local: vec2<f32>,
+    @location(4) @interpolate(flat) half_size: vec2<f32>,
+    @location(5) @interpolate(flat) radius: f32,
 }
 
 @vertex
@@ -54,11 +65,30 @@ fn vs(q: Quad, @builtin(vertex_index) vi: u32) -> VsOut {
     out.uv = mix(q.uv.xy, q.uv.zw, corner);
     out.color = q.color;
     out.mode = q.mode;
+    out.local = (corner - 0.5) * q.size;
+    out.half_size = q.size * 0.5;
+    out.radius = q.radius;
     return out;
+}
+
+// Signed distance to a rounded box centred on the origin. Negative
+// inside, positive outside — the standard formulation, kept because
+// anything cleverer is harder to check.
+fn rounded_box(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - half_size + vec2<f32>(r, r);
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.mode > 1.5) {
+        // A rounded rectangle. One pixel of feather at the edge, which
+        // is what makes a corner read as a curve rather than as a
+        // staircase.
+        let d = rounded_box(in.local, in.half_size, in.radius);
+        let coverage = 1.0 - smoothstep(-0.5, 0.5, d);
+        return vec4<f32>(in.color.rgb, in.color.a * coverage);
+    }
     let texel = textureSample(atlas_tex, atlas_smp, in.uv);
     if (in.mode > 0.5) {
         // An image: the bound texture already holds the colour.

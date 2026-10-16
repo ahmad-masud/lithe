@@ -34,8 +34,6 @@ pub enum Style {
     /// fence. The preview highlights code for the same reason the editor
     /// does, and from the same tree-sitter queries.
     Syntax(lithe_syntax::Kind),
-    /// A cell divider in a table, dimmed so the contents read first.
-    Divider,
 }
 
 impl Style {
@@ -51,17 +49,23 @@ impl Style {
             // A bullet, a checkbox and a table's rule are furniture
             // rather than language: they line up with each other, and
             // with the indents measured in cells around them.
-            Self::Code | Self::Syntax(_) | Self::Divider | Self::Bullet => lithe_gpu::Family::Mono,
+            Self::Code | Self::Syntax(_) | Self::Bullet => lithe_gpu::Family::Mono,
             _ => lithe_gpu::Family::Prose,
         }
     }
 
     /// The glyph size a run is drawn at, given the line's scale.
-    pub fn size(scale: Scale) -> lithe_gpu::Size {
-        match scale {
-            Scale::Body => lithe_gpu::Size::Body,
-            Scale::Large => lithe_gpu::Size::Large,
-            Scale::Huge => lithe_gpu::Size::Huge,
+    ///
+    /// Inline code in body text is set a shade smaller. A monospace
+    /// face at the same nominal size reads as larger than the prose
+    /// around it, so a word of code stood proud of its own line; a
+    /// heading keeps its scale, because there the code is the heading.
+    pub fn size(self, scale: Scale) -> lithe_gpu::Size {
+        match (self, scale) {
+            (Self::Code, Scale::Body) => lithe_gpu::Size::Small,
+            (_, Scale::Body) => lithe_gpu::Size::Body,
+            (_, Scale::Large) => lithe_gpu::Size::Large,
+            (_, Scale::Huge) => lithe_gpu::Size::Huge,
         }
     }
 
@@ -204,6 +208,8 @@ pub struct Line {
     /// Glyph size, and so the row height. Only headings are ever anything
     /// but [`Scale::Body`].
     pub scale: Scale,
+    /// A table row this line is, with its cells placed in columns.
+    pub row: Option<Row>,
     /// A drawn figure this line stands for.
     ///
     /// A figure is one line of the preview however many rows it takes:
@@ -258,6 +264,9 @@ impl Line {
         if self.figure.is_some() {
             return 0;
         }
+        if self.row.is_some() {
+            return self.text().chars().count();
+        }
         self.indent
             + self
                 .spans
@@ -268,14 +277,11 @@ impl Line {
 
     /// Whether this line is set on the grid rather than as prose.
     ///
-    /// Code, a drawn diagram and a table all mean what they mean because
-    /// of where their characters sit; set proportionally, a box-drawing
-    /// frame comes apart and a column of numbers stops being one.
+    /// Code and a drawn diagram mean what they mean because of where
+    /// their characters sit. A table used to as well; its cells are
+    /// now placed in measured columns, so its prose can be prose.
     pub fn is_grid(&self) -> bool {
-        matches!(
-            self.block,
-            Block::Code | Block::Diagram | Block::Table | Block::TableHead
-        )
+        matches!(self.block, Block::Code | Block::Diagram)
     }
 }
 
@@ -465,19 +471,40 @@ impl Align {
             _ => Self::Left,
         }
     }
-
-    /// Spaces to put before and after a cell of `used` cells in `width`.
-    fn pad(self, used: usize, width: usize) -> (usize, usize) {
-        let slack = width.saturating_sub(used);
-        match self {
-            Self::Left => (0, slack),
-            Self::Right => (slack, 0),
-            Self::Centre => (slack / 2, slack - slack / 2),
-        }
-    }
 }
 
-/// A table being collected, and then laid out into a monospace grid.
+/// A table being collected, and then laid out into measured columns.
+#[derive(Default)]
+/// One cell of a table.
+#[derive(Clone, Debug)]
+pub struct Cell {
+    pub spans: Vec<Span>,
+    pub align: Align,
+    /// Where the column starts and how wide it is, in cells.
+    pub x: f32,
+    pub width: f32,
+}
+
+/// One row of a table, as cells rather than as one padded string.
+///
+/// A table is the one construct whose columns have to line up down the
+/// page, so it is the one that cannot be laid out a line at a time:
+/// the widths come from every row, and the painter needs them to put a
+/// cell where its column is. Padding a row into a single monospace
+/// string did line the columns up, and set the whole table — prose
+/// cells included — in the grid's face, which is what made it read as
+/// a terminal rather than as a table.
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub cells: Vec<Cell>,
+    pub heading: bool,
+    /// Whether a rule is drawn under this row: under the heading, and
+    /// between body rows, but not under the last.
+    pub rule: bool,
+    /// How far the table runs, in cells, for the rules.
+    pub width: f32,
+}
+
 #[derive(Default)]
 struct Table {
     rows: Vec<Vec<Vec<Span>>>,
@@ -516,122 +543,119 @@ impl Table {
         self.aligns.get(column).copied().unwrap_or_default()
     }
 
-    /// One line per row, inside a drawn frame.
+    /// One line per row, with its cells placed in columns.
     ///
-    /// Emits lines directly rather than through [`wrap`]: the padding is
-    /// what holds the columns in line, and re-flowing a row at word
-    /// boundaries would take the table apart.
-    ///
-    /// Widths come from the content, then shrink to fit. A table is the
-    /// one construct here whose shape depends on every line of it, which
-    /// is why it is collected whole before anything is emitted.
-    fn lay_out(self, columns: usize, indent: usize) -> Vec<Line> {
-        const MIN: usize = 3;
+    /// Widths come from the content, measured the way it will be
+    /// drawn, and then shrink to fit. A table is the one construct
+    /// here whose shape depends on every line of it, which is why it
+    /// is collected whole before anything is emitted.
+    fn lay_out(self, columns: usize, indent: usize, measure: &mut dyn Measure) -> Vec<Line> {
+        /// Cells of air on each side of a cell's text. Generous,
+        /// because without vertical rules the gap between columns is
+        /// the only thing keeping them apart.
+        const PAD: f32 = 1.5;
+        const MIN: f32 = 3.0;
 
         let count = self.rows.iter().map(Vec::len).max().unwrap_or(0);
         if count == 0 {
             return Vec::new();
         }
-        let mut widths = vec![MIN; count];
-        for row in &self.rows {
-            for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(width_of(cell));
+        let cell_width = |spans: &[Span], measure: &mut dyn Measure| -> f32 {
+            spans
+                .iter()
+                .map(|s| measure.width(&s.text, s.style, Scale::Body))
+                .sum()
+        };
+        // A heading's cells are bold, and bold is wider. Promoted
+        // before the columns are measured, or the header is measured
+        // in one face and drawn in another — `Default` came out as
+        // `Def…` in a column sized for `exp`.
+        let aligns: Vec<Align> = (0..count).map(|i| self.align(i)).collect();
+        let Table { mut rows, head, .. } = self;
+        for (row, heading) in rows.iter_mut().zip(&head) {
+            if !heading {
+                continue;
+            }
+            for cell in row.iter_mut() {
+                for span in cell.iter_mut() {
+                    if span.style == Style::Body {
+                        span.style = Style::Bold;
+                    }
+                }
             }
         }
 
-        // A frame costs one cell per edge and three between columns:
-        // `│ a │ b │`.
-        let frame = |widths: &[usize]| widths.iter().sum::<usize>() + 3 * count + 1;
+        let mut widths = vec![MIN; count];
+        for row in &rows {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(cell_width(cell, measure));
+            }
+        }
 
         // Shrink the widest column, repeatedly, until the row fits.
-        // Taking from the widest keeps a narrow column readable instead
-        // of trimming every column into uselessness.
-        let room = columns.saturating_sub(indent);
-        while frame(&widths) > room {
-            let Some(widest) = widths
+        // Taking from the widest keeps a narrow column readable
+        // instead of trimming every column into uselessness.
+        let room = columns.saturating_sub(indent) as f32;
+        let total = |widths: &[f32]| widths.iter().sum::<f32>() + PAD * 2.0 * count as f32;
+        while total(&widths) > room {
+            let widest = widths
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, w)| **w)
-                .map(|(i, _)| i)
-            else {
-                break;
-            };
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i);
+            let Some(widest) = widest else { break };
             if widths[widest] <= MIN {
                 break;
             }
-            widths[widest] -= 1;
+            widths[widest] -= 1.0;
         }
 
-        let rule = |left: char, join: char, right: char| {
-            let mut text = String::from(left);
-            for (i, width) in widths.iter().enumerate() {
-                if i > 0 {
-                    text.push(join);
-                }
-                text.extend(std::iter::repeat_n('─', width + 2));
-            }
-            text.push(right);
-            Line {
-                spans: vec![Span::plain(text, Style::Divider)],
-                indent,
-                block: Block::Table,
-                scale: Scale::Body,
-                code: None,
-                figure: None,
-            }
-        };
-
-        let mut out = Vec::with_capacity(self.rows.len() + 3);
-        out.push(rule('┌', '┬', '┐'));
-
-        // Aligns is read per cell below, so it is taken before the rows
-        // move out of `self`.
-        let aligns: Vec<Align> = (0..count).map(|i| self.align(i)).collect();
-        let mut rows = self.rows.into_iter().zip(self.head).peekable();
-        while let Some((row, heading)) = rows.next() {
-            let mut spans: Vec<Span> = Vec::new();
-            for (i, width) in widths.iter().enumerate() {
-                spans.push(Span::plain(
-                    if i == 0 { "│ " } else { " │ " },
-                    Style::Divider,
-                ));
-                let cell = row.get(i).cloned().unwrap_or_default();
-                let used = width_of(&cell).min(*width);
-                let (before, after) = aligns[i].pad(used, *width);
-                if before > 0 {
-                    spans.push(Span::plain(" ".repeat(before), Style::Body));
-                }
-                for mut span in clip(cell, *width) {
-                    if heading && span.style == Style::Body {
-                        span.style = Style::Bold;
-                    }
-                    spans.push(span);
-                }
-                if after > 0 {
-                    spans.push(Span::plain(" ".repeat(after), Style::Body));
-                }
-            }
-            spans.push(Span::plain(" │", Style::Divider));
-            out.push(Line {
-                spans,
-                indent,
-                block: if heading {
-                    Block::TableHead
-                } else {
-                    Block::Table
-                },
-                scale: Scale::Body,
-                code: None,
-                figure: None,
-            });
-            // A heading is separated from the body, but only when there
-            // is a body to separate it from.
-            if heading && rows.peek().is_some() {
-                out.push(rule('├', '┼', '┤'));
-            }
+        // Where each column starts, once the widths are settled.
+        let mut starts = Vec::with_capacity(count);
+        let mut at = 0.0;
+        for width in &widths {
+            starts.push(at);
+            at += width + PAD * 2.0;
         }
-        out.push(rule('└', '┴', '┘'));
-        out
+        let table_width = at;
+
+        let rows: Vec<(Vec<Vec<Span>>, bool)> = rows.into_iter().zip(head).collect();
+        let last = rows.len().saturating_sub(1);
+
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, (row, heading))| {
+                let cells = (0..count)
+                    .map(|i| {
+                        let spans = row.get(i).cloned().unwrap_or_default();
+                        Cell {
+                            spans: clip_to(spans, widths[i], measure),
+                            align: aligns[i],
+                            x: starts[i] + PAD,
+                            width: widths[i],
+                        }
+                    })
+                    .collect();
+                Line {
+                    indent,
+                    block: if heading {
+                        Block::TableHead
+                    } else {
+                        Block::Table
+                    },
+                    row: Some(Row {
+                        cells,
+                        heading,
+                        // Under the heading, and between body rows,
+                        // but never under the last: a rule along the
+                        // bottom closes a box, and this is not one.
+                        rule: index < last,
+                        width: table_width,
+                    }),
+                    ..Line::default()
+                }
+            })
+            .collect()
     }
 }
 
@@ -639,27 +663,40 @@ fn width_of(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.text.chars().count()).sum()
 }
 
-/// Truncates a cell to `width`, marking the cut with an ellipsis.
-fn clip(spans: Vec<Span>, width: usize) -> Vec<Span> {
-    if width_of(&spans) <= width {
+/// Truncates a cell to `width` cells, measured the way it is drawn,
+/// marking the cut with an ellipsis.
+fn clip_to(spans: Vec<Span>, width: f32, measure: &mut dyn Measure) -> Vec<Span> {
+    let total: f32 = spans
+        .iter()
+        .map(|s| measure.width(&s.text, s.style, Scale::Body))
+        .sum();
+    if total <= width {
         return spans;
     }
-    let mut out = Vec::new();
-    let mut used = 0;
+    let mut out: Vec<Span> = Vec::new();
+    let mut used = 0.0;
+    let room = width - measure.width("…", Style::Body, Scale::Body);
     for span in spans {
-        let room = width.saturating_sub(used + 1);
-        if room == 0 {
+        let mut kept = String::new();
+        for ch in span.text.chars() {
+            let next = measure.width(&format!("{kept}{ch}"), span.style, Scale::Body);
+            if used + next > room {
+                break;
+            }
+            kept.push(ch);
+        }
+        let taken = measure.width(&kept, span.style, Scale::Body);
+        let whole = kept.chars().count() == span.text.chars().count();
+        if !kept.is_empty() {
+            used += taken;
+            out.push(Span {
+                text: kept,
+                ..span.clone()
+            });
+        }
+        if !whole {
             break;
         }
-        let len = span.text.chars().count();
-        if len <= room {
-            used += len;
-            out.push(span);
-            continue;
-        }
-        let text: String = span.text.chars().take(room).collect();
-        out.push(Span { text, ..span });
-        break;
     }
     out.push(Span::plain("…", Style::Body));
     out
@@ -1070,7 +1107,8 @@ impl<'a> Preview<'a> {
             }
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
-                    self.out.extend(table.lay_out(self.columns, 0));
+                    let laid = table.lay_out(self.columns, 0, self.measure);
+                    self.out.extend(laid);
                     self.blank();
                 }
             }
@@ -1264,7 +1302,9 @@ impl<'a> Preview<'a> {
 
     /// Where the block being read starts, in cells.
     fn indent(&self) -> usize {
-        self.quote * 3 + self.lists.len() * 2 + usize::from(self.footnote) * 2
+        // Two cells for a quote, not three: the bar is drawn at the
+        // column's own edge, so the text only has to clear the bar.
+        self.quote * 2 + self.lists.len() * 2 + usize::from(self.footnote) * 2
     }
 
     /// Wraps what has been read into lines and puts them out.
@@ -1294,7 +1334,13 @@ impl<'a> Preview<'a> {
     /// A blank line between blocks, and never two in a row: a heading
     /// already leaves one, and the source usually leaves another.
     fn blank(&mut self) {
-        if self.out.last().is_some_and(|line| !line.is_blank()) {
+        // A rule — under a heading or across the page — is the air
+        // under it already, and a blank row after it is a second
+        // helping.
+        let spoken_for = self.out.last().is_some_and(|line| {
+            line.is_blank() || matches!(line.block, Block::HeadingRule | Block::Rule)
+        });
+        if !self.out.is_empty() && !spoken_for {
             self.out.push(Line::default());
         }
     }
@@ -1335,10 +1381,13 @@ fn push_heading(
     columns: f32,
     measure: &mut dyn Measure,
 ) {
-    if out.last().is_some_and(|l| !l.is_blank()) {
+    let scale = heading_scale(level);
+    // Air above. A heading set larger takes two rows with its text on
+    // the lower one, so that row *is* the air — a blank line as well
+    // made the space above an `h2` three rows deep.
+    if scale == Scale::Body && out.last().is_some_and(|l| !l.is_blank()) {
         out.push(Line::default());
     }
-    let scale = heading_scale(level);
     let mut spans = spans;
     for span in &mut spans {
         // Code and links inside a heading keep their own colour; the rest
@@ -1417,6 +1466,7 @@ fn code_block(language: String, code: &[&str], columns: usize) -> Vec<Line> {
                 scale: Scale::Body,
                 code: None,
                 figure: None,
+                row: None,
             });
         }
     }
@@ -1523,6 +1573,7 @@ fn wrap(
                 scale,
                 code: None,
                 figure: None,
+                row: None,
             });
             used = 0.0;
         }
@@ -1561,6 +1612,7 @@ fn wrap(
             scale,
             code: None,
             figure: None,
+            row: None,
         });
     }
     lines
@@ -1802,29 +1854,37 @@ mod tests {
     }
 
     #[test]
-    fn a_pipe_table_is_drawn_inside_a_frame() {
+    fn every_row_of_a_table_puts_its_cells_in_the_same_columns() {
+        // Columns lining up down the page is the whole of what makes a
+        // table a table, and it is now a shared set of positions
+        // rather than a shared amount of padding.
         let out = render(
             "| Name | Size |\n|---|---:|\n| a.rs | 12 |\n| bb.rs | 3 |\n",
             60,
         );
-        let rows: Vec<String> = out.iter().map(text_of).filter(|t| !t.is_empty()).collect();
+        let rows: Vec<&Row> = out.iter().filter_map(|l| l.row.as_ref()).collect();
+        assert_eq!(rows.len(), 3, "a header and two body rows");
 
-        assert!(
-            rows[0].starts_with('┌') && rows[0].ends_with('┐'),
-            "{rows:#?}"
-        );
-        assert!(rows[1].starts_with("│ Name"), "{rows:#?}");
-        assert!(
-            rows[2].starts_with('├') && rows[2].ends_with('┤'),
-            "{rows:#?}"
-        );
-        assert!(rows.last().unwrap().starts_with('└'), "{rows:#?}");
+        let columns = |r: &Row| -> Vec<(u32, u32)> {
+            r.cells
+                .iter()
+                .map(|c| (c.x.to_bits(), c.width.to_bits()))
+                .collect()
+        };
+        let first = columns(rows[0]);
+        for row in &rows[1..] {
+            assert_eq!(columns(row), first, "every row shares the columns");
+        }
 
-        // Every row the same width is what makes the columns line up.
-        let widths: Vec<usize> = rows.iter().map(|r| r.chars().count()).collect();
+        assert!(rows[0].heading, "the first row is the header");
+        assert!(rows[0].rule, "with a rule under it");
+        assert!(!rows[2].rule, "and none under the last row");
         assert!(
-            widths.windows(2).all(|w| w[0] == w[1]),
-            "rows should be padded alike, got {widths:?}"
+            rows[0].cells[0]
+                .spans
+                .iter()
+                .all(|s| s.style == Style::Bold),
+            "a header is set bold"
         );
     }
 
@@ -1833,31 +1893,34 @@ mod tests {
         // The markers were being parsed and then thrown away, so every
         // column came out left-aligned however it was written.
         let out = render("| L | C | R |\n|:--|:-:|--:|\n| a | b | c |\n", 60);
-        let body = out
+        let row = out
             .iter()
-            .map(text_of)
-            .find(|t| t.contains('a'))
-            .expect("the body row");
-        let cells: Vec<&str> = body
-            .trim_matches(|c| c == '│' || c == ' ')
-            .split('│')
-            .collect();
-        assert_eq!(cells.len(), 3, "{body:?}");
-        assert!(cells[0].starts_with('a'), "left: {:?}", cells[0]);
-        assert!(
-            cells[1].starts_with(' ') && cells[1].ends_with(' '),
-            "centre: {:?}",
-            cells[1]
-        );
-        assert!(cells[2].ends_with('c'), "right: {:?}", cells[2]);
+            .find_map(|l| l.row.as_ref().filter(|r| !r.heading))
+            .expect("a body row");
+        let aligns: Vec<Align> = row.cells.iter().map(|c| c.align).collect();
+        assert_eq!(aligns, vec![Align::Left, Align::Centre, Align::Right]);
     }
 
     #[test]
     fn a_table_with_only_a_header_needs_no_separator() {
         let out = render("| One | Two |\n|---|---|\n", 60);
-        let rows: Vec<String> = out.iter().map(text_of).filter(|t| !t.is_empty()).collect();
-        assert_eq!(rows.len(), 3, "top, header, bottom: {rows:#?}");
-        assert!(rows[2].starts_with('└'), "{rows:#?}");
+        let rows: Vec<&Row> = out.iter().filter_map(|l| l.row.as_ref()).collect();
+        assert_eq!(rows.len(), 1, "one row and nothing to separate it from");
+        assert!(!rows[0].rule, "so no rule under it");
+    }
+
+    /// A header is measured in the face it is drawn in. Measuring the
+    /// plain text and drawing it bold made `Default` come out as
+    /// `Def…` in a column sized for `exp`.
+    #[test]
+    fn a_header_is_not_clipped_by_its_own_weight() {
+        let out = render("| Default |\n|---|\n| exp |\n", 60);
+        let header = out
+            .iter()
+            .find_map(|l| l.row.as_ref().filter(|r| r.heading))
+            .expect("a header");
+        let text: String = header.cells[0].spans.iter().map(|s| &*s.text).collect();
+        assert_eq!(text, "Default", "the whole word fits");
     }
 
     #[test]
@@ -2260,7 +2323,6 @@ mod tests {
         assert_eq!(Style::Body.family(), Family::Prose);
         assert_eq!(Style::Heading(1).family(), Family::Prose);
         assert_eq!(Style::Code.family(), Family::Mono);
-        assert_eq!(Style::Divider.family(), Family::Mono);
         // A marker lines up with the indents measured in cells around it.
         assert_eq!(Style::Bullet.family(), Family::Mono);
 
@@ -2270,14 +2332,28 @@ mod tests {
         assert_eq!(Style::BoldEmphasis.face(), Face::BoldItalic);
         assert_eq!(Style::Heading(3).face(), Face::Bold);
 
-        // And every row of a table or a diagram is drawn on the grid,
-        // whatever the styles inside it say.
-        let out = render("| a | b |\n|---|---|\n| 1 | 2 |\n", 60);
+        // A diagram is on the grid; a table no longer is, because its
+        // cells are placed in measured columns and its prose is prose.
+        let table = render("| a | b |\n|---|---|\n| 1 | 2 |\n", 60);
         assert!(
-            out.iter().filter(|l| !l.is_blank()).all(Line::is_grid),
-            "every row of a table is grid, got {:?}",
-            out.iter().map(|l| l.block).collect::<Vec<_>>()
+            table
+                .iter()
+                .filter(|l| l.row.is_some())
+                .all(|l| !l.is_grid()),
+            "a table row is not grid"
         );
+    }
+
+    /// Inline code is set a shade smaller than the prose around it: a
+    /// monospace face at the same nominal size reads as larger, and a
+    /// word of code stood proud of its own line.
+    #[test]
+    fn inline_code_is_set_smaller_than_the_line_it_is_in() {
+        use lithe_gpu::Size;
+        assert_eq!(Style::Code.size(Scale::Body), Size::Small);
+        assert_eq!(Style::Body.size(Scale::Body), Size::Body);
+        // In a heading the code *is* the heading, so it keeps the size.
+        assert_eq!(Style::Code.size(Scale::Huge), Size::Huge);
     }
 
     /// A line of prose is as long as what is in it, not as long as the

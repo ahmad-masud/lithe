@@ -20,7 +20,9 @@ use crate::editor::Editor;
 use crate::find::{Completion, Field, Find, ProjectSearch, Prompt};
 use crate::gitpanel::{GitPanel, Mode as GitMode, Row as GitRowKind};
 use crate::icons::{self, Icon};
-use crate::markdown::{Block as MdBlock, Line as MdLine, Scale as MdScale, Style as MdStyle};
+use crate::markdown::{
+    Align as MdAlign, Block as MdBlock, Line as MdLine, Scale as MdScale, Style as MdStyle,
+};
 use crate::picker::Picker;
 use crate::settings::{PreviewKind, Settings};
 use crate::theme::Theme;
@@ -2425,9 +2427,10 @@ fn span_style(style: MdStyle, theme: &Theme) -> (Rgba, lithe_gpu::Face, lithe_gp
         MdStyle::Code => theme.syntax.string,
         MdStyle::Quote => theme.status_fg,
         MdStyle::Link => theme.cursor,
-        MdStyle::Bullet => theme.gutter_fg_active,
+        // Quieter than the text it introduces: a marker is there to
+        // be counted, not read.
+        MdStyle::Bullet => theme.gutter_fg,
         MdStyle::Strike => theme.status_fg,
-        MdStyle::Divider => theme.gutter_fg,
         MdStyle::Syntax(kind) => theme.colour(Some(kind)),
         // A shade quieter than the editor's own text: a page of prose at
         // full contrast is a page nobody finishes.
@@ -2456,12 +2459,9 @@ impl crate::markdown::Measure for Measured<'_, '_> {
         if cell <= 0.0 {
             return text.chars().count() as f32;
         }
-        self.frame.measure(
-            text,
-            style.face(),
-            crate::markdown::Style::size(scale),
-            style.family(),
-        ) / cell
+        self.frame
+            .measure(text, style.face(), style.size(scale), style.family())
+            / cell
     }
 }
 
@@ -2779,11 +2779,6 @@ fn draw_preview(
         }
         let index = top + drawn;
         let height = line.rows() as f32 * l.cell.line_height;
-        let scale = match line.scale {
-            MdScale::Body => Size::Body,
-            MdScale::Large => Size::Large,
-            MdScale::Huge => Size::Huge,
-        };
         // A heading sits on the lower of its two rows, so the extra row
         // becomes air above it rather than a gap underneath.
         let baseline = y + height - (l.cell.line_height - l.cell.ascent);
@@ -2794,32 +2789,43 @@ fn draw_preview(
 
         // Block decoration goes behind the text.
         match line.block {
-            MdBlock::Code | MdBlock::Diagram => f.rect(
-                origin - 2.0 * l.cell.advance,
-                y,
-                behind + 4.0 * l.cell.advance,
-                height,
-                theme.panel_bg,
-            ),
-            // As wide as the table, not as wide as the column: a tint
-            // running past the last cell reads as a band across the page
-            // rather than as the table's own header.
-            MdBlock::TableHead => {
-                let cells: usize = line.spans.iter().map(|s| s.text.chars().count()).sum();
-                f.rect(
-                    origin + line.indent as f32 * l.cell.advance,
-                    y,
-                    cells as f32 * l.cell.advance,
-                    height,
-                    theme.panel_bg,
-                )
+            // A panel the width of the column, not of the window: a
+            // tint that runs to both edges of the pane reads as a
+            // change of mode rather than as a block in a document.
+            // Rounded at the ends, which is the whole block's first
+            // and last row.
+            MdBlock::Code | MdBlock::Diagram => {
+                let x0 = origin - l.cell.advance;
+                let panel = (behind + 2.0 * l.cell.advance).min(right + l.cell.advance - x0);
+                let radius = (l.cell.line_height * 0.3).round();
+                let first = lines
+                    .get((top + drawn).wrapping_sub(1))
+                    .is_none_or(|above| above.block != line.block);
+                let last = lines
+                    .get(top + drawn + 1)
+                    .is_none_or(|below| below.block != line.block);
+                // Square where the block continues, so consecutive
+                // rows join into one panel instead of a stack of
+                // lozenges. Drawn as one rounded rect plus a square
+                // one over the join, which is cheaper than a path.
+                f.rounded(x0, y, panel, height, radius, theme.panel_bg);
+                if !first {
+                    f.rect(x0, y, panel, radius, theme.panel_bg);
+                }
+                if !last {
+                    f.rect(x0, y + height - radius, panel, radius, theme.panel_bg);
+                }
             }
-            MdBlock::Quote => f.rect(
-                origin - 2.0 * l.cell.advance,
+            // At the column's own edge, where the text would start
+            // if it were not quoted — a bar further out than that
+            // reads as furniture rather than as part of the block.
+            MdBlock::Quote => f.rounded(
+                origin,
                 y,
-                2.0,
+                (l.cell.advance * 0.3).max(2.0).round(),
                 height,
-                theme.gutter_fg,
+                1.5,
+                theme.panel_active,
             ),
             MdBlock::Rule => f.rect(
                 left,
@@ -2835,8 +2841,8 @@ fn draw_preview(
                 1.0,
                 theme.panel_active,
             ),
-            // The frame draws itself, in characters.
-            MdBlock::Table | MdBlock::Plain => {}
+            // A table row draws its own rules, beside its own cells.
+            MdBlock::Table | MdBlock::TableHead | MdBlock::Plain => {}
         }
 
         // Selected text, behind everything the line draws. Measured in
@@ -2924,6 +2930,63 @@ fn draw_preview(
             continue;
         }
 
+        // A table row: each cell placed in its own column, with a
+        // hairline under the heading and between the rows. No outer
+        // frame and no vertical rules — the gap between columns is
+        // enough to keep them apart, and a box round a table is what
+        // made this read as a terminal.
+        if let Some(row) = &line.row {
+            let left = origin + line.indent as f32 * l.cell.advance;
+            for cell in &row.cells {
+                let width: f32 = cell
+                    .spans
+                    .iter()
+                    .map(|s| {
+                        let (_, face, family) = span_style(s.style, theme);
+                        f.measure(&s.text, face, s.style.size(line.scale), family)
+                    })
+                    .sum();
+                let room = cell.width * l.cell.advance;
+                let slack = (room - width).max(0.0);
+                let inset = match cell.align {
+                    MdAlign::Left => 0.0,
+                    MdAlign::Centre => slack / 2.0,
+                    MdAlign::Right => slack,
+                };
+                let mut cx = left + cell.x * l.cell.advance + inset;
+                for span in &cell.spans {
+                    let (colour, face, family) = span_style(span.style, theme);
+                    cx = f.text_run(
+                        cx,
+                        baseline,
+                        &span.text,
+                        colour,
+                        face,
+                        span.style.size(line.scale),
+                        family,
+                    );
+                }
+            }
+            if row.rule {
+                // Under the heading it marks where the data starts;
+                // between rows it is only there to help the eye track
+                // across, so it is fainter.
+                let colour = match row.heading {
+                    true => theme.panel_active,
+                    false => theme.gutter_bg,
+                };
+                f.rect(
+                    left,
+                    (y + height - 1.0).round(),
+                    row.width * l.cell.advance,
+                    1.0,
+                    colour,
+                );
+            }
+            y += height;
+            continue;
+        }
+
         let mut x = origin + line.indent as f32 * l.cell.advance;
         for span in &line.spans {
             let (colour, face, mut family) = span_style(span.style, theme);
@@ -2932,7 +2995,27 @@ fn draw_preview(
             if line.is_grid() {
                 family = lithe_gpu::Family::Mono;
             }
-            let next = f.text_run(x, baseline, &span.text, colour, face, scale, family);
+            let run = span.style.size(line.scale);
+            // Inline code sits on a tinted chip. Colour alone left a
+            // word of code looking like an error in the sentence
+            // rather than a thing being named.
+            if span.style == MdStyle::Code && !line.is_grid() && !span.text.trim().is_empty() {
+                let lead = span.text.len() - span.text.trim_start().len();
+                let tail = span.text.len() - span.text.trim_end().len();
+                let from = x + f.measure(&span.text[..lead], face, run, family);
+                let to = x + f.measure(span.text.trim_end(), face, run, family);
+                let pad = (l.cell.advance * 0.35).round();
+                f.rounded(
+                    from - pad,
+                    y + (l.cell.line_height * 0.12).round(),
+                    to - from + pad * 2.0,
+                    (l.cell.line_height * 0.82).round(),
+                    (l.cell.line_height * 0.18).round(),
+                    theme.panel_active,
+                );
+                let _ = tail;
+            }
+            let next = f.text_run(x, baseline, &span.text, colour, face, run, family);
             // A line through or under the run, where colour alone is doing
             // too much work in a single-weight preview.
             let rule = match span.style {
@@ -2944,7 +3027,7 @@ fn draw_preview(
             };
             if let Some(offset) = rule {
                 let lead = &span.text[..span.text.len() - span.text.trim_start().len()];
-                let from = x + f.measure(lead, face, scale, family);
+                let from = x + f.measure(lead, face, run, family);
                 f.rect(from, y + offset, next - from, 1.0, colour);
             }
             x = next;
