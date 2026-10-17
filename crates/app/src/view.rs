@@ -139,6 +139,15 @@ pub struct ButtonSlot {
     pub active: bool,
 }
 
+/// What a source control tab is called. Title case, because it is a
+/// label in an interface rather than a word typed at a shell.
+fn mode_label(mode: GitMode) -> &'static str {
+    match mode {
+        GitMode::Changes => "Changes",
+        GitMode::History => "History",
+    }
+}
+
 /// Rasterised diagrams, keyed by the markup they were drawn from and
 /// the width they were drawn at.
 pub type Figures = std::collections::HashMap<(u64, u32), crate::imageview::ImageView>;
@@ -1044,10 +1053,16 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
             // A caret for directories, so open and closed are tellable
             // apart without colour alone.
             if entry.is_dir {
-                f.text(
+                // A caret, not a letter: `v` and `>` were standing in
+                // for one because the grid's face had nothing better.
+                f.ui_text(
                     x - l.cell.advance,
                     baseline,
-                    if entry.expanded { "v" } else { ">" },
+                    if entry.expanded {
+                        "\u{25be}"
+                    } else {
+                        "\u{25b8}"
+                    },
                     theme.gutter_fg,
                 );
             }
@@ -1062,12 +1077,14 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                 let typed = tree.typed().unwrap_or_default();
                 let shown = typed.chars().count().min(room.saturating_sub(1));
                 let tail: String = typed.chars().skip(typed.chars().count() - shown).collect();
-                f.text(x, baseline, &tail, theme.fg);
+                let end = f.ui_text(x, baseline, &tail, theme.fg);
+                // A caret where the text actually ended, since a
+                // proportional name does not end on a cell boundary.
                 f.rect(
-                    x + shown as f32 * l.cell.advance,
-                    y + 2.0,
-                    l.cell.advance,
-                    l.cell.line_height - 4.0,
+                    end + 1.0,
+                    y + 3.0,
+                    2.0,
+                    l.cell.line_height - 6.0,
                     theme.cursor,
                 );
                 continue;
@@ -1080,7 +1097,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
             } else {
                 theme.tree_file
             };
-            f.text(x, baseline, &scratch.text, colour);
+            f.ui_text(x, baseline, &scratch.text, colour);
         }
     }
 
@@ -1113,35 +1130,46 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
             match row {
                 GitRowKind::Blank => {}
                 GitRowKind::Tabs => {
-                    // Two words acting as tabs, the active one lit.
+                    // A segmented control: two labels in one rounded
+                    // well, the chosen one lit. A hard-edged filled
+                    // box behind the active word was the single most
+                    // dated thing in the sidebar.
+                    let pad = (l.cell.advance * 0.8).round();
+                    let widths: Vec<f32> = [GitMode::Changes, GitMode::History]
+                        .iter()
+                        .map(|m| f.ui_measure(mode_label(*m)) + pad * 2.0)
+                        .collect();
+                    let inset = (l.cell.line_height * 0.14).round();
+                    let tall = l.cell.line_height - inset * 2.0;
+                    let radius = (tall / 2.0).round();
+                    f.rounded(
+                        l.cell.advance,
+                        y + inset,
+                        widths.iter().sum::<f32>(),
+                        tall,
+                        radius,
+                        theme.bg,
+                    );
                     let mut x = l.cell.advance;
-                    for (mode, label) in
-                        [(GitMode::Changes, "changes"), (GitMode::History, "history")]
-                    {
-                        let on = git.mode == mode;
+                    for (mode, width) in [GitMode::Changes, GitMode::History].iter().zip(&widths) {
+                        let on = git.mode == *mode;
                         if on {
-                            f.rect(
-                                x - 0.5 * l.cell.advance,
-                                y,
-                                (label.chars().count() as f32 + 1.0) * l.cell.advance,
-                                l.cell.line_height,
-                                theme.panel_active,
-                            );
+                            f.rounded(x, y + inset, *width, tall, radius, theme.panel_active);
                         }
-                        f.text(
-                            x,
+                        f.ui_text(
+                            x + pad,
                             baseline,
-                            label,
-                            if on { theme.fg } else { theme.tree_file },
+                            mode_label(*mode),
+                            if on { theme.fg } else { theme.status_fg },
                         );
-                        x += (label.chars().count() as f32 + 2.0) * l.cell.advance;
+                        x += width;
                     }
                 }
                 GitRowKind::Commit(index) => {
                     let Some(commit) = git.commits.get(*index) else {
                         continue;
                     };
-                    f.text(
+                    f.ui_text(
                         l.cell.advance,
                         baseline,
                         &commit.short,
@@ -1161,7 +1189,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                     if for_author >= 5 {
                         scratch.text.clear();
                         shorten_name(&mut scratch.text, &commit.author, for_author);
-                        f.text(
+                        f.ui_text(
                             l.cell.advance * column,
                             baseline,
                             &scratch.text,
@@ -1172,7 +1200,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                     scratch.text.clear();
                     let room = (columns - column - 1.0).max(6.0) as usize;
                     truncate_tail(&mut scratch.text, &commit.summary, room);
-                    f.text(
+                    f.ui_text(
                         l.cell.advance * column,
                         baseline,
                         &scratch.text,
@@ -1180,10 +1208,10 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                     );
                 }
                 GitRowKind::Header(text) => {
-                    f.text(l.cell.advance, baseline, text, theme.status_fg);
+                    f.ui_text(l.cell.advance, baseline, text, theme.status_fg);
                 }
                 GitRowKind::Empty(text) => {
-                    f.text(l.cell.advance, baseline, text, theme.gutter_fg);
+                    f.ui_text(l.cell.advance, baseline, text, theme.gutter_fg);
                 }
                 // Drawn as a button, because it is the one row here that
                 // does something to the world rather than describing it.
@@ -1198,7 +1226,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                         l.cell.line_height,
                         theme.panel_active,
                     );
-                    f.text(x + l.cell.advance, baseline, LABEL, theme.fg);
+                    f.ui_text(x + l.cell.advance, baseline, LABEL, theme.fg);
                 }
                 GitRowKind::Change(change) => {
                     let Some(change) = git.changes.get(*change) else {
@@ -1213,12 +1241,12 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                     };
                     scratch.text.clear();
                     scratch.text.push(change.status);
-                    f.text(l.cell.advance, baseline, &scratch.text, colour);
+                    f.ui_text(l.cell.advance, baseline, &scratch.text, colour);
 
                     scratch.text.clear();
                     let room = (l.tree_w / l.cell.advance - 3.0 - STAGE_COLS).max(4.0) as usize;
                     truncate_tail(&mut scratch.text, &change.display, room);
-                    f.text(
+                    f.ui_text(
                         l.cell.advance * 3.0,
                         baseline,
                         &scratch.text,
@@ -1226,7 +1254,7 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                     );
 
                     // Stage with +, unstage with −.
-                    f.text(
+                    f.ui_text(
                         l.tree_w - STAGE_COLS * l.cell.advance,
                         baseline,
                         if change.staged { "-" } else { "+" },
@@ -1260,12 +1288,17 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                 // A project is open but no file is: the tree is the
                 // affordance, so this only needs to point at it.
                 let hint = key!("+P  open a file        ", "+shift+P  commands");
-                let x = l
-                    .text_x
-                    .max((l.width - hint.chars().count() as f32 * l.cell.advance) / 2.0);
-                f.text(x, l.text_y + l.text_h / 2.0, hint, theme.gutter_fg);
+                let x = l.text_x.max((l.width - f.ui_measure(hint)) / 2.0);
+                f.ui_text(x, l.text_y + l.text_h / 2.0, hint, theme.gutter_fg);
             }
         }
+    }
+
+    // A hairline where the sidebar meets the text. The two are a
+    // shade apart already; the line is what makes the shade read as a
+    // boundary rather than as a gradient.
+    if l.tree_w > 0.0 {
+        f.rect(l.tree_w - 1.0, 0.0, 1.0, l.height, theme.panel_active);
     }
 
     // ---- tab strip ----
@@ -1316,17 +1349,20 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                 (true, true, _) => theme.status_fg,
                 (false, _, _) => theme.tree_file,
             };
-            f.text(
+            f.ui_text(
                 x0 + 1.0 * l.cell.advance,
                 l.cell.ascent,
                 &labels[index],
                 colour,
             );
-            // Close box, dim until the tab is the active one.
-            f.text(
+            // Close box, dim until the tab is the active one. A
+            // multiplication sign rather than a lowercase x, which is
+            // what a terminal reaches for when it has no better
+            // glyph.
+            f.ui_text(
                 x1 - CLOSE_COLS * l.cell.advance + 0.5 * l.cell.advance,
                 l.cell.ascent,
-                "x",
+                "\u{00d7}",
                 if active {
                     theme.status_fg
                 } else {
@@ -1400,19 +1436,22 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
         None => {
             if let Some(editor) = scene.workspace.active() {
                 let (line, col) = editor.line_col(editor.sel.primary().head);
+                // Separated by a middle dot rather than by runs of
+                // spaces: a status bar is a list of facts, and a
+                // separator says so where a gap only hopes to.
                 let _ = write!(
                     scratch.text,
-                    "{}{}:{}   {} lines",
-                    if editor.dirty { "* " } else { "" },
+                    "{}Ln {}, Col {}  ·  {} lines",
+                    if editor.dirty { "\u{25cf} " } else { "" },
                     line + 1,
                     col + 1,
                     editor.doc.len_lines()
                 );
                 if editor.sel.len() > 1 {
-                    let _ = write!(scratch.text, "   {} cursors", editor.sel.len());
+                    let _ = write!(scratch.text, "  ·  {} cursors", editor.sel.len());
                 }
                 if let Some(language) = editor.language_name() {
-                    let _ = write!(scratch.text, "   {language}");
+                    let _ = write!(scratch.text, "  ·  {language}");
                     // What the server is busy with outranks the fact
                     // that it is up: while rust-analyzer indexes, every
                     // answer is empty, and "lsp" alone does not explain
@@ -1429,21 +1468,25 @@ pub fn draw(renderer: &mut Renderer, scene: &Scene<'_>, scratch: &mut Scratch) {
                 }
             }
             if scene.autosave {
-                let _ = write!(scratch.text, "   autosave");
+                let _ = write!(scratch.text, "  ·  autosave");
             }
             if let Some(branch) = scene.branch {
-                let _ = write!(scratch.text, "   {branch}");
+                // The branch glyph says what the name is without
+                // spending a word on it.
+                let _ = write!(scratch.text, "  ·  \u{2387} {branch}");
             }
             if let Some(root) = &scene.workspace.root {
                 let name = root
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let _ = write!(scratch.text, "   [{name}]");
+                // The project, unbracketed: brackets round a name are
+                // a terminal's way of saying "this is a field".
+                let _ = write!(scratch.text, "  ·  {name}");
             }
         }
     }
-    f.text(
+    f.ui_text(
         text_x,
         status_y + l.cell.ascent,
         &scratch.text,
@@ -1705,9 +1748,19 @@ fn draw_context_menu(
     scratch: &mut Scratch,
 ) {
     let (x, y, width, height) = context_bounds(l, menu);
-    f.rect(x, y, width, height, theme.panel_bg);
-    f.rect(x, y, width, 1.0, theme.panel_active);
-    f.rect(x, y + height - 1.0, width, 1.0, theme.panel_active);
+    // A rounded card with an edge, rather than a square slab with a
+    // rule top and bottom: a menu floats over the window, and a
+    // corner is what says so.
+    let radius = (l.cell.line_height * 0.3).round();
+    f.rounded(
+        x - 1.0,
+        y - 1.0,
+        width + 2.0,
+        height + 2.0,
+        radius + 1.0,
+        theme.panel_active,
+    );
+    f.rounded(x, y, width, height, radius, theme.panel_bg);
 
     for (index, entry) in menu.entries.iter().enumerate() {
         let row_y = y + 2.0 + index as f32 * l.cell.line_height;
@@ -1723,9 +1776,19 @@ fn draw_context_menu(
         }
         let selected = index == menu.selected;
         if selected {
-            f.rect(x, row_y, width, l.cell.line_height, theme.panel_active);
+            // Inset and rounded, so the highlight reads as sitting on
+            // the card rather than as a band cut through it.
+            let pad = (l.cell.advance * 0.4).round();
+            f.rounded(
+                x + pad,
+                row_y,
+                width - pad * 2.0,
+                l.cell.line_height,
+                (l.cell.line_height * 0.22).round(),
+                theme.panel_active,
+            );
         }
-        f.text(
+        f.ui_text(
             x + 1.5 * l.cell.advance,
             row_y + l.cell.ascent,
             &entry.label,
@@ -1734,8 +1797,8 @@ fn draw_context_menu(
         if !entry.hint.is_empty() {
             scratch.text.clear();
             scratch.text.push_str(entry.hint);
-            let hint_x = x + width - l.cell.advance * (entry.hint.chars().count() as f32 + 1.5);
-            f.text(
+            let hint_x = x + width - f.ui_measure(entry.hint) - 1.5 * l.cell.advance;
+            f.ui_text(
                 hint_x,
                 row_y + l.cell.ascent,
                 &scratch.text,
@@ -1762,10 +1825,18 @@ fn draw_settings(
         match row {
             SettingRow::Blank => {}
             SettingRow::Title => {
-                f.text(ox, baseline, "Settings", theme.fg);
+                f.text_run(
+                    ox,
+                    baseline,
+                    "Settings",
+                    theme.fg,
+                    lithe_gpu::Face::Bold,
+                    lithe_gpu::Size::Large,
+                    lithe_gpu::Family::Prose,
+                );
             }
             SettingRow::Heading(text) => {
-                f.text(ox, baseline, text, theme.status_fg);
+                f.ui_text(ox, baseline, text, theme.status_fg);
             }
             SettingRow::Switch(setting) => {
                 tint(
@@ -1778,27 +1849,41 @@ fn draw_settings(
                     l.cell.line_height,
                 );
                 let on = setting.value(settings);
-                // A box that is filled or empty, rather than a tick: at
-                // one weight a tick and a cross look the same.
+                // A switch: a track with a knob that slides. A small
+                // filled square says "on" only if you already know
+                // that is what it means, and at this size a tick and
+                // a cross look the same.
                 let box_x = ox + 2.0 * l.cell.advance;
-                let size = (l.cell.line_height * 0.42).round();
-                let box_y = (y + (l.cell.line_height - size) / 2.0).round();
-                f.rect(box_x, box_y, size, size, theme.panel_active);
-                if on {
-                    let pad = (size / 4.0).round();
-                    f.rect(
-                        box_x + pad,
-                        box_y + pad,
-                        size - 2.0 * pad,
-                        size - 2.0 * pad,
-                        theme.cursor,
-                    );
-                }
+                let tall = (l.cell.line_height * 0.5).round();
+                let track = (tall * 1.75).round();
+                let box_y = (y + (l.cell.line_height - tall) / 2.0).round();
+                f.rounded(
+                    box_x,
+                    box_y,
+                    track,
+                    tall,
+                    tall / 2.0,
+                    if on { theme.cursor } else { theme.panel_active },
+                );
+                let gap = (tall * 0.15).round();
+                let knob = tall - gap * 2.0;
+                let knob_x = match on {
+                    true => box_x + track - knob - gap,
+                    false => box_x + gap,
+                };
+                f.rounded(
+                    knob_x,
+                    box_y + gap,
+                    knob,
+                    knob,
+                    knob / 2.0,
+                    if on { theme.bg } else { theme.status_fg },
+                );
                 scratch.text.clear();
                 let room = ((width / l.cell.advance) as usize).saturating_sub(6);
                 truncate_tail(&mut scratch.text, setting.label(), room);
-                f.text(
-                    box_x + size + l.cell.advance,
+                f.ui_text(
+                    box_x + track + l.cell.advance,
                     baseline,
                     &scratch.text,
                     if on { theme.fg } else { theme.tree_file },
@@ -1808,7 +1893,7 @@ fn draw_settings(
     }
 
     let hint = "changes are saved as you make them";
-    f.text(
+    f.ui_text(
         ox,
         oy + rows.len() as f32 * l.cell.line_height + l.cell.ascent,
         hint,
@@ -3095,7 +3180,7 @@ fn draw_prompt(
 
     scratch.text.clear();
     let _ = write!(scratch.text, "{}  {}", prompt.label, prompt.text);
-    f.text(l.cell.advance, y + l.cell.ascent, &scratch.text, theme.fg);
+    f.ui_text(l.cell.advance, y + l.cell.ascent, &scratch.text, theme.fg);
     f.rect(
         l.cell.advance * (scratch.text.chars().count() as f32 + 1.2),
         y,
@@ -3105,8 +3190,8 @@ fn draw_prompt(
     );
 
     let hint = "enter commits · esc cancels";
-    let hint_x = l.width - l.cell.advance * (hint.chars().count() as f32 + 1.0);
-    f.text(hint_x, y + l.cell.ascent, hint, theme.gutter_fg);
+    let hint_x = l.width - f.ui_measure(hint) - l.cell.advance;
+    f.ui_text(hint_x, y + l.cell.ascent, hint, theme.gutter_fg);
 }
 
 fn draw_find_bar(
@@ -3125,7 +3210,7 @@ fn draw_find_bar(
     scratch.text.clear();
     let _ = write!(scratch.text, "find  {}", find.query);
     let query_cells = scratch.text.chars().count() as f32;
-    f.text(l.cell.advance, baseline, &scratch.text, theme.fg);
+    f.ui_text(l.cell.advance, baseline, &scratch.text, theme.fg);
     if find.focus == Field::Query {
         f.rect(
             l.cell.advance * (query_cells + 1.2),
@@ -3140,7 +3225,7 @@ fn draw_find_bar(
         let x = l.cell.advance * (query_cells + 6.0);
         scratch.text.clear();
         let _ = write!(scratch.text, "replace  {}", find.replace);
-        f.text(x, baseline, &scratch.text, theme.fg);
+        f.ui_text(x, baseline, &scratch.text, theme.fg);
         if find.focus == Field::Replace {
             let cells = scratch.text.chars().count() as f32;
             f.rect(
@@ -3165,8 +3250,8 @@ fn draw_find_bar(
             .text
             .push_str("enter next · shift+enter previous · esc close");
     }
-    let hint_x = l.width - l.cell.advance * (scratch.text.chars().count() as f32 + 1.0);
-    f.text(
+    let hint_x = l.width - f.ui_measure(&scratch.text) - l.cell.advance;
+    f.ui_text(
         hint_x,
         baseline,
         &scratch.text,
@@ -3198,7 +3283,7 @@ fn draw_project_search(
 
     scratch.text.clear();
     let _ = write!(scratch.text, "search  {}", search.query);
-    f.text(
+    f.ui_text(
         panel_x + l.cell.advance,
         panel_y + l.cell.ascent,
         &scratch.text,
@@ -3223,7 +3308,7 @@ fn draw_project_search(
         let _ = write!(scratch.text, "{}", search.hits.len());
     }
     let count_x = panel_x + panel_w - l.cell.advance * (scratch.text.chars().count() as f32 + 1.0);
-    f.text(
+    f.ui_text(
         count_x,
         panel_y + l.cell.ascent,
         &scratch.text,
@@ -3254,7 +3339,7 @@ fn draw_project_search(
             .unwrap_or_default();
         let _ = write!(scratch.text, "{name}:{}", hit.line);
         let location_cells = scratch.text.chars().count();
-        f.text(
+        f.ui_text(
             panel_x + l.cell.advance * 1.5,
             y + l.cell.ascent,
             &scratch.text,
@@ -3266,7 +3351,7 @@ fn draw_project_search(
         scratch.text.clear();
         let trimmed = hit.text.trim_start();
         truncate_tail(&mut scratch.text, trimmed, room);
-        f.text(
+        f.ui_text(
             text_x,
             y + l.cell.ascent,
             &scratch.text,
@@ -3275,7 +3360,7 @@ fn draw_project_search(
     }
 
     if search.hits.is_empty() {
-        f.text(
+        f.ui_text(
             panel_x + l.cell.advance * 1.5,
             panel_y + l.cell.line_height + l.cell.ascent,
             if search.running {
@@ -3348,7 +3433,15 @@ fn draw_landing(
         match &entry.row {
             Row::Blank => {}
             Row::Title => {
-                f.text(ox, baseline, "lithe", theme.fg);
+                f.text_run(
+                    ox,
+                    baseline,
+                    "lithe",
+                    theme.fg,
+                    lithe_gpu::Face::Bold,
+                    lithe_gpu::Size::Large,
+                    lithe_gpu::Family::Prose,
+                );
             }
             Row::Subtitle => {
                 scratch.text.clear();
@@ -3357,16 +3450,20 @@ fn draw_landing(
                     "a local editor  ·  v{}",
                     env!("CARGO_PKG_VERSION")
                 );
-                f.text(ox, baseline, &scratch.text, theme.gutter_fg);
+                f.ui_text(ox, baseline, &scratch.text, theme.gutter_fg);
             }
             Row::Heading(text) => {
-                f.text(ox, baseline, text, theme.status_fg);
+                f.ui_text(ox, baseline, text, theme.status_fg);
             }
             Row::Action { label, hint } => {
-                f.text(ox + indent, baseline, label, theme.cursor);
+                f.ui_text(ox + indent, baseline, label, theme.cursor);
                 // Shortcut hint, right-aligned in the column.
-                let hint_x = ox + width - hint.chars().count() as f32 * l.cell.advance;
-                f.text(hint_x, baseline, hint, theme.gutter_fg);
+                // Measured, not counted: a proportional hint is not
+                // as wide as its character count says, so counting
+                // left a column of shortcuts ragged down its right
+                // edge.
+                let hint_x = ox + width - f.ui_measure(hint);
+                f.ui_text(hint_x, baseline, hint, theme.gutter_fg);
             }
             Row::Recent(recent) => {
                 let Some(path) = scene.recents.get(*recent) else {
@@ -3376,7 +3473,7 @@ fn draw_landing(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                f.text(ox + indent, baseline, &name, theme.cursor);
+                f.ui_text(ox + indent, baseline, &name, theme.cursor);
 
                 // The parent directory, right-aligned and elided from the
                 // left: the tail of a path is what identifies it.
@@ -3384,11 +3481,11 @@ fn draw_landing(
                 let room = (LANDING_COLS - 2.0 - name.chars().count() as f32 - 2.0).max(4.0);
                 scratch.text.clear();
                 truncate_into(&mut scratch.text, &parent, room as usize);
-                let detail_x = ox + width - scratch.text.chars().count() as f32 * l.cell.advance;
-                f.text(detail_x, baseline, &scratch.text, theme.gutter_fg);
+                let detail_x = ox + width - f.ui_measure(&scratch.text);
+                f.ui_text(detail_x, baseline, &scratch.text, theme.gutter_fg);
             }
             Row::Footer(text) => {
-                f.text(ox, baseline, text, theme.gutter_fg);
+                f.ui_text(ox, baseline, text, theme.gutter_fg);
             }
         }
     }
@@ -3841,7 +3938,7 @@ fn draw_picker(
     // Query line.
     scratch.text.clear();
     let _ = write!(scratch.text, "{}  {}", picker.kind.prompt(), picker.query);
-    f.text(
+    f.ui_text(
         panel_x + l.cell.advance,
         panel_y + l.cell.ascent,
         &scratch.text,
@@ -3862,7 +3959,7 @@ fn draw_picker(
     scratch.text.clear();
     let _ = write!(scratch.text, "{}/{}", picker.matched(), picker.total());
     let count_x = panel_x + panel_w - l.cell.advance * (scratch.text.chars().count() as f32 + 1.0);
-    f.text(
+    f.ui_text(
         count_x,
         panel_y + l.cell.ascent,
         &scratch.text,
@@ -3884,7 +3981,7 @@ fn draw_picker(
         }
         scratch.text.clear();
         truncate_into(&mut scratch.text, label, room);
-        f.text(
+        f.ui_text(
             panel_x + l.cell.advance * 1.5,
             y + l.cell.ascent,
             &scratch.text,

@@ -467,6 +467,31 @@ with the pointer elsewhere, nothing did, and the window stayed blank
 until it was clicked. `Focused(true)` and `Occluded(false)` — the two
 events that mean the window is really on screen — now redraw.
 
+The interface is set in the reading face; the grid's face is for the
+document. A tab label, a status bar and a file tree in a monospace
+font are a terminal wearing an editor's clothes, and that — more than
+any colour or corner — was what dated the window. `Frame::ui_text`
+draws chrome and `ui_measure` sizes it.
+
+Measuring matters where it did not before. A right-aligned shortcut
+hint used to be placed at `width - len * advance`, which is exact in
+a grid and ragged everywhere else; those now measure. Tab extents
+stay in cells, because hit-testing reads them without a measurer to
+hand and a cell-wide box is generous enough that a proportional label
+always fits inside it.
+
+A rounded rectangle made the rest possible: a segmented control for
+the source control tabs, switches on the settings page, a floating
+card for the right-click menu with an inset pill on the row under the
+pointer. Each of those was previously a hard-edged filled box, which
+is the shape a program draws when it can only draw one shape.
+
+Panels are visibly recessed. At two points away from the editor's own
+background the sidebar and the tab strip did not read as panels at
+all — the window looked like one flat sheet with text in different
+places on it — so `panel_bg` dropped and a hairline marks where the
+sidebar ends.
+
 The preview scrolls in rows, and a line is not a row. The scrollbar
 and the scroll limit always counted rows; four other places read the
 same number as a line index and took its fraction as a sub-row slip.

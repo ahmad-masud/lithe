@@ -1,4 +1,4 @@
-//! Editing operations: the layer that turns cursors plus history into the
+n //! Editing operations: the layer that turns cursors plus history into the
 //! things a keypress means.
 //!
 //! Every mutation funnels through [`Editor::edit`], which builds one

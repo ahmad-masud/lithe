@@ -119,7 +119,12 @@ impl Default for Theme {
             vcs_removed: Rgba::hex(0xB4555E),
             diff_added_bg: Rgba::hex(0x182A1C),
             diff_removed_bg: Rgba::hex(0x2C1A1D),
-            panel_bg: Rgba::hex(0x101217),
+            // Recessed, and visibly so. At a couple of points away
+            // from the editor's own background the sidebar and the
+            // tab strip did not read as panels at all — the window
+            // looked like one flat sheet with text in different
+            // places on it.
+            panel_bg: Rgba::hex(0x0C0E13),
             panel_active: Rgba::hex(0x232832),
             // Deliberately faint. Hover is an answer to "is this a
             // thing I can click", not a selection.

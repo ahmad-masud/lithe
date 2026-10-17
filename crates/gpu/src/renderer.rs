@@ -448,6 +448,11 @@ impl Renderer {
             .measure(&self.queue, text, face, size, family)
     }
 
+    /// How wide a run of chrome text is. See [`Frame::ui_text`].
+    pub fn ui_measure(&self, text: &str) -> f32 {
+        self.measure(text, Face::Regular, Size::Body, Family::Prose)
+    }
+
     /// Target size in physical pixels.
     pub fn size_px(&self) -> (f32, f32) {
         (self.width as f32, self.height as f32)
@@ -826,6 +831,29 @@ impl Frame<'_> {
             end: r.quads.len() as u32,
             image: Some(index),
         });
+    }
+
+    /// Chrome text: a tab label, a status bar, a panel row.
+    ///
+    /// The interface is set in the reading face, not the grid's. The
+    /// grid's face is for the document, where a column means
+    /// something; a tab label set in it is a terminal pretending to be
+    /// an editor, which is most of what made this look its age.
+    pub fn ui_text(&mut self, x: f32, baseline_y: f32, text: &str, color: Rgba) -> f32 {
+        self.text_run(
+            x,
+            baseline_y,
+            text,
+            color,
+            Face::Regular,
+            Size::Body,
+            Family::Prose,
+        )
+    }
+
+    /// How wide [`Frame::ui_text`] would draw this.
+    pub fn ui_measure(&self, text: &str) -> f32 {
+        self.measure(text, Face::Regular, Size::Body, Family::Prose)
     }
 
     /// A filled rectangle with rounded corners.
